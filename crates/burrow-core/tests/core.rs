@@ -332,6 +332,24 @@ async fn hand_written_files_get_an_id_once() {
 }
 
 #[tokio::test]
+async fn folder_names_keep_their_dots() {
+    let f = Fixture::new();
+    fs::create_dir(f.tree().join("example.com")).unwrap();
+    f.reload().await;
+    let folder = f.nodes().await.pop().unwrap();
+    assert_eq!(folder.name, "example.com");
+
+    // Moving it keeps the directory name too.
+    let other = f.create(None, "folder", "other").await;
+    f.run(Command::MoveNode {
+        id: folder.id,
+        parent: Some(other.id),
+    })
+    .await;
+    assert!(f.tree().join("other/example.com/_folder.toml").is_file());
+}
+
+#[tokio::test]
 async fn our_own_writes_reload_to_no_events() {
     let f = Fixture::new();
     let folder = f.create(None, "folder", "f").await;
