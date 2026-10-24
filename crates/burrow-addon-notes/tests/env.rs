@@ -1,4 +1,4 @@
-//! Addons must not inherit the user's SSH agent. This sets an environment
+//! Addons must not inherit `SSH_AUTH_SOCK`. This sets an environment
 //! variable, so it is its own test binary: changing the environment while
 //! other threads start processes is not safe.
 
@@ -9,7 +9,7 @@ use burrow_core::{Command, Core, CoreOptions, MemoryStore, Response};
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn addons_do_not_get_the_ssh_agent() {
+async fn addons_do_not_inherit_ssh_auth_sock() {
     // Safe: this is the only test in the binary, and no other thread is
     // running yet.
     unsafe { std::env::set_var("SSH_AUTH_SOCK", "/tmp/agent.sock") };

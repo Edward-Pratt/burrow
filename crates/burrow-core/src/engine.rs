@@ -72,7 +72,11 @@ impl Core {
         let (tree, tree_problems) = Tree::load(&options.config_dir.join("tree"))?;
         let addons_dir = options.config_dir.join("addons");
         std::fs::create_dir_all(&addons_dir).map_err(|e| Error::io(&addons_dir, e))?;
-        let addons = Host::new(addons_dir, options.state_dir.join("addons.toml"));
+        let addons = Host::new(
+            addons_dir,
+            options.state_dir.join("addons.toml"),
+            options.state_dir.join("addons"),
+        );
         addons.rescan();
         let problems = [tree_problems.clone(), addons.problems()].concat();
         let (events, _) = broadcast::channel(EVENT_BUFFER);

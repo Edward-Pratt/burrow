@@ -394,3 +394,85 @@ async fn the_first_addon_by_id_keeps_a_contested_kind() {
             .contains("already belongs to addon notes")
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn addons_write_to_their_data_folder_and_stay_approved() {
+    let f = Fixture::new();
+    f.approve().await;
+    let note = f.create("note", "Shopping").await;
+
+    let cwd = f
+        .invoke("touch", Some(note.id), &[])
+        .await
+        .unwrap()
+        .unwrap();
+    let data = f.dir.path().join("state/addons/notes");
+    assert_eq!(Path::new(&cwd), data.canonicalize().unwrap());
+    assert!(data.join("scratch").exists());
+    assert!(!f.dir.path().join("addons/notes/scratch").exists());
+
+    f.run(Command::ReloadConfig).await.unwrap();
+    assert_eq!(f.state().await, AddonState::Running);
+}
+
+/// The event types the addon has received, once `expected` shows up or
+/// after a second.
+async fn events_seen(f: &Fixture, note: NodeId, expected: &str) -> String {
+    let mut seen = String::new();
+    for _ in 0..50 {
+        seen = f.invoke("events", Some(note), &[]).await.unwrap().unwrap();
+        if seen.contains(expected) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    seen
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn node_events_need_nodes_read() {
+    let f = Fixture::new();
+    f.approve().await;
+    let note = f.create("note", "Shopping").await;
+    f.view(note.id).await.unwrap();
+    f.create("ssh-host", "web").await;
+    assert_eq!(
+        events_seen(&f, note.id, "node_created").await,
+        "node_created"
+    );
+
+    let f = Fixture::with(|dir| {
+        let manifest = MANIFEST.replace(r#""nodes:read", "#, "");
+        fs::write(dir.join("addons/notes/addon.toml"), manifest).unwrap();
+    });
+    f.approve().await;
+    let note = f.create("note", "Shopping").await;
+    f.view(note.id).await.unwrap();
+    f.create("ssh-host", "web").await;
+    // Give a wrongly forwarded event time to arrive.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(events_seen(&f, note.id, "never").await, "");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn views_can_only_be_redrawn_for_own_nodes() {
+    let f = Fixture::new();
+    f.approve().await;
+    let note = f.create("note", "Mine").await;
+    let host = f.create("ssh-host", "web").await;
+
+    let target = host.id.to_string();
+    let error = f
+        .invoke("redraw", Some(note.id), &[("target", &target)])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("permission denied"), "{error}");
+
+    let mut events = f.core.subscribe();
+    let target = note.id.to_string();
+    let message = f
+        .invoke("redraw", Some(note.id), &[("target", &target)])
+        .await;
+    assert_eq!(message.unwrap().as_deref(), Some("Redrawn"));
+    assert_eq!(next_view(&mut events).await.0, note.id);
+}

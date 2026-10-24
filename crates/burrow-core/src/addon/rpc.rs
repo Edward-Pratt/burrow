@@ -7,6 +7,7 @@
 //! passes core events on, filtered by the addon's permissions.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,9 +33,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Messages queued for the addon's stdin before senders wait.
 const OUTBOX: usize = 64;
 
-/// Environment variables an addon gets. Everything else, `SSH_AUTH_SOCK`
-/// above all, is left out: addons work through connection handles, not the
-/// user's credentials.
+/// Environment variables an addon gets. Everything else is left out, so it
+/// does not inherit pointers to the user's credentials such as
+/// `SSH_AUTH_SOCK`. This is not a wall: the addon runs as the user and can
+/// still find such sockets by path.
 const KEPT_ENV: [&str; 9] = [
     "PATH",
     "HOME",
@@ -122,9 +124,10 @@ impl Process {
 pub(crate) async fn start(
     core: &Core,
     manifest: Arc<Manifest>,
+    data: &Path,
     generation: u64,
 ) -> Result<Process, String> {
-    let process = spawn(core, &manifest, generation)?;
+    let process = spawn(core, &manifest, data, generation)?;
     process
         .call::<Value>("initialize", json!({"api": API_VERSION, "id": manifest.id}))
         .await?;
@@ -136,11 +139,21 @@ pub(crate) async fn start(
 /// Not `async` on purpose: the reader task runs commands through
 /// `Core::execute`, which can itself start an addon. Spawning from inside an
 /// `async fn` would make that future's type depend on itself.
-fn spawn(core: &Core, manifest: &Arc<Manifest>, generation: u64) -> Result<Process, String> {
+///
+/// It runs in `data`, its writable folder, rather than its own folder:
+/// any file written there would change the fingerprint and withdraw the
+/// approval. For the same reason Python is told to keep bytecode caches in
+/// `data`.
+fn spawn(
+    core: &Core,
+    manifest: &Arc<Manifest>,
+    data: &Path,
+    generation: u64,
+) -> Result<Process, String> {
     let mut command = tokio::process::Command::new(&manifest.program);
     command
         .args(&manifest.args)
-        .current_dir(&manifest.dir)
+        .current_dir(data)
         .env_clear()
         .envs(
             KEPT_ENV
@@ -148,7 +161,10 @@ fn spawn(core: &Core, manifest: &Arc<Manifest>, generation: u64) -> Result<Proce
                 .filter_map(|k| Some((k, std::env::var_os(k)?))),
         )
         .env("BURROW_ADDON_ID", &manifest.id)
+        .env("BURROW_ADDON_DIR", &manifest.dir)
+        .env("BURROW_ADDON_DATA", data)
         .env("BURROW_API", API_VERSION.to_string())
+        .env("PYTHONPYCACHEPREFIX", data.join("pycache"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

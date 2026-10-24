@@ -14,6 +14,9 @@
 //!
 //! Addons start on first use. One that stops is started again on the next
 //! use, after a delay that doubles each time it stops soon after starting.
+//!
+//! Since writing into its folder would withdraw an addon's approval, each
+//! addon runs in a data folder of its own under the state folder instead.
 
 mod manifest;
 mod rpc;
@@ -48,9 +51,12 @@ struct Grants {
 pub(crate) struct Host {
     dir: PathBuf,
     grants_path: PathBuf,
+    /// Holds each addon's writable data folder, by id.
+    data_dir: PathBuf,
     state: Mutex<State>,
-    /// Held while starting an addon, so two first uses start it once.
-    starting: tokio::sync::Mutex<()>,
+    /// Held while starting an addon, so two first uses start it once. One
+    /// per addon, so one that is slow to start holds up no other.
+    starting: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Default)]
@@ -76,12 +82,13 @@ struct Failure {
 }
 
 impl Host {
-    pub fn new(dir: PathBuf, grants_path: PathBuf) -> Host {
+    pub fn new(dir: PathBuf, grants_path: PathBuf, data_dir: PathBuf) -> Host {
         Host {
             dir,
             grants_path,
+            data_dir,
             state: Mutex::default(),
-            starting: tokio::sync::Mutex::new(()),
+            starting: Mutex::default(),
         }
     }
 
@@ -259,17 +266,31 @@ impl Host {
         if let Some(process) = self.current(id, &manifest.fingerprint)? {
             return Ok(process);
         }
-        let _starting = self.starting.lock().await;
+        let lock = self
+            .starting
+            .lock()
+            .unwrap()
+            .entry(id.clone())
+            .or_default()
+            .clone();
+        let _starting = lock.lock().await;
         if let Some(process) = self.current(id, &manifest.fingerprint)? {
             return Ok(process);
         }
 
-        // The program may have changed since the last scan. Check the file
-        // that is about to run against the approval.
-        let check = manifest.clone();
-        let current = tokio::task::spawn_blocking(move || manifest::load(&check.dir))
-            .await
-            .map_err(|e| Error::Task(e.to_string()))?;
+        // The program may have changed since the last scan. Check the files
+        // that are about to run against the approval.
+        let (check, data) = (manifest.clone(), self.data_dir.join(id));
+        let make_data = data.clone();
+        let (current, made) = tokio::task::spawn_blocking(move || {
+            (
+                manifest::load(&check.dir),
+                std::fs::create_dir_all(&make_data),
+            )
+        })
+        .await
+        .map_err(|e| Error::Task(e.to_string()))?;
+        made.map_err(|e| Error::io(&data, e))?;
         if current.map(|m| m.fingerprint).as_ref() != Ok(&manifest.fingerprint) {
             // A rescan marks it as needing approval and tells clients.
             let core = core.clone();
@@ -282,7 +303,7 @@ impl Host {
             state.next_generation += 1;
             state.next_generation
         };
-        let process = match rpc::start(core, manifest.clone(), generation).await {
+        let process = match rpc::start(core, manifest.clone(), &data, generation).await {
             Ok(process) => Arc::new(process),
             Err(error) => {
                 self.record_failure(id, error.clone());

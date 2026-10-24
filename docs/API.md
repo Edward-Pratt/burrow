@@ -156,7 +156,12 @@ An addon never runs until the user approves it. The addons folder can arrive wit
 - **Where approvals live:** in `$XDG_STATE_HOME/burrow/addons.toml`, outside the config folder, so they do not travel with it.
 - **Limits:** a folder over 4096 files or 256 MiB is refused rather than partly pinned. Files outside the folder that the program reads are not covered, and neither is a file swapped in the instant between the check and the program reading it.
 
-**Permissions limit the Burrow API, not the program.** An approved addon is a normal process running as you. It can read your files like any other program. Its permissions only decide what it may ask Burrow to do. It does get a cleared environment: only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TZ`, `TMPDIR` and `XDG_RUNTIME_DIR` are passed, plus `BURROW_ADDON_ID` and `BURROW_API`. In particular, `SSH_AUTH_SOCK` is not passed.
+**Permissions limit the Burrow API, not the program.** An approved addon is a normal process running as you. It can read your files like any other program, including agent sockets it finds by path. Its permissions only decide what it may ask Burrow to do.
+
+### Where an addon runs
+
+- **Its folder is read-only in practice.** Writing a file there changes the fingerprint and withdraws the approval. So an addon runs in its own data folder, `$XDG_STATE_HOME/burrow/addons/<id>/`, and keeps its files there. `PYTHONPYCACHEPREFIX` points Python's bytecode cache there too.
+- **Environment:** cleared, then only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TZ`, `TMPDIR` and `XDG_RUNTIME_DIR` are passed. Burrow adds `BURROW_ADDON_ID`, `BURROW_ADDON_DIR` (its folder), `BURROW_ADDON_DATA` (the data folder) and `BURROW_API`. Pointers to your credentials, such as `SSH_AUTH_SOCK`, are not passed.
 
 ### Permissions
 
