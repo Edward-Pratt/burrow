@@ -18,3 +18,7 @@ Planning. See [docs/DESIGN.md](docs/DESIGN.md).
 ## Stack
 
 Native Rust + GTK4 (gtk4-rs + relm4). No webview. The core (`burrow-core`) is separate from the UI (`burrow-gtk`).
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE). Addons run as separate processes and may use any license.

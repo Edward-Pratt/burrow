@@ -137,7 +137,7 @@ Built-in features use the same addon API as third-party ones.
 3. Local terminal (VTE)
 4. SSH: `~/.ssh/config` parsing, `known_hosts`, russh terminal, agent auth
 5. Addon protocol v1: manifest, loader, declarative UI, permissions
-6. Postgres addon (GtkSourceView editor, GtkColumnView grid)
-7. SFTP, tunnels, then the rest
+6. SSH tunnels + SFTP file panel
+7. Postgres addon (GtkSourceView editor, GtkColumnView grid), then the rest
 8. `burrowd` + `burrow-cli` + MCP bridge
 9. `burrow-agent` + monitoring addon
