@@ -280,11 +280,12 @@ fn resolve_program(dir: &Path, command: &str) -> Result<PathBuf, String> {
 const MAX_FILES: usize = 4096;
 const MAX_BYTES: u64 = 256 << 20;
 
-/// A hash of every file in the addon's folder, by relative path, except
-/// `addon.toml` (its approved fields are pinned separately). The program
-/// is often a script that loads its siblings, so pinning the program file
-/// alone would let those change unseen. Symlinks are pinned by their target
-/// and refused when they lead out of the folder.
+/// A hash of every file in the addon's folder, by relative path,
+/// `addon.toml` included. The program is often a script that loads its
+/// siblings, so pinning the program file alone would let those change
+/// unseen. Symlinks are pinned by their target and refused when they lead
+/// out of the folder. Names must be UTF-8, and each field is hashed with
+/// its length, so two different folders never hash the same way.
 fn hash_folder(dir: &Path) -> Result<String, String> {
     let mut entries = Vec::new();
     let mut bytes = 0;
@@ -292,10 +293,10 @@ fn hash_folder(dir: &Path) -> Result<String, String> {
     entries.sort();
     let mut hasher = Sha256::new();
     for (path, hash) in entries {
-        hasher.update(path.as_bytes());
-        hasher.update([0]);
-        hasher.update(hash.as_bytes());
-        hasher.update(b"\n");
+        for field in [path, hash] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
     }
     Ok(HEXLOWER.encode(&hasher.finalize()))
 }
@@ -312,11 +313,9 @@ fn walk(
         let relative = path
             .strip_prefix(root)
             .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
-        if relative == MANIFEST_FILE {
-            continue;
-        }
+            .to_str()
+            .ok_or_else(|| format!("{} is not a UTF-8 name", path.display()))?
+            .to_string();
         let meta = fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         if meta.is_dir() {
             walk(root, &path, entries, bytes)?;
@@ -331,7 +330,10 @@ fn walk(
                 return Err(format!("{relative} links outside the addon's folder"));
             }
             let target = fs::read_link(&path).map_err(|e| format!("{relative}: {e}"))?;
-            format!("link:{}", target.display())
+            let target = target
+                .to_str()
+                .ok_or_else(|| format!("{relative} links to a name that is not UTF-8"))?;
+            format!("link:{target}")
         } else if meta.is_file() {
             *bytes += meta.len();
             if *bytes > MAX_BYTES {
@@ -348,8 +350,9 @@ fn walk(
     Ok(())
 }
 
-/// What an approval covers. Titles, the name and the version are left out,
-/// so rewording a menu entry does not ask for approval again.
+/// What an approval covers. The manifest's own bytes are in `files_sha256`;
+/// the approved fields are spelled out as well, to keep what is approved
+/// readable here.
 #[derive(Serialize)]
 struct Approved<'a> {
     id: &'a str,
@@ -509,9 +512,14 @@ label = "Note"
         let (_root, folder) = addon(MANIFEST);
         let first = load(&folder).unwrap().fingerprint;
 
+        // The program might read its manifest, so that counts too.
         let renamed = MANIFEST.replace(r#"name = "Notes""#, r#"name = "My notes""#);
         fs::write(folder.join(MANIFEST_FILE), renamed).unwrap();
-        assert_eq!(load(&folder).unwrap().fingerprint, first);
+        let first = {
+            let renamed = load(&folder).unwrap().fingerprint;
+            assert_ne!(renamed, first);
+            renamed
+        };
 
         fs::write(folder.join("bin/notes"), "#!/bin/sh\necho changed\n").unwrap();
         let changed = load(&folder).unwrap().fingerprint;
