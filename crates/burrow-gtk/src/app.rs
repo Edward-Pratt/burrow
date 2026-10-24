@@ -8,14 +8,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use burrow_core::{Command, Core, Event, Node, NodeId, NodePatch, Problem, Response, Watcher};
+use burrow_core::{
+    Command, Core, Event, Node, NodeId, NodePatch, Problem, Response, SSH_HOST_KIND, SessionId,
+    SessionState, Watcher,
+};
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
 use relm4::{Component, ComponentParts, ComponentSender, gtk};
 use tokio::sync::broadcast::error::RecvError;
+use vte4::TerminalExt;
 
 use crate::dialogs;
 use crate::palette::{self, Item};
+use crate::remote::{self, Remote, Unclaimed};
 use crate::runtime::runtime;
 use crate::settings::{Theme, UiSettings};
 use crate::sidebar;
@@ -73,6 +78,30 @@ pub enum AppMsg {
         title: String,
     },
     TerminalExited(u32),
+    /// The core accepted `open_terminal` for an SSH host tab.
+    SessionStarted {
+        node: NodeId,
+        session: SessionId,
+    },
+    /// `open_terminal` itself failed.
+    SessionFailed {
+        node: NodeId,
+        error: String,
+    },
+    SessionOutput {
+        session: SessionId,
+        data: Vec<u8>,
+    },
+    /// Typed into an SSH host tab.
+    RemoteInput {
+        node: NodeId,
+        data: Vec<u8>,
+    },
+    RemoteResize {
+        node: NodeId,
+        cols: u16,
+        rows: u16,
+    },
     ShowPalette,
     ToggleSidebar,
     ShowSettings,
@@ -105,6 +134,9 @@ pub struct App {
     error: Option<String>,
     tabs: HashMap<TabKey, Tab>,
     next_terminal: u32,
+    /// SSH host tabs, by node.
+    remotes: HashMap<NodeId, Remote>,
+    unclaimed: Unclaimed,
     /// Watches the config folder while the window is open.
     _watcher: Option<Watcher>,
     sidebar_dirty: bool,
@@ -168,6 +200,8 @@ impl Component for App {
             error,
             tabs: HashMap::new(),
             next_terminal: 1,
+            remotes: HashMap::new(),
+            unclaimed: Unclaimed::default(),
             _watcher: watcher,
             sidebar_dirty: false,
         };
@@ -187,18 +221,23 @@ impl Component for App {
             AppMsg::Loaded { nodes, problems } => {
                 self.nodes = nodes.into_iter().map(|n| (n.id, n)).collect();
                 self.problems = problems;
-                self.tabs.retain(|key, tab| {
-                    let keep = match key {
-                        TabKey::Node(id) => self.nodes.contains_key(id),
-                        TabKey::Terminal(_) => true,
-                    };
-                    if !keep {
-                        close_page(&widgets.notebook, &tab.page);
-                    }
-                    keep
-                });
+                let gone: Vec<TabKey> = self
+                    .tabs
+                    .keys()
+                    .filter(|key| match key {
+                        TabKey::Node(id) => !self.nodes.contains_key(id),
+                        TabKey::Terminal(_) => false,
+                    })
+                    .copied()
+                    .collect();
+                for key in gone {
+                    self.close_tab(key, widgets);
+                }
                 self.sidebar_dirty = true;
             }
+            AppMsg::CoreEvent(
+                event @ (Event::SessionChanged { .. } | Event::PromptRequested { .. }),
+            ) => self.session_event(event, window, &sender),
             AppMsg::CoreEvent(event) => self.apply_event(event, widgets),
             AppMsg::Resync => load(&self.core, &sender),
             AppMsg::Failed(error) => self.error = Some(error),
@@ -259,6 +298,72 @@ impl Component for App {
                 }
             }
             AppMsg::TerminalExited(id) => self.close_tab(TabKey::Terminal(id), widgets),
+            AppMsg::SessionStarted { node, session } => {
+                match self.remotes.get_mut(&node) {
+                    Some(remote) if remote.state == remote::State::Starting => {
+                        remote.state = remote::State::Running(session);
+                        // Sizes seen while starting had no session to go to.
+                        let (cols, rows) = terminal::size(&remote.terminal);
+                        execute(
+                            &self.core,
+                            &sender,
+                            Command::ResizeTerminal {
+                                session,
+                                cols,
+                                rows,
+                            },
+                        );
+                        for event in self.unclaimed.claim(session) {
+                            self.session_event(event, window, &sender);
+                        }
+                    }
+                    // The tab was closed while the session started.
+                    _ => execute(&self.core, &sender, Command::CloseSession { session }),
+                }
+            }
+            AppMsg::SessionFailed { node, error } => {
+                if let Some(remote) = self.remotes.get_mut(&node) {
+                    remote.terminal.feed(remote::failure(&error).as_bytes());
+                    remote.state = remote::State::Closed;
+                }
+            }
+            AppMsg::SessionOutput { session, data } => {
+                if let Some(remote) = self.remote_for(session) {
+                    remote.terminal.feed(&data);
+                }
+            }
+            AppMsg::RemoteInput { node, data } => {
+                let Some(remote) = self.remotes.get_mut(&node) else {
+                    return;
+                };
+                match remote.state {
+                    remote::State::Running(session) => execute(
+                        &self.core,
+                        &sender,
+                        Command::WriteTerminal { session, data },
+                    ),
+                    remote::State::Closed if data.contains(&b'\r') => {
+                        remote.terminal.feed(b"\r\n");
+                        remote.state = remote::State::Starting;
+                        remote::start(&self.core, node, &remote.terminal, &sender);
+                    }
+                    _ => {}
+                }
+            }
+            AppMsg::RemoteResize { node, cols, rows } => {
+                if let Some(&Remote {
+                    state: remote::State::Running(session),
+                    ..
+                }) = self.remotes.get(&node)
+                {
+                    let command = Command::ResizeTerminal {
+                        session,
+                        cols,
+                        rows,
+                    };
+                    execute(&self.core, &sender, command);
+                }
+            }
             AppMsg::ShowPalette => self.show_palette(window, &sender),
             AppMsg::ToggleSidebar => {
                 self.settings.sidebar_visible = !self.settings.sidebar_visible;
@@ -337,12 +442,63 @@ impl App {
             Event::NodeDeleted { id } => {
                 self.nodes.remove(&id);
                 self.expanded.remove(&id);
-                if let Some(tab) = self.tabs.remove(&TabKey::Node(id)) {
-                    close_page(&widgets.notebook, &tab.page);
-                }
+                self.close_tab(TabKey::Node(id), widgets);
                 self.sidebar_dirty = true;
             }
             Event::ProblemsChanged { problems } => self.problems = problems,
+            // Handled by `session_event`, which needs the window.
+            Event::SessionChanged { .. } | Event::PromptRequested { .. } => {}
+        }
+    }
+
+    fn remote_for(&self, session: SessionId) -> Option<&Remote> {
+        self.remotes
+            .values()
+            .find(|r| r.state == remote::State::Running(session))
+    }
+
+    fn session_event(
+        &mut self,
+        event: Event,
+        window: &gtk::ApplicationWindow,
+        sender: &ComponentSender<Self>,
+    ) {
+        let session = match &event {
+            Event::SessionChanged { session, .. } | Event::PromptRequested { session, .. } => {
+                *session
+            }
+            _ => return,
+        };
+        let Some(remote) = self
+            .remotes
+            .values_mut()
+            .find(|r| r.state == remote::State::Running(session))
+        else {
+            self.unclaimed.hold(session, event);
+            return;
+        };
+        match event {
+            Event::SessionChanged { state, .. } => {
+                if let Some(text) = remote::status_text(&state) {
+                    remote.terminal.feed(text.as_bytes());
+                }
+                if matches!(state, SessionState::Closed { .. }) {
+                    remote.state = remote::State::Closed;
+                }
+            }
+            Event::PromptRequested { prompt, .. } => {
+                let (core, sender) = (self.core.clone(), sender.clone());
+                let id = prompt.id;
+                dialogs::answer(window, &prompt, move |answer| {
+                    let command = Command::AnswerPrompt {
+                        session,
+                        prompt: id,
+                        answer,
+                    };
+                    execute(&core, &sender, command);
+                });
+            }
+            _ => {}
         }
     }
 
@@ -384,9 +540,40 @@ impl App {
         let Some(node) = self.nodes.get(&id) else {
             return;
         };
+        let (icon, name) = (sidebar::icon_name(node, false), node.name.clone());
+        if node.kind == SSH_HOST_KIND {
+            let term = terminal::remote(
+                |_| {},
+                {
+                    let sender = sender.clone();
+                    move |data| sender.input(AppMsg::RemoteInput { node: id, data })
+                },
+                {
+                    let sender = sender.clone();
+                    move |cols, rows| {
+                        sender.input(AppMsg::RemoteResize {
+                            node: id,
+                            cols,
+                            rows,
+                        })
+                    }
+                },
+            );
+            let page = terminal::page(&term);
+            self.add_tab(key, page.upcast(), icon, &name, widgets, sender);
+            term.grab_focus();
+            remote::start(&self.core, id, &term, sender);
+            self.remotes.insert(
+                id,
+                Remote {
+                    terminal: term,
+                    state: remote::State::Starting,
+                },
+            );
+            return;
+        }
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
         fill_page(&page, node, &self.nodes);
-        let (icon, name) = (sidebar::icon_name(node, false), node.name.clone());
         self.add_tab(key, page.upcast(), icon, &name, widgets, sender);
     }
 
@@ -457,6 +644,18 @@ impl App {
     fn close_tab(&mut self, key: TabKey, widgets: &Widgets) {
         if let Some(tab) = self.tabs.remove(&key) {
             close_page(&widgets.notebook, &tab.page);
+        }
+        // A session still starting is closed when its id arrives.
+        if let TabKey::Node(id) = key
+            && let Some(Remote {
+                state: remote::State::Running(session),
+                ..
+            }) = self.remotes.remove(&id)
+        {
+            let core = self.core.clone();
+            runtime().spawn(async move {
+                let _ = core.execute(Command::CloseSession { session }).await;
+            });
         }
     }
 
@@ -834,7 +1033,7 @@ fn fill_page(page: &gtk::Box, node: &Node, nodes: &HashMap<NodeId, Node>) {
         page.append(&props);
     }
 
-    let note = gtk::Label::new(Some("Connecting arrives with the SSH milestone."));
+    let note = gtk::Label::new(Some("Burrow can't open this kind of item yet."));
     note.set_xalign(0.0);
     note.set_margin_top(12);
     note.add_css_class("dim");

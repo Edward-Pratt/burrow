@@ -1,8 +1,11 @@
-//! Local terminal tabs. VTE starts and runs the shell itself, so the core is
-//! not involved: a local shell has no connection or secrets to manage.
+//! Terminal tabs. For a local shell, VTE starts and runs the shell itself,
+//! so the core is not involved. For an SSH host, the core runs the session
+//! and VTE only draws: output is fed in, and keystrokes go back to the core.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use relm4::gtk;
 use relm4::gtk::glib;
@@ -66,19 +69,8 @@ pub fn new(
     on_title: impl Fn(String) + 'static,
     on_exit: impl Fn() + 'static,
 ) -> vte4::Terminal {
-    let terminal = vte4::Terminal::new();
-    terminal.set_hexpand(true);
-    terminal.set_vexpand(true);
-    terminal.set_scrollback_lines(10_000);
-    terminal.set_scroll_on_keystroke(true);
-
-    terminal.connect_window_title_changed(move |terminal| {
-        if let Some(title) = terminal.window_title().filter(|t| !t.is_empty()) {
-            on_title(title.to_string());
-        }
-    });
+    let terminal = base(on_title);
     terminal.connect_child_exited(move |_, _status| on_exit());
-    add_clipboard_shortcuts(&terminal);
 
     let home = glib::home_dir();
     terminal.spawn_async(
@@ -104,6 +96,61 @@ pub fn new(
             }
         ),
     );
+    terminal
+}
+
+/// A terminal with no process of its own, for a session the core runs.
+///
+/// `on_input` gets what the user types (and VTE's replies to terminal
+/// queries). `on_resize` gets the size in columns and rows whenever it
+/// changes. The same rule as [`new`] applies: the callbacks must not hold
+/// the terminal.
+pub fn remote(
+    on_title: impl Fn(String) + 'static,
+    on_input: impl Fn(Vec<u8>) + 'static,
+    on_resize: impl Fn(u16, u16) + 'static,
+) -> vte4::Terminal {
+    let terminal = base(on_title);
+    terminal.connect_commit(move |_, text, _| on_input(text.as_bytes().to_vec()));
+
+    // VTE has no signal for "the grid changed size" when it has no PTY of
+    // its own, so check a few times a second. The timer holds the terminal
+    // weakly and stops when it is gone.
+    let last = Cell::new((0, 0));
+    let weak = terminal.downgrade();
+    glib::timeout_add_local(Duration::from_millis(200), move || {
+        let Some(terminal) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let size = size(&terminal);
+        if terminal.is_mapped() && size != last.get() {
+            last.set(size);
+            on_resize(size.0, size.1);
+        }
+        glib::ControlFlow::Continue
+    });
+    terminal
+}
+
+/// Columns and rows.
+pub fn size(terminal: &vte4::Terminal) -> (u16, u16) {
+    let clamp = |n: std::ffi::c_long| n.clamp(1, u16::MAX.into()) as u16;
+    (clamp(terminal.column_count()), clamp(terminal.row_count()))
+}
+
+/// Settings shared by local and remote terminals.
+fn base(on_title: impl Fn(String) + 'static) -> vte4::Terminal {
+    let terminal = vte4::Terminal::new();
+    terminal.set_hexpand(true);
+    terminal.set_vexpand(true);
+    terminal.set_scrollback_lines(10_000);
+    terminal.set_scroll_on_keystroke(true);
+    terminal.connect_window_title_changed(move |terminal| {
+        if let Some(title) = terminal.window_title().filter(|t| !t.is_empty()) {
+            on_title(title.to_string());
+        }
+    });
+    add_clipboard_shortcuts(&terminal);
     terminal
 }
 
