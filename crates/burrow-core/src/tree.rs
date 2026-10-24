@@ -205,7 +205,7 @@ impl Tree {
     /// All nodes, sorted by name so clients get a stable order.
     pub fn nodes(&self) -> Vec<Node> {
         let mut nodes: Vec<Node> = self.entries.values().map(|e| e.node.clone()).collect();
-        nodes.sort_by(|a, b| (a.name.to_lowercase(), a.id).cmp(&(b.name.to_lowercase(), b.id)));
+        nodes.sort_by_key(|a| (a.name.to_lowercase(), a.id));
         nodes
     }
 
