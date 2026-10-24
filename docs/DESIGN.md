@@ -34,7 +34,51 @@ Cargo workspace:
 | `burrowd` (later) | The core as a user systemd service, so tunnels and monitoring keep running with the window closed. |
 | `burrow-cli` (later) | A command-line client. |
 
-The core exposes one API that the UI, addons, the CLI and an MCP bridge all use.
+### One versioned API for every client
+
+The core is driven only through a single command and event API, defined in one place and versioned.
+
+- **Commands** are requests (`connect`, `open_terminal`, `run_query`) and return a result.
+- **Events** are what the core pushes to subscribers (`session_state_changed`, `query_progress`, `alert_raised`).
+- **Clients:** the GTK UI, addons, `burrow-cli` and the MCP bridge for Claude are all clients of this API. None of them use a private shortcut into the core. In-process, the UI calls it directly; out-of-process clients use JSON-RPC over a Unix socket.
+- **Addon protocol:** the addon protocol is a permission-filtered subset of the same API.
+- **Testing:** the core is tested headless against Docker containers running `sshd` and Postgres.
+
+### Plain-text config
+
+All non-secret state lives as TOML files in `$XDG_CONFIG_HOME/burrow/` (default `~/.config/burrow/`):
+
+```
+~/.config/burrow/
+  burrow.toml              # app settings
+  tree/                    # sidebar: one folder per sidebar folder
+    work/
+      _folder.toml         # folder metadata (colour, order)
+      api-db.toml          # a connection
+      prod-web.toml        # an SSH host's Burrow-only extras
+  addons/                  # installed addons
+```
+
+- **Secrets:** stored only in the keyring. Config files hold a reference to the keyring entry (`secret = "keyring:burrow/api-db"`), never the secret itself.
+- **Dotfiles-friendly:** you can keep the config in a dotfiles repo and review changes with git.
+- **Sharing:** sharing a folder means copying its directory. Secrets are added only through an optional encrypted bundle (Argon2id + XChaCha20-Poly1305).
+- **Edits from outside Burrow:** the core watches the directory, so edits made in an editor show up live.
+- **Runtime state stays out of the config folder:** history, the open-tab layout and caches live in `$XDG_STATE_HOME/burrow/` and `$XDG_CACHE_HOME/burrow/`.
+
+### OpenSSH config as source of truth
+
+- **Host settings:** hosts come from `~/.ssh/config`, including `Include`, `Host` patterns, `Match`, `ProxyJump`, `IdentityFile`, `User` and `Port`. Burrow does not keep its own copy of them.
+- **Host keys:** host keys are checked against and added to `~/.ssh/known_hosts`.
+- **Burrow-only extras:** colour, folder, start directory and monitoring settings go in Burrow's config, keyed by the `Host` alias.
+- **Hosts added in Burrow:** these are written to `~/.ssh/config.d/burrow.conf`, which is pulled in by an `Include` line. Burrow asks once before adding that line, so `ssh myhost` in a shell matches Burrow.
+
+### Server agent (later, as an addon)
+
+`burrow-agent` is an optional small static binary (musl, x86_64 and aarch64) that runs on servers. It streams structured stats, systemd, container and PM2 state over the existing SSH connection as JSON lines.
+
+- **Install:** Burrow offers to upload it to `~/.local/share/burrow/` on the server and checks its version and hash on every connect.
+- **Fallback:** servers without the agent fall back to plain shell commands with parsed output.
+- **No exposed ports:** the agent never listens on the network. It only talks over SSH.
 
 ## Platform
 
@@ -42,7 +86,8 @@ The core exposes one API that the UI, addons, the CLI and an MCP bridge all use.
 |---|---|
 | Secrets | Secret Service through the `keyring` crate (gnome-keyring or KWallet) |
 | Local terminal | VTE starts and runs the shell itself; read the shell list from `$SHELL` and `/etc/shells`. `portable-pty` only if the core ever needs a PTY without the UI. |
-| SSH | `russh`; agent auth through `SSH_AUTH_SOCK` |
+| SSH | `russh`; agent auth through `SSH_AUTH_SOCK`; reads `~/.ssh/config` and `known_hosts` |
+| Paths | XDG base directories (`directories` crate) |
 | Notifications | `GNotification` (freedesktop D-Bus, works with mako and swaync) |
 | Packaging | AUR PKGBUILD as the main channel, with no self-updater. Not Flatpak: its sandbox blocks host shells, the SSH agent and `~/.ssh`. |
 | RDP | IronRDP or FreeRDP, as a late addon |
@@ -87,10 +132,12 @@ Built-in features use the same addon API as third-party ones.
 
 ## Milestones
 
-1. Workspace with `burrow-core` and `burrow-gtk`: window, tabs, sidebar, palette, settings, keyring
-2. Local terminal (VTE)
-3. SSH hosts + terminal (russh), host key verification, agent auth
-4. Addon protocol v1: manifest, loader, declarative UI, permissions
-5. Postgres addon (GtkSourceView editor, GtkColumnView grid)
-6. SFTP, tunnels, then the rest
-7. `burrowd` + `burrow-cli`
+1. Workspace with `burrow-core` and `burrow-gtk`: core API v1, TOML config tree + file watcher, keyring
+2. GTK shell: window, tabs, sidebar, palette, settings
+3. Local terminal (VTE)
+4. SSH: `~/.ssh/config` parsing, `known_hosts`, russh terminal, agent auth
+5. Addon protocol v1: manifest, loader, declarative UI, permissions
+6. Postgres addon (GtkSourceView editor, GtkColumnView grid)
+7. SFTP, tunnels, then the rest
+8. `burrowd` + `burrow-cli` + MCP bridge
+9. `burrow-agent` + monitoring addon
