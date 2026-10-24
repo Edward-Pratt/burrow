@@ -117,6 +117,8 @@ protocol = "jsonrpc-stdio"
   The core draws all of this with native widgets. Addons never depend on GTK, so changing toolkit later breaks no addon.
 - **Custom UI escape hatch (later):** an optional webview panel for an addon that needs fully custom UI. It loads only when that addon uses it.
 - **Permissions:** declared in the manifest, approved by the user on install, and enforced by the core on every call.
+- **Approval is pinned:** an approval covers a hash of the manifest's permissions and kinds and of every file in the addon's folder. It is kept in `$XDG_STATE_HOME/burrow/`, not the config folder, because the config folder may be shared or synced. An addon that arrives with a `git pull` never starts by itself, and a changed one asks again. Permissions limit the Burrow API, not the process: an approved addon runs as the user. Burrow does not sandbox it, and the approval dialog says so.
+- **Static contributions:** kinds, palette commands and context actions are declared in the manifest, not reported at runtime. Burrow can show them, and check writes against them, without starting the addon, so addons start only when first used.
 - **Secrets:** addons never receive credentials. They ask the core to open a connection and get an opaque handle back. All authenticated I/O goes through the core.
 
 ### Built-in addons (dogfood the API)

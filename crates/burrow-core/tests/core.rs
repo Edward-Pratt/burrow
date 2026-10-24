@@ -65,6 +65,7 @@ fn open(config_dir: &Path, secrets: Arc<MemoryStore>) -> Core {
     Core::open(CoreOptions {
         config_dir: config_dir.to_path_buf(),
         secrets,
+        state_dir: config_dir.join("state"),
         ssh_config: None,
     })
     .unwrap()

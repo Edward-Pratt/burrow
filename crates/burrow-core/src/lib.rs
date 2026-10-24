@@ -5,6 +5,7 @@
 //! This crate must not depend on any UI toolkit. Everything here is `Send`
 //! so it can run behind a GTK main loop today and inside `burrowd` later.
 
+mod addon;
 mod api;
 mod engine;
 mod error;
@@ -14,8 +15,10 @@ mod tree;
 mod watch;
 
 pub use api::{
-    API_VERSION, Command, Event, FOLDER_KIND, Node, NodeId, NodePatch, Problem, Prompt,
-    PromptAnswer, PromptKind, Response, SSH_HOST_KIND, SecretValue, SessionId, SessionState,
+    API_VERSION, AddonAction, AddonCommand, AddonInfo, AddonKind, AddonState, Block, Button,
+    Command, Event, FOLDER_KIND, Field, FormField, FormInput, FormValue, Node, NodeId, NodePatch,
+    Problem, Prompt, PromptAnswer, PromptKind, Response, SSH_HOST_KIND, SecretValue, SessionId,
+    SessionState, View,
 };
 pub use engine::{Core, CoreOptions};
 pub use error::{Error, Result};

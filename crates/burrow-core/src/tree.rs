@@ -467,7 +467,7 @@ fn write_entry(entry: &Entry) -> Result<()> {
 
 /// Writes to a hidden temp file in the same directory, then renames it over
 /// the target, so readers (including our own watcher) never see half a file.
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let dir = parent_dir(path);
     let mut tmp = NamedTempFile::new_in(&dir).map_err(|e| Error::io(&dir, e))?;
     tmp.write_all(contents.as_bytes())
@@ -550,7 +550,7 @@ fn problem(path: &Path, message: impl ToString) -> Problem {
     }
 }
 
-fn validate_kind(kind: &str) -> Result<()> {
+pub(crate) fn validate_kind(kind: &str) -> Result<()> {
     let ok = !kind.is_empty()
         && kind
             .chars()
@@ -565,7 +565,7 @@ fn validate_kind(kind: &str) -> Result<()> {
     }
 }
 
-fn validate_name(name: String) -> Result<String> {
+pub(crate) fn validate_name(name: String) -> Result<String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err(Error::invalid("name", "must not be empty"));

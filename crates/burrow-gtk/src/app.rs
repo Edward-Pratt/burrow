@@ -5,12 +5,14 @@
 //! it. The UI never edits its node list directly, so it always matches the
 //! core, including after edits made outside Burrow.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::Duration;
 
 use burrow_core::{
-    Command, Core, Event, Node, NodeId, NodePatch, Problem, Response, SSH_HOST_KIND, SessionId,
-    SessionState, Watcher,
+    AddonInfo, Command, Core, Event, FormValue, Node, NodeId, NodePatch, Problem, Response,
+    SSH_HOST_KIND, SessionId, SessionState, View, Watcher,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
@@ -18,6 +20,7 @@ use relm4::{Component, ComponentParts, ComponentSender, gtk};
 use tokio::sync::broadcast::error::RecvError;
 use vte4::TerminalExt;
 
+use crate::addons;
 use crate::dialogs;
 use crate::palette::{self, Item};
 use crate::remote::{self, Remote, Unclaimed};
@@ -31,11 +34,16 @@ pub struct Init {
     pub config_dir: PathBuf,
 }
 
+/// How long a message from an addon stays in the status bar.
+const NOTICE_TIME: Duration = Duration::from_secs(6);
+
 /// What "New …" creates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NewKind {
     Folder,
     SshHost,
+    /// A kind owned by an addon.
+    Addon(String),
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +52,7 @@ pub enum AppMsg {
     Loaded {
         nodes: Vec<Node>,
         problems: Vec<Problem>,
+        addons: Vec<AddonInfo>,
     },
     CoreEvent(Event),
     /// We missed events; reload everything.
@@ -105,6 +114,26 @@ pub enum AppMsg {
         cols: u16,
         rows: u16,
     },
+    /// (Re)loads an addon node's view.
+    LoadView(NodeId),
+    ViewLoaded {
+        node: NodeId,
+        result: Result<View, String>,
+    },
+    /// Sends an action to an addon.
+    Invoke {
+        addon: String,
+        action: String,
+        node: Option<NodeId>,
+        values: BTreeMap<String, FormValue>,
+    },
+    /// An addon's reply to `Invoke`, shown in the status bar.
+    Notice(String),
+    ClearNotice(u32),
+    ManageAddons,
+    ReviewAddon(String),
+    RevokeAddon(String),
+    OpenAddonsFolder,
     ShowPalette,
     ToggleSidebar,
     ShowSettings,
@@ -134,11 +163,18 @@ pub struct App {
     nodes: HashMap<NodeId, Node>,
     expanded: HashSet<NodeId>,
     problems: Vec<Problem>,
+    addons: Vec<AddonInfo>,
     error: Option<String>,
+    /// A message from an addon, and a counter so an old timer does not
+    /// clear a newer one.
+    notice: Option<String>,
+    notice_id: u32,
     tabs: HashMap<TabKey, Tab>,
     next_terminal: u32,
     /// SSH host tabs, by node.
     remotes: HashMap<NodeId, Remote>,
+    /// Tabs drawn by addons: the box their view goes in, by node.
+    views: HashMap<NodeId, gtk::Box>,
     unclaimed: Unclaimed,
     /// Watches the config folder while the window is open.
     _watcher: Option<Watcher>,
@@ -152,6 +188,7 @@ pub struct Widgets {
     row_ids: Vec<NodeId>,
     content: gtk::Stack,
     notebook: gtk::Notebook,
+    new_button: gtk::MenuButton,
     status: gtk::Label,
     problems_button: gtk::MenuButton,
     problems_list: gtk::Label,
@@ -200,10 +237,14 @@ impl Component for App {
             nodes: HashMap::new(),
             expanded: HashSet::new(),
             problems: Vec::new(),
+            addons: Vec::new(),
             error,
+            notice: None,
+            notice_id: 0,
             tabs: HashMap::new(),
             next_terminal: 1,
             remotes: HashMap::new(),
+            views: HashMap::new(),
             unclaimed: Unclaimed::default(),
             _watcher: watcher,
             sidebar_dirty: false,
@@ -221,9 +262,14 @@ impl Component for App {
         window: &Self::Root,
     ) {
         match message {
-            AppMsg::Loaded { nodes, problems } => {
+            AppMsg::Loaded {
+                nodes,
+                problems,
+                addons,
+            } => {
                 self.nodes = nodes.into_iter().map(|n| (n.id, n)).collect();
                 self.problems = problems;
+                self.set_addons(addons, widgets, &sender);
                 let gone: Vec<TabKey> = self
                     .tabs
                     .keys()
@@ -241,7 +287,7 @@ impl Component for App {
             AppMsg::CoreEvent(
                 event @ (Event::SessionChanged { .. } | Event::PromptRequested { .. }),
             ) => self.session_event(event, window, &sender),
-            AppMsg::CoreEvent(event) => self.apply_event(event, widgets),
+            AppMsg::CoreEvent(event) => self.apply_event(event, widgets, &sender),
             AppMsg::Resync => load(&self.core, &sender),
             AppMsg::Failed(error) => self.error = Some(error),
 
@@ -377,6 +423,84 @@ impl Component for App {
                     execute(&self.core, &sender, command);
                 }
             }
+            AppMsg::LoadView(id) => self.load_view(id, &sender),
+            AppMsg::ViewLoaded { node, result } => self.show_view(node, result, &sender),
+            AppMsg::Invoke {
+                addon,
+                action,
+                node,
+                values,
+            } => {
+                let command = Command::InvokeAction {
+                    addon,
+                    action,
+                    node,
+                    values,
+                };
+                let (core, input) = (self.core.clone(), sender.input_sender().clone());
+                runtime().spawn(async move {
+                    let message = match core.execute(command).await {
+                        Ok(Response::Invoked {
+                            message: Some(message),
+                        }) => AppMsg::Notice(message),
+                        Ok(_) => return,
+                        Err(e) => AppMsg::Failed(e.to_string()),
+                    };
+                    let _ = input.send(message);
+                });
+            }
+            AppMsg::Notice(message) => {
+                self.error = None;
+                self.notice = Some(message);
+                self.notice_id += 1;
+                let (id, sender) = (self.notice_id, sender.clone());
+                glib::timeout_add_local_once(NOTICE_TIME, move || {
+                    sender.input(AppMsg::ClearNotice(id));
+                });
+            }
+            AppMsg::ClearNotice(id) => {
+                if id == self.notice_id {
+                    self.notice = None;
+                }
+            }
+            AppMsg::ManageAddons => {
+                let review = {
+                    let sender = sender.clone();
+                    move |id| sender.input(AppMsg::ReviewAddon(id))
+                };
+                let revoke = {
+                    let sender = sender.clone();
+                    move |id| sender.input(AppMsg::RevokeAddon(id))
+                };
+                let open_folder = {
+                    let sender = sender.clone();
+                    move || sender.input(AppMsg::OpenAddonsFolder)
+                };
+                addons::manage(window, &self.addons, review, revoke, open_folder);
+            }
+            AppMsg::ReviewAddon(id) => {
+                if let Some(addon) = self.addons.iter().find(|a| a.id == id) {
+                    let command = Command::ApproveAddon {
+                        id,
+                        fingerprint: addon.fingerprint.clone(),
+                    };
+                    let (core, sender) = (self.core.clone(), sender.clone());
+                    addons::review(window, addon, move || {
+                        execute(&core, &sender, command.clone())
+                    });
+                }
+            }
+            AppMsg::RevokeAddon(id) => {
+                execute(&self.core, &sender, Command::RevokeAddon { id });
+            }
+            AppMsg::OpenAddonsFolder => {
+                let folder = gio::File::for_path(self.core.addons_dir());
+                gtk::FileLauncher::new(Some(&folder)).launch(
+                    Some(window),
+                    None::<&gio::Cancellable>,
+                    |_| {},
+                );
+            }
             AppMsg::ShowPalette => self.show_palette(window, &sender),
             AppMsg::ToggleSidebar => {
                 self.settings.sidebar_visible = !self.settings.sidebar_visible;
@@ -408,7 +532,8 @@ impl Component for App {
             // Rebuilding destroys the focused row; remember whether the
             // sidebar had focus so keyboard use (arrows, Delete) carries on.
             let had_focus = widgets.list.focus_child().is_some();
-            widgets.row_ids = sidebar::rebuild(&widgets.list, &self.nodes, &self.expanded);
+            widgets.row_ids =
+                sidebar::rebuild(&widgets.list, &self.nodes, &self.expanded, &self.icons());
             let row = selection
                 .and_then(|id| widgets.row_ids.iter().position(|&r| r == id))
                 .and_then(|index| widgets.list.row_at_index(index as i32));
@@ -431,7 +556,7 @@ impl Component for App {
 }
 
 impl App {
-    fn apply_event(&mut self, event: Event, widgets: &Widgets) {
+    fn apply_event(&mut self, event: Event, widgets: &Widgets, sender: &ComponentSender<Self>) {
         self.error = None;
         match event {
             Event::NodeCreated { node } => {
@@ -443,17 +568,23 @@ impl App {
                 self.sidebar_dirty = true;
             }
             Event::NodeUpdated { node } => {
-                if let Some(tab) = self.tabs.get(&TabKey::Node(node.id)) {
+                let id = node.id;
+                if let Some(tab) = self.tabs.get(&TabKey::Node(id)) {
                     set_tab_title(&tab.title, &node.name);
                     if let Some(page) = tab.page.downcast_ref::<gtk::Box>() {
                         fill_page(page, &node, &self.nodes);
                     }
                 }
-                self.nodes.insert(node.id, node);
+                self.nodes.insert(id, node);
                 self.sidebar_dirty = true;
+                // The addon draws from the node, so ask it again.
+                if self.views.contains_key(&id) {
+                    self.load_view(id, sender);
+                }
             }
             Event::NodeDeleted { id } => {
                 self.nodes.remove(&id);
+                self.views.remove(&id);
                 self.expanded.remove(&id);
                 self.close_tab(TabKey::Node(id), widgets);
                 self.sidebar_dirty = true;
@@ -461,6 +592,125 @@ impl App {
             Event::ProblemsChanged { problems } => self.problems = problems,
             // Handled by `session_event`, which needs the window.
             Event::SessionChanged { .. } | Event::PromptRequested { .. } => {}
+            Event::AddonsChanged { addons } => self.set_addons(addons, widgets, sender),
+            Event::ViewChanged { node, view } => self.show_view(node, Ok(view), sender),
+        }
+    }
+
+    /// Takes a new addon list. Tabs whose addon was approved or revoked are
+    /// drawn again.
+    fn set_addons(
+        &mut self,
+        addons: Vec<AddonInfo>,
+        widgets: &Widgets,
+        sender: &ComponentSender<Self>,
+    ) {
+        let usable = |list: &[AddonInfo], kind: &str| {
+            addons::owner(list, kind).map(|a| (a.id.clone(), addons::usable(a)))
+        };
+        let stale: Vec<NodeId> = self
+            .views
+            .keys()
+            .filter(|id| {
+                self.nodes.get(id).is_none_or(|node| {
+                    usable(&self.addons, &node.kind) != usable(&addons, &node.kind)
+                })
+            })
+            .copied()
+            .collect();
+        self.addons = addons;
+        for id in stale {
+            self.load_view(id, sender);
+        }
+        widgets
+            .new_button
+            .set_popover(Some(&menu_popover(self.new_entries(None, ""), sender)));
+        self.sidebar_dirty = true;
+    }
+
+    /// The icon for each addon kind.
+    fn icons(&self) -> HashMap<String, String> {
+        self.addons
+            .iter()
+            .flat_map(|a| &a.kinds)
+            .filter_map(|k| Some((k.kind.clone(), k.icon.clone()?)))
+            .collect()
+    }
+
+    /// "New …" entries for folders, SSH hosts and the kinds of approved
+    /// addons. `suffix` follows each label, such as " here".
+    fn new_entries(&self, parent: Option<Option<NodeId>>, suffix: &str) -> Vec<(String, AppMsg)> {
+        let mut kinds = vec![
+            ("folder".to_string(), NewKind::Folder),
+            ("SSH host".to_string(), NewKind::SshHost),
+        ];
+        for addon in self.addons.iter().filter(|a| addons::usable(a)) {
+            for kind in &addon.kinds {
+                kinds.push((kind.label.clone(), NewKind::Addon(kind.kind.clone())));
+            }
+        }
+        kinds
+            .into_iter()
+            .map(|(label, kind)| (format!("New {label}{suffix}"), AppMsg::New { kind, parent }))
+            .collect()
+    }
+
+    /// Asks the node's addon for its view, or explains why it can't.
+    fn load_view(&self, id: NodeId, sender: &ComponentSender<Self>) {
+        let (Some(page), Some(node)) = (self.views.get(&id), self.nodes.get(&id)) else {
+            return;
+        };
+        let Some(addon) = addons::owner(&self.addons, &node.kind) else {
+            let message = "The addon for this kind of item is no longer installed.";
+            addons::render_message(page, &node.name, message, Vec::new());
+            return;
+        };
+        if !addons::usable(addon) {
+            let button = gtk::Button::with_label("Review addon…");
+            send_on_click(&button, sender, AppMsg::ReviewAddon(addon.id.clone()));
+            let message = format!(
+                "This item is drawn by the {} addon, which you have not approved.",
+                addon.name
+            );
+            addons::render_message(page, &node.name, &message, vec![button]);
+            return;
+        }
+        let (core, input) = (self.core.clone(), sender.input_sender().clone());
+        runtime().spawn(async move {
+            let result = match core.execute(Command::OpenView { node: id }).await {
+                Ok(Response::View { view }) => Ok(view),
+                Ok(other) => Err(format!("unexpected reply {other:?}")),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = input.send(AppMsg::ViewLoaded { node: id, result });
+        });
+    }
+
+    fn show_view(&self, id: NodeId, result: Result<View, String>, sender: &ComponentSender<Self>) {
+        let (Some(page), Some(node)) = (self.views.get(&id), self.nodes.get(&id)) else {
+            return;
+        };
+        let Some(addon) = addons::owner(&self.addons, &node.kind) else {
+            return;
+        };
+        match result {
+            Ok(view) => {
+                let (addon, sender) = (addon.id.clone(), sender.clone());
+                let on_action: addons::OnAction = Rc::new(move |action, values| {
+                    sender.input(AppMsg::Invoke {
+                        addon: addon.clone(),
+                        action,
+                        node: Some(id),
+                        values,
+                    })
+                });
+                addons::render(page, &view, on_action);
+            }
+            Err(error) => {
+                let button = gtk::Button::with_label("Try again");
+                send_on_click(&button, sender, AppMsg::LoadView(id));
+                addons::render_message(page, &node.name, &error, vec![button]);
+            }
         }
     }
 
@@ -554,7 +804,8 @@ impl App {
         let Some(node) = self.nodes.get(&id) else {
             return;
         };
-        let (icon, name) = (sidebar::icon_name(node, false), node.name.clone());
+        let icon = sidebar::icon_name(node, false, &self.icons()).to_string();
+        let (icon, name) = (icon.as_str(), node.name.clone());
         if node.kind == SSH_HOST_KIND {
             let term = terminal::remote(
                 |_| {},
@@ -578,6 +829,18 @@ impl App {
             term.grab_focus();
             remote::start(&self.core, id, &term, sender);
             self.remotes.insert(id, Remote::new(term));
+            return;
+        }
+        if addons::owner(&self.addons, &node.kind).is_some() {
+            let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            page.add_css_class("addon-view");
+            let scroller = gtk::ScrolledWindow::builder()
+                .child(&page)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .build();
+            self.add_tab(key, scroller.upcast(), icon, &name, widgets, sender);
+            self.views.insert(id, page);
+            self.load_view(id, sender);
             return;
         }
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -653,6 +916,9 @@ impl App {
         if let Some(tab) = self.tabs.remove(&key) {
             close_page(&widgets.notebook, &tab.page);
         }
+        if let TabKey::Node(id) = key {
+            self.views.remove(&id);
+        }
         // A session still starting is closed when its id arrives.
         if let TabKey::Node(id) = key
             && let Some(Remote {
@@ -685,19 +951,32 @@ impl App {
         window: &gtk::ApplicationWindow,
         sender: &ComponentSender<Self>,
     ) {
-        let (title, label) = match kind {
-            NewKind::Folder => ("New folder", "Folder name"),
-            NewKind::SshHost => ("New SSH host", "Host alias (as in ~/.ssh/config)"),
+        let (title, label) = match &kind {
+            NewKind::Folder => ("New folder".to_string(), "Folder name"),
+            NewKind::SshHost => (
+                "New SSH host".to_string(),
+                "Host alias (as in ~/.ssh/config)",
+            ),
+            NewKind::Addon(kind) => {
+                let label = self
+                    .addons
+                    .iter()
+                    .flat_map(|a| &a.kinds)
+                    .find(|k| &k.kind == kind)
+                    .map_or(kind.as_str(), |k| k.label.as_str());
+                (format!("New {label}"), "Name")
+            }
         };
         let (core, sender) = (self.core.clone(), sender.clone());
-        dialogs::prompt(window, title, label, "", "Create", move |name| {
-            let (kind, props) = match kind {
+        dialogs::prompt(window, &title, label, "", "Create", move |name| {
+            let (kind, props) = match &kind {
                 NewKind::Folder => ("folder", toml::Table::new()),
                 NewKind::SshHost => {
                     let mut props = toml::Table::new();
                     props.insert("alias".into(), name.clone().into());
                     ("ssh-host", props)
                 }
+                NewKind::Addon(kind) => (kind.as_str(), toml::Table::new()),
             };
             execute(
                 &core,
@@ -771,47 +1050,33 @@ impl App {
         sender: &ComponentSender<Self>,
     ) {
         let node = id.and_then(|id| self.nodes.get(&id));
-        let mut entries: Vec<(&str, AppMsg)> = Vec::new();
+        let mut entries: Vec<(String, AppMsg)> = Vec::new();
         match node {
             Some(node) if node.is_folder() => {
-                let parent = Some(Some(node.id));
-                entries.push((
-                    "New folder here",
-                    AppMsg::New {
-                        kind: NewKind::Folder,
-                        parent,
-                    },
-                ));
-                entries.push((
-                    "New SSH host here",
-                    AppMsg::New {
-                        kind: NewKind::SshHost,
-                        parent,
-                    },
-                ));
+                entries.extend(self.new_entries(Some(Some(node.id)), " here"));
             }
-            Some(node) => entries.push(("Open", AppMsg::Open(node.id))),
-            None => {
-                let parent = Some(None);
-                entries.push((
-                    "New folder",
-                    AppMsg::New {
-                        kind: NewKind::Folder,
-                        parent,
-                    },
-                ));
-                entries.push((
-                    "New SSH host",
-                    AppMsg::New {
-                        kind: NewKind::SshHost,
-                        parent,
-                    },
-                ));
+            Some(node) => {
+                entries.push(("Open".into(), AppMsg::Open(node.id)));
+                for addon in self.addons.iter().filter(|a| addons::usable(a)) {
+                    let actions = addon.actions.iter();
+                    for action in actions.filter(|a| a.kinds.contains(&node.kind)) {
+                        entries.push((
+                            action.title.clone(),
+                            AppMsg::Invoke {
+                                addon: addon.id.clone(),
+                                action: action.id.clone(),
+                                node: Some(node.id),
+                                values: BTreeMap::new(),
+                            },
+                        ));
+                    }
+                }
             }
+            None => entries.extend(self.new_entries(Some(None), "")),
         }
         if let Some(node) = node {
-            entries.push(("Rename…", AppMsg::Rename(node.id)));
-            entries.push(("Delete…", AppMsg::Delete(node.id)));
+            entries.push(("Rename…".into(), AppMsg::Rename(node.id)));
+            entries.push(("Delete…".into(), AppMsg::Delete(node.id)));
         }
         let popover = menu_popover(entries, sender);
         popover.set_parent(&widgets.list);
@@ -830,27 +1095,31 @@ impl App {
             subtitle: String::new(),
             message,
         };
-        let mut items = vec![
-            command("New terminal", AppMsg::NewTerminal(None)),
-            command(
-                "New folder",
-                AppMsg::New {
-                    kind: NewKind::Folder,
-                    parent: None,
-                },
-            ),
-            command(
-                "New SSH host",
-                AppMsg::New {
-                    kind: NewKind::SshHost,
-                    parent: None,
-                },
-            ),
+        let mut items = vec![command("New terminal", AppMsg::NewTerminal(None))];
+        items.extend(
+            self.new_entries(None, "")
+                .into_iter()
+                .map(|(title, message)| command(&title, message)),
+        );
+        items.extend([
             command("Toggle sidebar", AppMsg::ToggleSidebar),
             command("Reload config", AppMsg::ReloadConfig),
             command("Open config folder", AppMsg::OpenConfigFolder),
+            command("Manage addons", AppMsg::ManageAddons),
             command("Settings", AppMsg::ShowSettings),
-        ];
+        ]);
+        for addon in self.addons.iter().filter(|a| addons::usable(a)) {
+            items.extend(addon.commands.iter().map(|c| Item {
+                title: c.title.clone(),
+                subtitle: addon.name.clone(),
+                message: AppMsg::Invoke {
+                    addon: addon.id.clone(),
+                    action: c.id.clone(),
+                    node: None,
+                    values: BTreeMap::new(),
+                },
+            }));
+        }
         items.extend(terminal::shells().into_iter().map(|shell| Item {
             title: format!("New terminal: {}", terminal::shell_name(&shell)),
             subtitle: shell.clone(),
@@ -897,12 +1166,16 @@ impl App {
     }
 
     fn refresh_status(&self, widgets: &Widgets) {
-        match &self.error {
-            Some(error) => {
+        match (&self.error, &self.notice) {
+            (Some(error), _) => {
                 widgets.status.set_label(error);
                 widgets.status.add_css_class("error");
             }
-            None => {
+            (None, Some(notice)) => {
+                widgets.status.set_label(notice);
+                widgets.status.remove_css_class("error");
+            }
+            (None, None) => {
                 let leaves = self.nodes.values().filter(|n| !n.is_folder()).count();
                 let folders = self.nodes.len() - leaves;
                 widgets.status.set_label(&format!(
@@ -943,7 +1216,7 @@ fn execute(core: &Core, sender: &ComponentSender<App>, command: Command) {
     });
 }
 
-/// Loads the full node list and problems.
+/// Loads the full node list, problems and addons.
 fn load(core: &Core, sender: &ComponentSender<App>) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
@@ -956,7 +1229,15 @@ fn load(core: &Core, sender: &ComponentSender<App>) {
                 Response::Problems { problems } => problems,
                 _ => Vec::new(),
             };
-            Ok::<_, burrow_core::Error>(AppMsg::Loaded { nodes, problems })
+            let addons = match core.execute(Command::ListAddons).await? {
+                Response::Addons { addons } => addons,
+                _ => Vec::new(),
+            };
+            Ok::<_, burrow_core::Error>(AppMsg::Loaded {
+                nodes,
+                problems,
+                addons,
+            })
         }
         .await;
         let _ = input.send(result.unwrap_or_else(|e| AppMsg::Failed(e.to_string())));
@@ -1048,13 +1329,16 @@ fn fill_page(page: &gtk::Box, node: &Node, nodes: &HashMap<NodeId, Node>) {
     page.append(&note);
 }
 
-fn menu_popover(entries: Vec<(&str, AppMsg)>, sender: &ComponentSender<App>) -> gtk::Popover {
+fn menu_popover(
+    entries: Vec<(impl AsRef<str>, AppMsg)>,
+    sender: &ComponentSender<App>,
+) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
     popover.add_css_class("menu");
     let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
     for (label, message) in entries {
-        let button = gtk::Button::with_label(label);
+        let button = gtk::Button::with_label(label.as_ref());
         button.add_css_class("flat");
         if let Some(child) = button.child().and_downcast::<gtk::Label>() {
             child.set_xalign(0.0);
@@ -1083,26 +1367,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
     let new_button = gtk::MenuButton::new();
     new_button.set_icon_name("list-add-symbolic");
     new_button.set_tooltip_text(Some("New"));
-    new_button.set_popover(Some(&menu_popover(
-        vec![
-            ("New terminal    Ctrl+Shift+T", AppMsg::NewTerminal(None)),
-            (
-                "New folder",
-                AppMsg::New {
-                    kind: NewKind::Folder,
-                    parent: None,
-                },
-            ),
-            (
-                "New SSH host",
-                AppMsg::New {
-                    kind: NewKind::SshHost,
-                    parent: None,
-                },
-            ),
-        ],
-        sender,
-    )));
+    // Filled in once the addons, and their kinds, are known.
     header.pack_start(&new_button);
 
     let main_menu = gtk::MenuButton::new();
@@ -1112,6 +1377,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
             ("Command palette    Ctrl+Shift+P", AppMsg::ShowPalette),
             ("Reload config", AppMsg::ReloadConfig),
             ("Open config folder", AppMsg::OpenConfigFolder),
+            ("Addons…", AppMsg::ManageAddons),
             ("Settings    Ctrl+,", AppMsg::ShowSettings),
         ],
         sender,
@@ -1229,6 +1495,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
         row_ids: Vec::new(),
         content,
         notebook,
+        new_button,
         status,
         problems_button,
         problems_list,

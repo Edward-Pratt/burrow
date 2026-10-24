@@ -138,6 +138,7 @@ impl Server {
     fn core(&self) -> Core {
         Core::open(CoreOptions {
             config_dir: self.path("burrow"),
+            state_dir: self.path("state"),
             secrets: Arc::new(MemoryStore::new()),
             ssh_config: Some(self.path("ssh_config")),
         })

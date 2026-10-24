@@ -1,0 +1,27 @@
+id = "notes"
+name = "Notes"
+version = "0.1.0"
+api = "1"
+permissions = ["nodes:read", "nodes:write"]
+
+[backend]
+command = "burrow-addon-notes"
+protocol = "jsonrpc-stdio"
+
+[[kinds]]
+kind = "note"
+label = "Note"
+icon = "text-x-generic-symbolic"
+
+[[commands]]
+id = "new-note"
+title = "New note"
+
+[[commands]]
+id = "count"
+title = "Count notes"
+
+[[actions]]
+id = "describe"
+title = "Describe host"
+kinds = ["ssh-host"]

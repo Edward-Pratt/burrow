@@ -42,6 +42,11 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `resize_terminal` | `session`, `cols`, `rows` | `ok` |
 | `answer_prompt` | `session`, `prompt`, `answer` | `ok` |
 | `close_session` | `session` | `ok` |
+| `list_addons` | | `addons { addons }`, sorted by id |
+| `approve_addon` | `id`, `fingerprint` | `ok` |
+| `revoke_addon` | `id` | `ok` |
+| `open_view` | `node` | `view { view }` |
+| `invoke_action` | `addon`, `action`, `node?`, `values?` | `invoked { message }` |
 
 Rules:
 - **`update_node` patch:** a missing field is left as it is. `"color": null` clears the color. `props` replaces all props.
@@ -67,6 +72,8 @@ Every subscriber receives events. They are sent for changes made through command
 | `problems_changed` | `problems` | The set of config files that fail to load changed. |
 | `session_changed` | `session`, `node`, `state` | A session moved on: `connecting { step }`, `connected`, or `closed { error }` (`error` is null when the shell ended normally). |
 | `prompt_requested` | `session`, `prompt { id, kind, title, message }` | A session waits for `answer_prompt`. |
+| `addons_changed` | `addons` | An addon was added, removed, changed, approved, revoked, started or stopped. |
+| `view_changed` | `node`, `view` | The addon that owns `node` redrew its view. |
 
 A subscriber that falls more than 256 events behind gets a "lagged" error and should call `list_nodes` again.
 
@@ -95,6 +102,124 @@ A prompt left unanswered when the session closes counts as cancelled.
 ### Output stream
 
 Terminal output is not sent as events: a burst of output would push every subscriber past its event buffer. In-process clients take each session's output with `Core::take_output(session)`, once. It is a bounded stream, so a slow reader slows the SSH channel down instead of losing output. Dropping the stream ends the session. Out-of-process clients will receive the same bytes as notifications (milestone 8).
+
+## Addons
+
+An addon is a folder in `$XDG_CONFIG_HOME/burrow/addons/` holding an `addon.toml` and a program. Burrow starts the program when the addon is first used and talks to it over stdin and stdout. The `notes` example in `crates/burrow-addon-notes` is a complete addon in about 200 lines. To try it:
+
+```sh
+cargo build -p burrow-addon-notes
+mkdir -p ~/.config/burrow/addons/notes
+cp target/debug/burrow-addon-notes crates/burrow-addon-notes/addon.toml ~/.config/burrow/addons/notes/
+```
+
+### Manifest
+
+```toml
+id = "notes"                 # must match the folder's name
+name = "Notes"
+version = "0.1.0"
+api = "1"                    # the API major version it was written for
+permissions = ["nodes:read", "nodes:write"]
+
+[backend]
+command = "burrow-addon-notes"   # a path inside the folder
+args = []
+protocol = "jsonrpc-stdio"
+
+[[kinds]]                    # node kinds the addon owns and draws
+kind = "note"
+label = "Note"
+icon = "text-x-generic-symbolic"
+
+[[commands]]                 # palette commands
+id = "count"
+title = "Count notes"
+
+[[actions]]                  # context-menu actions on other kinds
+id = "describe"
+title = "Describe host"
+kinds = ["ssh-host"]
+```
+
+A manifest that fails a check is reported in `list_problems`, and the addon is left out. The checks:
+- **Fields:** the `id` matches the folder name. The `api` major is this Burrow's. Every permission is known.
+- **Program:** `command` is a relative path to an executable file inside the folder. It is never looked up on `PATH`, and neither `..` nor a symlink may lead out of the folder.
+- **Kinds:** `folder` and `ssh-host` belong to Burrow. When two addons claim the same kind, the one whose id sorts first keeps it. The other is left out and reported.
+
+### Approval
+
+An addon never runs until the user approves it. The addons folder can arrive with a dotfiles repo, a shared folder or a `git pull`, so finding an addon there is not consent to run it.
+
+- **What an approval covers:** `list_addons` reports a `fingerprint`, a SHA-256 over the id, permissions, kinds, program path, arguments and every file in the folder, `addon.toml` included. `approve_addon` must repeat it, so the user approves exactly what they were shown. If anything changes, the addon needs approving again (`needs_approval { changed: true }`).
+- **When it is checked:** on every rescan (live, through the file watcher) and again just before each start.
+- **Where approvals live:** in `$XDG_STATE_HOME/burrow/addons.toml`, outside the config folder, so they do not travel with it.
+- **Limits:** a folder over 4096 files or 256 MiB is refused rather than partly pinned. Files outside the folder that the program reads are not covered, and neither is a file swapped in the instant between the check and the program reading it.
+
+**Permissions limit the Burrow API, not the program.** An approved addon is a normal process running as you. It can read your files like any other program, including agent sockets it finds by path. Its permissions only decide what it may ask Burrow to do.
+
+### Where an addon runs
+
+- **Its folder is read-only in practice.** Writing a file there changes the fingerprint and withdraws the approval. So an addon runs in its own data folder, `$XDG_STATE_HOME/burrow/addons/<id>/`, and keeps its files there. `PYTHONPYCACHEPREFIX` points Python's bytecode cache there too.
+- **Environment:** cleared, then only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TZ`, `TMPDIR` and `XDG_RUNTIME_DIR` are passed. Burrow adds `BURROW_ADDON_ID`, `BURROW_ADDON_DIR` (its folder), `BURROW_ADDON_DATA` (the data folder) and `BURROW_API`. Pointers to your credentials, such as `SSH_AUTH_SOCK`, are not passed.
+
+### Permissions
+
+Each command an addon sends is checked against this table. Anything not listed is refused, including secrets, sessions, problems and managing addons.
+
+| Command | Needs |
+|---|---|
+| `version` | nothing |
+| `list_nodes`, `get_node` | `nodes:read` |
+| `create_node` | `nodes:write`, and the kind must be the addon's own |
+| `update_node`, `move_node`, `delete_node` | `nodes:write`, and the node's kind must be the addon's own |
+
+Events reach an addon only with `nodes:read`, and only node events.
+
+### Protocol
+
+JSON-RPC 2.0, one message per line (UTF-8, `\n`-terminated), in both directions. A line over 1 MiB stops the addon. Burrow waits 30 s for each answer.
+
+Burrow sends:
+
+| Method | Params | Result |
+|---|---|---|
+| `initialize` | `{ api, id }` | anything |
+| `open_view` | `{ node }` | a view |
+| `invoke` | `{ action, node, values }` | `{ message? }` |
+| `event` (notification) | an [event](#events) | |
+| `resync` (notification) | | missed events; list again |
+
+The addon sends:
+
+| Method | Params | Result |
+|---|---|---|
+| `execute` | a [command](#commands) | its response, or an error |
+| `view_changed` (notification) | `{ node, view }` for a node of its own kind | |
+
+- **`invoke`:** runs a palette command (`node` is null), a context-menu action, or a button or form from one of the addon's views. Burrow only forwards a palette command or a context action that the manifest declares for that kind. From the addon's own views, any action is forwarded.
+- **Lifecycle:** Burrow closes stdin when it is done, and the addon should exit then. An addon that exits or breaks the protocol is restarted on the next use. The delay before that grows from 1 s to 60 s while it keeps failing soon after starting.
+
+### Views
+
+A view is a list of blocks, drawn top to bottom with native widgets:
+
+```json
+{"blocks": [
+  {"type": "heading", "text": "Shopping"},
+  {"type": "text", "text": "milk"},
+  {"type": "fields", "fields": [{"label": "Rows", "value": "12"}]},
+  {"type": "table", "columns": ["Name", "Size"], "rows": [["a", "1"]]},
+  {"type": "form", "action": "save", "submit": "Save", "fields": [
+    {"name": "text", "label": "Text", "input": "multiline", "value": "milk"},
+    {"name": "pinned", "label": "Pinned", "input": "check", "value": false},
+    {"name": "colour", "label": "Colour", "input": "choice", "options": ["red", "blue"], "value": "red"}
+  ]},
+  {"type": "buttons", "buttons": [{"action": "count", "label": "Count notes"}]}
+]}
+```
+
+`input` is `text`, `multiline`, `check` or `choice`. Submitting a form sends its `action` with `values`: a bool for `check`, a string for the rest. Tables show their first 500 rows.
 
 ## Secrets
 

@@ -29,12 +29,15 @@ pub fn location(nodes: &HashMap<NodeId, Node>, node: &Node) -> String {
     parts.join(" / ")
 }
 
-pub fn icon_name(node: &Node, expanded: bool) -> &'static str {
+/// `icons` maps addon kinds to the icons their addons chose.
+pub fn icon_name<'a>(node: &Node, expanded: bool, icons: &'a HashMap<String, String>) -> &'a str {
     match node.kind.as_str() {
         "folder" if expanded => "folder-open-symbolic",
         "folder" => "folder-symbolic",
         "ssh-host" => "network-server-symbolic",
-        _ => "text-x-generic-symbolic",
+        kind => icons
+            .get(kind)
+            .map_or("text-x-generic-symbolic", String::as_str),
     }
 }
 
@@ -44,10 +47,11 @@ pub fn rebuild(
     list: &gtk::ListBox,
     nodes: &HashMap<NodeId, Node>,
     expanded: &HashSet<NodeId>,
+    icons: &HashMap<String, String>,
 ) -> Vec<NodeId> {
     list.remove_all();
     let mut ids = Vec::new();
-    add_rows(list, nodes, expanded, None, 0, &mut ids);
+    add_rows(list, nodes, expanded, icons, None, 0, &mut ids);
     ids
 }
 
@@ -55,21 +59,27 @@ fn add_rows(
     list: &gtk::ListBox,
     nodes: &HashMap<NodeId, Node>,
     expanded: &HashSet<NodeId>,
+    icons: &HashMap<String, String>,
     parent: Option<NodeId>,
     depth: i32,
     ids: &mut Vec<NodeId>,
 ) {
     for node in children(nodes, parent) {
         let is_open = expanded.contains(&node.id);
-        list.append(&row(node, depth, is_open));
+        list.append(&row(node, depth, is_open, icons));
         ids.push(node.id);
         if node.is_folder() && is_open {
-            add_rows(list, nodes, expanded, Some(node.id), depth + 1, ids);
+            add_rows(list, nodes, expanded, icons, Some(node.id), depth + 1, ids);
         }
     }
 }
 
-fn row(node: &Node, depth: i32, expanded: bool) -> gtk::ListBoxRow {
+fn row(
+    node: &Node,
+    depth: i32,
+    expanded: bool,
+    icons: &HashMap<String, String>,
+) -> gtk::ListBoxRow {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     content.set_margin_start(depth * INDENT);
 
@@ -82,7 +92,9 @@ fn row(node: &Node, depth: i32, expanded: bool) -> gtk::ListBoxRow {
     });
     arrow.set_opacity(if node.is_folder() { 0.7 } else { 0.0 });
     content.append(&arrow);
-    content.append(&gtk::Image::from_icon_name(icon_name(node, expanded)));
+    content.append(&gtk::Image::from_icon_name(icon_name(
+        node, expanded, icons,
+    )));
 
     let name = gtk::Label::new(Some(&node.name));
     name.set_xalign(0.0);
