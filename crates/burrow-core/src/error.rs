@@ -37,6 +37,9 @@ pub enum Error {
     #[error("file watcher: {0}")]
     Watch(String),
 
+    #[error("session {0} not found")]
+    SessionNotFound(crate::api::SessionId),
+
     #[error("background task failed: {0}")]
     Task(String),
 }
