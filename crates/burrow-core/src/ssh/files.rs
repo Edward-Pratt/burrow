@@ -585,9 +585,9 @@ async fn plan_upload(
     Ok(())
 }
 
-/// Writes straight to the target, which is removed if the upload stops
-/// part way: SFTP's rename cannot replace a file, so a hidden copy would
-/// not help.
+/// Copies into a new hidden file next to the target, then moves it into
+/// place. A stopped upload leaves a file it replaces as it was, and the
+/// target is never opened, so a symlink there is never written through.
 async fn upload_file(
     sftp: &SftpSession,
     local: &Path,
@@ -595,11 +595,17 @@ async fn upload_file(
     progress: &mut Progress,
     partial: &Partial,
 ) -> Result<()> {
+    let (dir, name) = remote.rsplit_once('/').unwrap_or((".", remote));
+    let temp = join(
+        if dir.is_empty() { "/" } else { dir },
+        &format!(".{name}.burrow-{}", progress.transfer),
+    );
     let local_error = |e: std::io::Error| format!("{}: {e}", local.display());
     let mut from = tokio::fs::File::open(local).await.map_err(local_error)?;
-    let flags = OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE;
-    let mut to = sftp.open_with_flags(remote, flags).await.map_err(text)?;
-    partial.set(Some(Target::Remote(remote.to_string())));
+    // EXCLUDE: fail rather than follow anything already at that name.
+    let flags = OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE;
+    let mut to = sftp.open_with_flags(&temp, flags).await.map_err(text)?;
+    partial.set(Some(Target::Remote(temp.clone())));
     let mut buffer = vec![0; CHUNK];
     loop {
         let read = from.read(&mut buffer).await.map_err(local_error)?;
@@ -610,6 +616,21 @@ async fn upload_file(
         progress.add(read as u64);
     }
     to.shutdown().await.map_err(text)?;
+
+    // SFTP's rename won't replace a file, so the old one goes first.
+    match sftp.symlink_metadata(remote).await {
+        Ok(existing) if existing.file_type() == FileType::File => {
+            sftp.remove_file(remote).await.map_err(text)?;
+        }
+        Ok(existing) if existing.file_type() == FileType::Symlink => {
+            return Err(format!(
+                "{remote} is a symlink, which Burrow won't write through"
+            ));
+        }
+        Ok(_) => return Err(format!("{remote} is in the way of a file")),
+        Err(_) => {}
+    }
+    sftp.rename(&temp, remote).await.map_err(text)?;
     partial.set(None);
     Ok(())
 }

@@ -1130,6 +1130,24 @@ async fn folders_copy_whole_but_symlinks_inside_are_skipped() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     assert!(names.iter().all(|n| !n.starts_with('.')), "{names:?}");
+
+    // Merging into a folder never writes through a symlink in it.
+    fs::remove_file(uploaded.join("top.txt")).unwrap();
+    std::os::unix::fs::symlink(server.path("secret.txt"), uploaded.join("top.txt")).unwrap();
+    let merge = Command::Upload {
+        session,
+        local: tree,
+        remote: remote(&uploaded),
+        overwrite: true,
+    };
+    match transferred(&core, &mut events, merge).await {
+        TransferState::Failed { error } => assert!(error.contains("symlink"), "{error}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(server.path("secret.txt")).unwrap(),
+        "outside"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1168,7 +1186,7 @@ async fn a_cancelled_upload_leaves_no_partial_file() {
     let big = server.path("big.bin");
     fs::File::create(&big)
         .unwrap()
-        .set_len(512 * 1024 * 1024)
+        .set_len(8 * 1024 * 1024 * 1024)
         .unwrap();
     let target = server.path("big-copy.bin");
     let upload = Command::Upload {
@@ -1214,5 +1232,10 @@ async fn a_cancelled_upload_leaves_no_partial_file() {
     .await
     .unwrap();
     assert_eq!(state, TransferState::Cancelled);
-    assert!(!target.exists(), "{} was left behind", target.display());
+    let left: Vec<_> = fs::read_dir(server.dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.contains("big-copy"))
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
 }
