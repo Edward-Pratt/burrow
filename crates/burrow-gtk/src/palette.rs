@@ -1,4 +1,4 @@
-//! The command palette (Ctrl+P): type to filter commands and nodes, Enter
+//! The command palette (Ctrl+Shift+P): type to filter commands and nodes, Enter
 //! to run the highlighted one.
 
 use std::cell::RefCell;

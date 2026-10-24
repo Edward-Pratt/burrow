@@ -7,6 +7,7 @@ mod palette;
 mod runtime;
 mod settings;
 mod sidebar;
+mod terminal;
 
 use std::path::PathBuf;
 

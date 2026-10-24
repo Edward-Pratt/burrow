@@ -6,7 +6,7 @@ Inspired by [Tusk](https://github.com/repticJS/tusk). Burrow is written from scr
 
 ## Status
 
-Milestones 1 (core) and 2 (GTK shell) in review. See [docs/DESIGN.md](docs/DESIGN.md).
+Milestones 1 (core) and 2 (GTK shell) are done; milestone 3 (local terminal) is in review. See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Goals
 
