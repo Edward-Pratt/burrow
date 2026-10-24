@@ -32,6 +32,23 @@ impl SecretKey {
         format!("{REF_SCHEME}{}/{}", self.service, self.user)
     }
 
+    /// The key for `reference`, but only if it is the one `field` of node
+    /// `id` would have been given. Config files are plain text that can come
+    /// from a shared folder or a `git pull`; without this check a crafted
+    /// reference could make Burrow read, overwrite or delete another app's
+    /// keyring entry, or another node's.
+    pub fn for_node_ref(id: NodeId, field: &str, reference: &str) -> Result<Self> {
+        let key = Self::parse_ref(reference)?;
+        if key == Self::for_field(id, field) {
+            Ok(key)
+        } else {
+            Err(Error::invalid(
+                "secret reference",
+                format!("{reference:?} does not belong to field {field:?} of this node"),
+            ))
+        }
+    }
+
     pub fn parse_ref(reference: &str) -> Result<Self> {
         let rest = reference.strip_prefix(REF_SCHEME).ok_or_else(|| {
             Error::invalid(
@@ -40,7 +57,7 @@ impl SecretKey {
             )
         })?;
         match rest.split_once('/') {
-            Some((service, user)) if !service.is_empty() && !user.is_empty() => Ok(SecretKey {
+            Some((service, user)) if service == SERVICE && !user.is_empty() => Ok(SecretKey {
                 service: service.to_string(),
                 user: user.to_string(),
             }),
@@ -161,6 +178,16 @@ mod tests {
         assert!(SecretKey::parse_ref("vault:burrow/x").is_err());
         assert!(SecretKey::parse_ref("keyring:burrow").is_err());
         assert!(SecretKey::parse_ref("keyring:/x").is_err());
+        assert!(SecretKey::parse_ref("keyring:other-app/x").is_err());
+    }
+
+    #[test]
+    fn references_must_belong_to_their_node_and_field() {
+        let id = NodeId::new();
+        let own = SecretKey::for_field(id, "password").to_ref();
+        assert!(SecretKey::for_node_ref(id, "password", &own).is_ok());
+        assert!(SecretKey::for_node_ref(id, "passphrase", &own).is_err());
+        assert!(SecretKey::for_node_ref(NodeId::new(), "password", &own).is_err());
     }
 
     /// Talks to the real desktop keyring, so it only runs on request:

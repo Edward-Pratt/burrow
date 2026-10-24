@@ -156,7 +156,7 @@ impl Inner {
             Command::SetSecret { id, field, value } => {
                 validate_field(&field)?;
                 let key = match self.tree().get(id)?.secret_refs.get(&field) {
-                    Some(reference) => SecretKey::parse_ref(reference)?,
+                    Some(reference) => SecretKey::for_node_ref(id, &field, reference)?,
                     None => SecretKey::for_field(id, &field),
                 };
                 // Store the value first, without holding the tree lock across
@@ -181,7 +181,11 @@ impl Inner {
                     (tree.set_secret_ref(id, &field, None)?, reference)
                 };
                 if let Some(reference) = reference {
-                    self.secrets.delete(&SecretKey::parse_ref(&reference)?)?;
+                    // A reference that isn't this node's own is dropped from
+                    // the file but never followed into the store.
+                    if let Ok(key) = SecretKey::for_node_ref(id, &field, &reference) {
+                        self.secrets.delete(&key)?;
+                    }
                     self.emit(Event::NodeUpdated { node: node.clone() });
                 }
                 Ok(Response::Node { node })
@@ -199,7 +203,9 @@ impl Inner {
     fn resolve_secret(&self, id: NodeId, field: &str) -> Result<Option<SecretValue>> {
         let reference = self.tree().get(id)?.secret_refs.get(field).cloned();
         match reference {
-            Some(reference) => self.secrets.get(&SecretKey::parse_ref(&reference)?),
+            Some(reference) => self
+                .secrets
+                .get(&SecretKey::for_node_ref(id, field, &reference)?),
             None => Ok(None),
         }
     }
@@ -207,8 +213,14 @@ impl Inner {
     /// Best effort: the nodes are already gone, so a keyring failure here
     /// only leaves an unused secret behind.
     fn forget_secrets(&self, removed: &[Entry]) {
-        for reference in removed.iter().flat_map(|e| e.secret_refs.values()) {
-            let result = SecretKey::parse_ref(reference).and_then(|key| self.secrets.delete(&key));
+        let refs = removed.iter().flat_map(|e| {
+            e.secret_refs
+                .iter()
+                .map(move |(field, r)| (e.node.id, field, r))
+        });
+        for (id, field, reference) in refs {
+            let result = SecretKey::for_node_ref(id, field, reference)
+                .and_then(|key| self.secrets.delete(&key));
             if let Err(e) = result {
                 tracing::warn!("could not delete secret {reference}: {e}");
             }
