@@ -80,9 +80,6 @@ pub struct App {
     core: Core,
     config_dir: PathBuf,
     settings: UiSettings,
-    /// The platform's color scheme at startup, restored for
-    /// [`Theme::System`].
-    system_scheme: gtk::InterfaceColorScheme,
     nodes: HashMap<NodeId, Node>,
     expanded: HashSet<NodeId>,
     problems: Vec<Problem>,
@@ -124,10 +121,6 @@ impl Component for App {
     fn init(init: Init, window: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         let Init { core, config_dir } = init;
         let settings = UiSettings::load(&config_dir);
-        let system_scheme = gtk::Settings::default()
-            .map_or(gtk::InterfaceColorScheme::Default, |s| {
-                s.gtk_interface_color_scheme()
-            });
 
         // Subscribe before listing, so nothing that happens in between is
         // missed.
@@ -149,7 +142,6 @@ impl Component for App {
             core,
             config_dir,
             settings,
-            system_scheme,
             nodes: HashMap::new(),
             expanded: HashSet::new(),
             problems: Vec::new(),
@@ -256,13 +248,18 @@ impl Component for App {
         if self.sidebar_dirty {
             self.sidebar_dirty = false;
             let selection = selected(widgets);
+            // Rebuilding destroys the focused row; remember whether the
+            // sidebar had focus so keyboard use (arrows, Delete) carries on.
+            let had_focus = widgets.list.focus_child().is_some();
             widgets.row_ids = sidebar::rebuild(&widgets.list, &self.nodes, &self.expanded);
-            if let Some(index) =
-                selection.and_then(|id| widgets.row_ids.iter().position(|&r| r == id))
-            {
-                widgets
-                    .list
-                    .select_row(widgets.list.row_at_index(index as i32).as_ref());
+            let row = selection
+                .and_then(|id| widgets.row_ids.iter().position(|&r| r == id))
+                .and_then(|index| widgets.list.row_at_index(index as i32));
+            if let Some(row) = row {
+                widgets.list.select_row(Some(&row));
+                if had_focus {
+                    row.grab_focus();
+                }
             }
         }
         widgets
@@ -579,11 +576,16 @@ impl App {
         let Some(settings) = gtk::Settings::default() else {
             return;
         };
-        settings.set_gtk_interface_color_scheme(match self.settings.theme {
-            Theme::System => self.system_scheme,
-            Theme::Light => gtk::InterfaceColorScheme::Light,
-            Theme::Dark => gtk::InterfaceColorScheme::Dark,
-        });
+        match self.settings.theme {
+            // Resetting, rather than setting the startup value, hands the
+            // setting back to the desktop so later light/dark switches from
+            // the portal still apply.
+            Theme::System => settings.reset_property("gtk-interface-color-scheme"),
+            Theme::Light => {
+                settings.set_gtk_interface_color_scheme(gtk::InterfaceColorScheme::Light)
+            }
+            Theme::Dark => settings.set_gtk_interface_color_scheme(gtk::InterfaceColorScheme::Dark),
+        }
     }
 
     fn save_settings(&mut self) {
