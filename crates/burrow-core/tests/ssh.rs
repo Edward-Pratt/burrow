@@ -515,3 +515,90 @@ async fn an_unfamiliar_key_type_warns_even_under_accept_new() {
     answer(&core, session, &prompt, PromptAnswer::Cancel).await;
     assert!(closed_error(expect_state(&mut events, session).await).is_some());
 }
+
+/// A throwaway `ssh-agent` on its own socket.
+struct Agent {
+    socket: PathBuf,
+    process: Child,
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+impl Agent {
+    fn start(dir: &Path) -> Agent {
+        let socket = dir.join("agent.sock");
+        let process = Process::new("ssh-agent")
+            .arg("-D")
+            .arg("-a")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Owned by `Agent` straight away, so it is killed and reaped even
+        // if the wait below fails.
+        let agent = Agent { socket, process };
+        for _ in 0..100 {
+            if agent.socket.exists() {
+                return agent;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("ssh-agent did not start");
+    }
+
+    fn add(&self, key: &Path) {
+        let status = Process::new("ssh-add")
+            .arg("-q")
+            .arg(key)
+            .env("SSH_AUTH_SOCK", &self.socket)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signs_in_with_a_key_only_the_agent_holds() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    let agent = Agent::start(server.dir.path());
+    // An unrelated key first, as agents such as 1Password hold many.
+    keygen(&server.path("other_key"));
+    agent.add(&server.path("other_key"));
+    agent.add(&server.path("client_key"));
+    // Only the agent can sign now. The config names the public key, the
+    // way 1Password's setup picks an agent key.
+    fs::remove_file(server.path("client_key")).unwrap();
+    let config = fs::read_to_string(server.path("ssh_config")).unwrap();
+    let config = config
+        .replace(
+            &format!("IdentityFile {}", server.path("client_key").display()),
+            &format!("IdentityFile {}", server.path("client_key.pub").display()),
+        )
+        .replace(
+            "IdentityAgent none",
+            &format!("IdentityAgent {}", agent.socket.display()),
+        );
+    fs::write(server.path("ssh_config"), config).unwrap();
+    let host_key = fs::read_to_string(server.path("host_key.pub")).unwrap();
+    fs::write(
+        server.path("known_hosts"),
+        format!("[127.0.0.1]:{} {host_key}", server.port),
+    )
+    .unwrap();
+
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let mut events = core.subscribe();
+    let (session, _output) = open(&core, &node).await;
+    assert_eq!(
+        expect_state(&mut events, session).await,
+        SessionState::Connected
+    );
+}

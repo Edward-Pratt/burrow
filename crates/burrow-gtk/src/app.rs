@@ -92,6 +92,9 @@ pub enum AppMsg {
         session: SessionId,
         data: Vec<u8>,
     },
+    SessionOutputEnded {
+        session: SessionId,
+    },
     /// Typed into an SSH host tab.
     RemoteInput {
         node: NodeId,
@@ -332,6 +335,16 @@ impl Component for App {
                     remote.terminal.feed(&data);
                 }
             }
+            AppMsg::SessionOutputEnded { session } => {
+                if let Some(remote) = self
+                    .remotes
+                    .values_mut()
+                    .find(|r| r.state == remote::State::Running(session))
+                {
+                    remote.ending.output_ended = true;
+                    remote.finish_if_done();
+                }
+            }
             AppMsg::RemoteInput { node, data } => {
                 let Some(remote) = self.remotes.get_mut(&node) else {
                     return;
@@ -479,11 +492,12 @@ impl App {
         };
         match event {
             Event::SessionChanged { state, .. } => {
-                if let Some(text) = remote::status_text(&state) {
-                    remote.terminal.feed(text.as_bytes());
-                }
+                let text = remote::status_text(&state);
                 if matches!(state, SessionState::Closed { .. }) {
-                    remote.state = remote::State::Closed;
+                    remote.ending.status = Some(text.unwrap_or_default());
+                    remote.finish_if_done();
+                } else if let Some(text) = text {
+                    remote.terminal.feed(text.as_bytes());
                 }
             }
             Event::PromptRequested { prompt, .. } => {
@@ -563,13 +577,7 @@ impl App {
             self.add_tab(key, page.upcast(), icon, &name, widgets, sender);
             term.grab_focus();
             remote::start(&self.core, id, &term, sender);
-            self.remotes.insert(
-                id,
-                Remote {
-                    terminal: term,
-                    state: remote::State::Starting,
-                },
-            );
+            self.remotes.insert(id, Remote::new(term));
             return;
         }
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);

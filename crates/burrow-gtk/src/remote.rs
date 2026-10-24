@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use burrow_core::{Command, Core, Event, NodeId, Response, SessionId, SessionState};
 use relm4::ComponentSender;
+use vte4::TerminalExt;
 
 use crate::app::{App, AppMsg};
 use crate::runtime::runtime;
@@ -20,6 +21,39 @@ const MAX_UNCLAIMED: usize = 32;
 pub struct Remote {
     pub terminal: vte4::Terminal,
     pub state: State,
+    /// The running session's end, seen from both sides. Its `closed` event
+    /// and the end of its output arrive on different tasks, so the "closed"
+    /// message waits until the last output is shown.
+    pub ending: Ending,
+}
+
+#[derive(Default)]
+pub struct Ending {
+    /// What to show once the output has ended too.
+    pub status: Option<String>,
+    pub output_ended: bool,
+}
+
+impl Remote {
+    pub fn new(terminal: vte4::Terminal) -> Remote {
+        Remote {
+            terminal,
+            state: State::Starting,
+            ending: Ending::default(),
+        }
+    }
+
+    /// Shows the closing message and allows a reconnect once the session
+    /// has both reported `closed` and finished its output.
+    pub fn finish_if_done(&mut self) {
+        if self.ending.output_ended
+            && let Some(status) = self.ending.status.take()
+        {
+            self.terminal.feed(status.as_bytes());
+            self.state = State::Closed;
+            self.ending = Ending::default();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,21 +111,21 @@ pub fn start(core: &Core, node: NodeId, terminal: &vte4::Terminal, sender: &Comp
         {
             return;
         }
-        let Ok(mut output) = core.take_output(session) else {
-            return;
-        };
-        while let Some(mut data) = output.recv().await {
-            while data.len() < OUTPUT_BATCH {
-                match output.try_recv() {
-                    Ok(more) => data.extend(more),
-                    Err(_) => break,
+        if let Ok(mut output) = core.take_output(session) {
+            while let Some(mut data) = output.recv().await {
+                while data.len() < OUTPUT_BATCH {
+                    match output.try_recv() {
+                        Ok(more) => data.extend(more),
+                        Err(_) => break,
+                    }
+                }
+                // The window is gone. Dropping `output` ends the session.
+                if input.send(AppMsg::SessionOutput { session, data }).is_err() {
+                    return;
                 }
             }
-            // The window is gone. Dropping `output` ends the session.
-            if input.send(AppMsg::SessionOutput { session, data }).is_err() {
-                break;
-            }
         }
+        let _ = input.send(AppMsg::SessionOutputEnded { session });
     });
 }
 

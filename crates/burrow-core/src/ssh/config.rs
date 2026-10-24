@@ -131,6 +131,11 @@ fn parse(output: &str, home: &Path, auth_sock: Option<PathBuf>) -> HostConfig {
         server_alive_interval: None,
     };
     let expand = |value: &str| expand_path(value, home);
+    // `none` means no file at all, not a file named "none".
+    let paths = |value: &str| match value {
+        "none" => Vec::new(),
+        _ => value.split_whitespace().map(expand).collect(),
+    };
     for line in output.lines() {
         let Some((key, value)) = line.split_once(' ') else {
             continue;
@@ -149,12 +154,8 @@ fn parse(output: &str, home: &Path, auth_sock: Option<PathBuf>) -> HostConfig {
                 }
             }
             "identitiesonly" => config.identities_only = is_yes(value),
-            "userknownhostsfile" => {
-                config.user_known_hosts = value.split_whitespace().map(expand).collect()
-            }
-            "globalknownhostsfile" => {
-                config.global_known_hosts = value.split_whitespace().map(expand).collect()
-            }
+            "userknownhostsfile" => config.user_known_hosts = paths(value),
+            "globalknownhostsfile" => config.global_known_hosts = paths(value),
             "stricthostkeychecking" => {
                 config.strict_host_key_checking = match value {
                     "accept-new" | "false" | "no" | "off" => StrictHostKeyChecking::AcceptNew,
@@ -251,6 +252,13 @@ proxyjump bastion
         assert_eq!(config.connect_timeout, None);
         assert_eq!(config.server_alive_interval, Some(Duration::from_secs(30)));
         assert_eq!(config.proxy_jump.as_deref(), Some("bastion"));
+    }
+
+    #[test]
+    fn known_hosts_none_means_no_file() {
+        let config = parsed("userknownhostsfile none\nglobalknownhostsfile none\n");
+        assert!(config.user_known_hosts.is_empty());
+        assert!(config.global_known_hosts.is_empty());
     }
 
     #[test]

@@ -249,10 +249,15 @@ async fn verify_host_key(config: &HostConfig, key: &PublicKey, prompter: &Prompt
                 "THE HOST KEY FOR {name} HAS CHANGED. Someone may be intercepting the \
                  connection, or the server was reinstalled. Burrow will not connect. The \
                  server now offers {} key {fingerprint}; the old key is in {}, line {line}. \
-                 If you know why it changed, remove the old key with `ssh-keygen -R {name}` \
+                 If you know why it changed, remove the old key with `ssh-keygen -R {}` \
                  and connect again.",
                 key.algorithm(),
-                path.display()
+                path.display(),
+                if port == 22 {
+                    name.clone()
+                } else {
+                    format!("'[{name}]:{port}'")
+                },
             ));
         }
         Check::Unknown | Check::OtherTypes { .. } => {}
@@ -347,7 +352,11 @@ async fn authenticate(
         .identity_files
         .iter()
         .map(|path| {
-            let public = russh::keys::load_public_key(path.with_added_extension("pub")).ok();
+            // `IdentityFile` may name the public key itself, to pick a key
+            // held only by the agent (1Password's setup does this).
+            let public = russh::keys::load_public_key(path)
+                .or_else(|_| russh::keys::load_public_key(path.with_added_extension("pub")))
+                .ok();
             (path.as_path(), public)
         })
         .collect();
