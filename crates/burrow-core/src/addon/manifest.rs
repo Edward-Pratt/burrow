@@ -218,14 +218,14 @@ pub(crate) fn load(folder: &Path) -> Result<Manifest, String> {
         .canonicalize()
         .map_err(|e| format!("{}: {e}", folder.display()))?;
     let program = resolve_program(&dir, &file.backend.command)?;
-    let program_hash = hash_file(&program)?;
+    let files_hash = hash_folder(&dir)?;
     let fingerprint = fingerprint(
         &file.id,
         &permissions,
         &file.kinds,
         &program,
         &file.backend.args,
-        &program_hash,
+        &files_hash,
     );
     Ok(Manifest {
         id: file.id,
@@ -275,9 +275,77 @@ fn resolve_program(dir: &Path, command: &str) -> Result<PathBuf, String> {
     Ok(program)
 }
 
-pub(crate) fn hash_file(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(HEXLOWER.encode(&Sha256::digest(&bytes)))
+/// Limits on what an approval can pin. A folder past them is refused
+/// rather than partly pinned.
+const MAX_FILES: usize = 4096;
+const MAX_BYTES: u64 = 256 << 20;
+
+/// A hash of every file in the addon's folder, by relative path, except
+/// `addon.toml` (its approved fields are pinned separately). The program
+/// is often a script that loads its siblings, so pinning the program file
+/// alone would let those change unseen. Symlinks are pinned by their target
+/// and refused when they lead out of the folder.
+fn hash_folder(dir: &Path) -> Result<String, String> {
+    let mut entries = Vec::new();
+    let mut bytes = 0;
+    walk(dir, dir, &mut entries, &mut bytes)?;
+    entries.sort();
+    let mut hasher = Sha256::new();
+    for (path, hash) in entries {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(HEXLOWER.encode(&hasher.finalize()))
+}
+
+fn walk(
+    root: &Path,
+    dir: &Path,
+    entries: &mut Vec<(String, String)>,
+    bytes: &mut u64,
+) -> Result<(), String> {
+    let read = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for entry in read {
+        let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        if relative == MANIFEST_FILE {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if meta.is_dir() {
+            walk(root, &path, entries, bytes)?;
+            continue;
+        }
+        if entries.len() >= MAX_FILES {
+            return Err(format!("the folder has over {MAX_FILES} files"));
+        }
+        let hash = if meta.is_symlink() {
+            let leads_out = path.canonicalize().map_or(true, |p| !p.starts_with(root));
+            if leads_out {
+                return Err(format!("{relative} links outside the addon's folder"));
+            }
+            let target = fs::read_link(&path).map_err(|e| format!("{relative}: {e}"))?;
+            format!("link:{}", target.display())
+        } else if meta.is_file() {
+            *bytes += meta.len();
+            if *bytes > MAX_BYTES {
+                return Err(format!("the folder holds over {} MiB", MAX_BYTES >> 20));
+            }
+            let contents = fs::read(&path).map_err(|e| format!("{relative}: {e}"))?;
+            HEXLOWER.encode(&Sha256::digest(&contents))
+        } else {
+            // Sockets and pipes have no contents to pin.
+            continue;
+        };
+        entries.push((relative, hash));
+    }
+    Ok(())
 }
 
 /// What an approval covers. Titles, the name and the version are left out,
@@ -289,7 +357,7 @@ struct Approved<'a> {
     kinds: Vec<&'a str>,
     program: &'a Path,
     args: &'a [String],
-    program_sha256: &'a str,
+    files_sha256: &'a str,
 }
 
 fn fingerprint(
@@ -298,7 +366,7 @@ fn fingerprint(
     kinds: &[AddonKind],
     program: &Path,
     args: &[String],
-    program_hash: &str,
+    files_hash: &str,
 ) -> String {
     let mut kinds: Vec<&str> = kinds.iter().map(|k| k.kind.as_str()).collect();
     kinds.sort_unstable();
@@ -308,7 +376,7 @@ fn fingerprint(
         kinds,
         program,
         args,
-        program_sha256: program_hash,
+        files_sha256: files_hash,
     };
     let json = serde_json::to_vec(&approved).expect("plain data always serializes");
     HEXLOWER.encode(&Sha256::digest(&json))
@@ -421,6 +489,15 @@ label = "Note"
     }
 
     #[test]
+    fn links_out_of_the_folder_are_refused() {
+        let (root, folder) = addon(MANIFEST);
+        let outside = root.path().join("secret.py");
+        fs::write(&outside, "print()\n").unwrap();
+        symlink(&outside, folder.join("lib.py")).unwrap();
+        assert!(load(&folder).unwrap_err().contains("links outside"));
+    }
+
+    #[test]
     fn program_must_be_executable() {
         let (_root, folder) = addon(MANIFEST);
         fs::set_permissions(folder.join("bin/notes"), fs::Permissions::from_mode(0o644)).unwrap();
@@ -439,6 +516,12 @@ label = "Note"
         fs::write(folder.join("bin/notes"), "#!/bin/sh\necho changed\n").unwrap();
         let changed = load(&folder).unwrap().fingerprint;
         assert_ne!(changed, first);
+
+        // Any file the program might load counts, not just the program.
+        fs::write(folder.join("bin/helper.sh"), "echo hi\n").unwrap();
+        let added = load(&folder).unwrap().fingerprint;
+        assert_ne!(added, changed);
+        let changed = added;
 
         let more = MANIFEST.replace(r#"["nodes:read"]"#, r#"["nodes:read", "nodes:write"]"#);
         fs::write(folder.join(MANIFEST_FILE), more).unwrap();

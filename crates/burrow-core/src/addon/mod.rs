@@ -6,7 +6,11 @@
 //! from a dotfiles repo or a shared folder: an addon that arrives with a
 //! `git pull` must never start by itself. An approval is pinned to the
 //! manifest's [`fingerprint`](crate::AddonInfo::fingerprint), which covers
-//! the program file's hash, so a changed binary needs approving again.
+//! every file in the addon's folder, so a changed program, or a changed
+//! script it loads, needs approving again. The folder is checked again
+//! just before each start. A file changed in the instant between that check
+//! and the program reading it is not caught; doing that needs a writer
+//! racing Burrow on this machine, which already runs as the user.
 //!
 //! Addons start on first use. One that stops is started again on the next
 //! use, after a delay that doubles each time it stops soon after starting.

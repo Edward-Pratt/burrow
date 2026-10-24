@@ -209,7 +209,7 @@ pub struct AddonInfo {
     /// The program that runs, resolved inside the addon's folder.
     pub program: PathBuf,
     /// A hash of everything an approval covers: the id, permissions, kinds,
-    /// program path, its arguments and the program file itself.
+    /// program path and arguments, and every file in the addon's folder.
     /// [`Command::ApproveAddon`] must repeat it, so the user approves
     /// exactly what they were shown.
     pub fingerprint: String,
@@ -244,8 +244,8 @@ pub struct AddonAction {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AddonState {
-    /// Never approved, or `changed` since it was: a new program file, other
-    /// permissions or other kinds. It does not run until approved.
+    /// Never approved, or `changed` since it was: other files, permissions
+    /// or kinds. It does not run until approved.
     NeedsApproval {
         changed: bool,
     },
