@@ -19,6 +19,7 @@ use crate::palette::{self, Item};
 use crate::runtime::runtime;
 use crate::settings::{Theme, UiSettings};
 use crate::sidebar;
+use crate::terminal;
 
 pub struct Init {
     pub core: Core,
@@ -61,8 +62,17 @@ pub enum AppMsg {
     Delete(NodeId),
     RenameSelected,
     DeleteSelected,
-    CloseTab(NodeId),
+    CloseTab(TabKey),
     CloseCurrentTab,
+    /// Moves to the next (`1`) or previous (`-1`) tab, wrapping around.
+    SwitchTab(i32),
+    /// Opens a local terminal; `None` runs the login shell.
+    NewTerminal(Option<String>),
+    TerminalTitle {
+        id: u32,
+        title: String,
+    },
+    TerminalExited(u32),
     ShowPalette,
     ToggleSidebar,
     ShowSettings,
@@ -71,8 +81,17 @@ pub enum AppMsg {
     OpenConfigFolder,
 }
 
+/// What a tab shows. Node tabs follow their node; terminal tabs belong to
+/// no node and are numbered as they open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TabKey {
+    Node(NodeId),
+    Terminal(u32),
+}
+
 struct Tab {
-    page: gtk::Box,
+    /// A `gtk::Box` for node tabs, a [`terminal::page`] for terminals.
+    page: gtk::Widget,
     title: gtk::Label,
 }
 
@@ -84,7 +103,8 @@ pub struct App {
     expanded: HashSet<NodeId>,
     problems: Vec<Problem>,
     error: Option<String>,
-    tabs: HashMap<NodeId, Tab>,
+    tabs: HashMap<TabKey, Tab>,
+    next_terminal: u32,
     /// Watches the config folder while the window is open.
     _watcher: Option<Watcher>,
     sidebar_dirty: bool,
@@ -147,6 +167,7 @@ impl Component for App {
             problems: Vec::new(),
             error,
             tabs: HashMap::new(),
+            next_terminal: 1,
             _watcher: watcher,
             sidebar_dirty: false,
         };
@@ -166,8 +187,11 @@ impl Component for App {
             AppMsg::Loaded { nodes, problems } => {
                 self.nodes = nodes.into_iter().map(|n| (n.id, n)).collect();
                 self.problems = problems;
-                self.tabs.retain(|id, tab| {
-                    let keep = self.nodes.contains_key(id);
+                self.tabs.retain(|key, tab| {
+                    let keep = match key {
+                        TabKey::Node(id) => self.nodes.contains_key(id),
+                        TabKey::Terminal(_) => true,
+                    };
                     if !keep {
                         close_page(&widgets.notebook, &tab.page);
                     }
@@ -208,18 +232,33 @@ impl Component for App {
                     self.delete(id, window, &sender);
                 }
             }
-            AppMsg::CloseTab(id) => self.close_tab(id, widgets),
+            AppMsg::CloseTab(key) => self.close_tab(key, widgets),
             AppMsg::CloseCurrentTab => {
                 let current = widgets.notebook.nth_page(widgets.notebook.current_page());
-                let id = self
+                let key = self
                     .tabs
                     .iter()
-                    .find(|(_, tab)| current.as_ref() == Some(tab.page.upcast_ref()))
-                    .map(|(id, _)| *id);
-                if let Some(id) = id {
-                    self.close_tab(id, widgets);
+                    .find(|(_, tab)| current.as_ref() == Some(&tab.page))
+                    .map(|(key, _)| *key);
+                if let Some(key) = key {
+                    self.close_tab(key, widgets);
                 }
             }
+            AppMsg::SwitchTab(step) => {
+                let notebook = &widgets.notebook;
+                let pages = notebook.n_pages() as i32;
+                if let Some(current) = notebook.current_page().filter(|_| pages > 0) {
+                    let next = (current as i32 + step).rem_euclid(pages);
+                    notebook.set_current_page(Some(next as u32));
+                }
+            }
+            AppMsg::NewTerminal(shell) => self.open_terminal(shell, widgets, &sender),
+            AppMsg::TerminalTitle { id, title } => {
+                if let Some(tab) = self.tabs.get(&TabKey::Terminal(id)) {
+                    set_tab_title(&tab.title, &title);
+                }
+            }
+            AppMsg::TerminalExited(id) => self.close_tab(TabKey::Terminal(id), widgets),
             AppMsg::ShowPalette => self.show_palette(window, &sender),
             AppMsg::ToggleSidebar => {
                 self.settings.sidebar_visible = !self.settings.sidebar_visible;
@@ -286,9 +325,11 @@ impl App {
                 self.sidebar_dirty = true;
             }
             Event::NodeUpdated { node } => {
-                if let Some(tab) = self.tabs.get(&node.id) {
-                    tab.title.set_label(&node.name);
-                    fill_page(&tab.page, &node, &self.nodes);
+                if let Some(tab) = self.tabs.get(&TabKey::Node(node.id)) {
+                    set_tab_title(&tab.title, &node.name);
+                    if let Some(page) = tab.page.downcast_ref::<gtk::Box>() {
+                        fill_page(page, &node, &self.nodes);
+                    }
                 }
                 self.nodes.insert(node.id, node);
                 self.sidebar_dirty = true;
@@ -296,7 +337,7 @@ impl App {
             Event::NodeDeleted { id } => {
                 self.nodes.remove(&id);
                 self.expanded.remove(&id);
-                if let Some(tab) = self.tabs.remove(&id) {
+                if let Some(tab) = self.tabs.remove(&TabKey::Node(id)) {
                     close_page(&widgets.notebook, &tab.page);
                 }
                 self.sidebar_dirty = true;
@@ -333,40 +374,88 @@ impl App {
     }
 
     fn open_tab_now(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
-        let notebook = &widgets.notebook;
-        if let Some(tab) = self.tabs.get(&id) {
-            if let Some(index) = notebook.page_num(&tab.page) {
-                notebook.set_current_page(Some(index));
+        let key = TabKey::Node(id);
+        if let Some(tab) = self.tabs.get(&key) {
+            if let Some(index) = widgets.notebook.page_num(&tab.page) {
+                widgets.notebook.set_current_page(Some(index));
             }
             return;
         }
         let Some(node) = self.nodes.get(&id) else {
             return;
         };
-
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
         fill_page(&page, node, &self.nodes);
+        let (icon, name) = (sidebar::icon_name(node, false), node.name.clone());
+        self.add_tab(key, page.upcast(), icon, &name, widgets, sender);
+    }
 
-        let title = gtk::Label::new(Some(&node.name));
+    fn open_terminal(
+        &mut self,
+        shell: Option<String>,
+        widgets: &Widgets,
+        sender: &ComponentSender<Self>,
+    ) {
+        let id = self.next_terminal;
+        self.next_terminal += 1;
+        let shell = shell.unwrap_or_else(terminal::default_shell);
+        let term = terminal::new(
+            &shell,
+            {
+                let sender = sender.clone();
+                move |title| sender.input(AppMsg::TerminalTitle { id, title })
+            },
+            {
+                let sender = sender.clone();
+                move || sender.input(AppMsg::TerminalExited(id))
+            },
+        );
+        let page = terminal::page(&term);
+        let key = TabKey::Terminal(id);
+        let name = terminal::shell_name(&shell);
+        self.add_tab(
+            key,
+            page.upcast(),
+            "utilities-terminal-symbolic",
+            name,
+            widgets,
+            sender,
+        );
+        term.grab_focus();
+    }
+
+    fn add_tab(
+        &mut self,
+        key: TabKey,
+        page: gtk::Widget,
+        icon: &str,
+        name: &str,
+        widgets: &Widgets,
+        sender: &ComponentSender<Self>,
+    ) {
+        let title = gtk::Label::new(None);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        set_tab_title(&title, name);
         let close = gtk::Button::from_icon_name("window-close-symbolic");
         close.add_css_class("flat");
         close.add_css_class("tab-close");
-        close.set_tooltip_text(Some("Close tab (Ctrl+W)"));
+        close.set_tooltip_text(Some("Close tab (Ctrl+Shift+W)"));
         let tab_label = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        tab_label.append(&gtk::Image::from_icon_name(sidebar::icon_name(node, false)));
+        tab_label.append(&gtk::Image::from_icon_name(icon));
         tab_label.append(&title);
         tab_label.append(&close);
 
+        let notebook = &widgets.notebook;
         let index = notebook.append_page(&page, Some(&tab_label));
         notebook.set_tab_reorderable(&page, true);
         notebook.set_current_page(Some(index));
 
-        send_on_click(&close, sender, AppMsg::CloseTab(id));
-        self.tabs.insert(id, Tab { page, title });
+        send_on_click(&close, sender, AppMsg::CloseTab(key));
+        self.tabs.insert(key, Tab { page, title });
     }
 
-    fn close_tab(&mut self, id: NodeId, widgets: &Widgets) {
-        if let Some(tab) = self.tabs.remove(&id) {
+    fn close_tab(&mut self, key: TabKey, widgets: &Widgets) {
+        if let Some(tab) = self.tabs.remove(&key) {
             close_page(&widgets.notebook, &tab.page);
         }
     }
@@ -535,6 +624,7 @@ impl App {
             message,
         };
         let mut items = vec![
+            command("New terminal", AppMsg::NewTerminal(None)),
             command(
                 "New folder",
                 AppMsg::New {
@@ -554,6 +644,11 @@ impl App {
             command("Open config folder", AppMsg::OpenConfigFolder),
             command("Settings", AppMsg::ShowSettings),
         ];
+        items.extend(terminal::shells().into_iter().map(|shell| Item {
+            title: format!("New terminal: {}", terminal::shell_name(&shell)),
+            subtitle: shell.clone(),
+            message: AppMsg::NewTerminal(Some(shell)),
+        }));
         let mut nodes: Vec<&Node> = self.nodes.values().collect();
         nodes.sort_by_key(|n| (n.is_folder(), n.name.to_lowercase()));
         items.extend(nodes.into_iter().map(|node| {
@@ -684,10 +779,19 @@ fn selected(widgets: &Widgets) -> Option<NodeId> {
     widgets.row_ids.get(row.index() as usize).copied()
 }
 
-fn close_page(notebook: &gtk::Notebook, page: &gtk::Box) {
+fn close_page(notebook: &gtk::Notebook, page: &gtk::Widget) {
     if let Some(index) = notebook.page_num(page) {
         notebook.remove_page(Some(index));
     }
+}
+
+/// Long titles (a shell's working folder, say) are cut short with "…".
+/// Notebooks give tab labels only their minimum width, and an ellipsized
+/// label's minimum is just the "…", so the minimum is set to fit the text.
+fn set_tab_title(label: &gtk::Label, title: &str) {
+    const MAX_CHARS: usize = 24;
+    label.set_label(title);
+    label.set_width_chars(title.chars().count().min(MAX_CHARS) as i32);
 }
 
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
@@ -730,9 +834,7 @@ fn fill_page(page: &gtk::Box, node: &Node, nodes: &HashMap<NodeId, Node>) {
         page.append(&props);
     }
 
-    let note = gtk::Label::new(Some(
-        "Connecting arrives with the local terminal and SSH milestones.",
-    ));
+    let note = gtk::Label::new(Some("Connecting arrives with the SSH milestone."));
     note.set_xalign(0.0);
     note.set_margin_top(12);
     note.add_css_class("dim");
@@ -767,7 +869,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
     // Header bar.
     let header = gtk::HeaderBar::new();
     let sidebar_button = gtk::Button::from_icon_name("sidebar-show-symbolic");
-    sidebar_button.set_tooltip_text(Some("Toggle sidebar (Ctrl+B)"));
+    sidebar_button.set_tooltip_text(Some("Toggle sidebar (Ctrl+Shift+B)"));
     send_on_click(&sidebar_button, sender, AppMsg::ToggleSidebar);
     header.pack_start(&sidebar_button);
 
@@ -776,6 +878,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
     new_button.set_tooltip_text(Some("New"));
     new_button.set_popover(Some(&menu_popover(
         vec![
+            ("New terminal    Ctrl+Shift+T", AppMsg::NewTerminal(None)),
             (
                 "New folder",
                 AppMsg::New {
@@ -799,7 +902,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
     main_menu.set_icon_name("open-menu-symbolic");
     main_menu.set_popover(Some(&menu_popover(
         vec![
-            ("Command palette    Ctrl+P", AppMsg::ShowPalette),
+            ("Command palette    Ctrl+Shift+P", AppMsg::ShowPalette),
             ("Reload config", AppMsg::ReloadConfig),
             ("Open config folder", AppMsg::OpenConfigFolder),
             ("Settings    Ctrl+,", AppMsg::ShowSettings),
@@ -808,7 +911,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
     )));
     header.pack_end(&main_menu);
     let palette_button = gtk::Button::from_icon_name("system-search-symbolic");
-    palette_button.set_tooltip_text(Some("Command palette (Ctrl+P)"));
+    palette_button.set_tooltip_text(Some("Command palette (Ctrl+Shift+P)"));
     send_on_click(&palette_button, sender, AppMsg::ShowPalette);
     header.pack_end(&palette_button);
     window.set_titlebar(Some(&header));
@@ -831,21 +934,22 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
         }
     });
     list.add_controller(right_click);
-    // Delete only applies while the sidebar has focus, so it never eats a
-    // keypress meant for a text field or, later, a terminal.
-    let delete = gtk::EventControllerKey::new();
-    delete.connect_key_pressed({
+    // Delete and F2 only apply while the sidebar has focus, so they never
+    // eat a keypress meant for a text field or a terminal.
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed({
         let sender = sender.clone();
         move |_, key, _, _| {
-            if key == gdk::Key::Delete {
-                sender.input(AppMsg::DeleteSelected);
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
+            let message = match key {
+                gdk::Key::Delete => AppMsg::DeleteSelected,
+                gdk::Key::F2 => AppMsg::RenameSelected,
+                _ => return glib::Propagation::Proceed,
+            };
+            sender.input(message);
+            glib::Propagation::Stop
         }
     });
-    list.add_controller(delete);
+    list.add_controller(keys);
 
     let scroller = gtk::ScrolledWindow::builder()
         .child(&list)
@@ -860,6 +964,15 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
     // Tabs, with a welcome page when none are open.
     let notebook = gtk::Notebook::new();
     notebook.set_scrollable(true);
+    // Typing goes straight to a terminal when its tab is chosen. The new
+    // page isn't shown yet during the signal, so focus it just after.
+    notebook.connect_switch_page(|_, page, _| {
+        if let Some(terminal) = terminal::in_page(page) {
+            glib::idle_add_local_once(move || {
+                terminal.grab_focus();
+            });
+        }
+    });
     let content = gtk::Stack::new();
     content.set_hexpand(true);
     content.add_named(&welcome(), Some("welcome"));
@@ -923,15 +1036,16 @@ fn welcome() -> gtk::Box {
     title.add_css_class("welcome-title");
     page.append(&title);
     for (keys, what) in [
-        ("Ctrl+P", "Command palette"),
-        ("Ctrl+B", "Toggle sidebar"),
+        ("Ctrl+Shift+T", "New terminal"),
+        ("Ctrl+Shift+P", "Command palette"),
+        ("Ctrl+Shift+B", "Toggle sidebar"),
+        ("Ctrl+Shift+W", "Close tab"),
         ("F2", "Rename the selected item"),
-        ("Ctrl+W", "Close tab"),
     ] {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let key = gtk::Label::new(Some(keys));
         key.add_css_class("kbd");
-        key.set_width_chars(8);
+        key.set_width_chars(12);
         let label = gtk::Label::new(Some(what));
         label.add_css_class("dim");
         row.append(&key);
@@ -947,16 +1061,23 @@ fn send_on_click(button: &gtk::Button, sender: &ComponentSender<App>, message: A
 }
 
 fn add_shortcuts(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) {
+    // Plain Ctrl keys belong to the shell (Ctrl+W deletes a word, Ctrl+R
+    // searches history), so Burrow's own use Ctrl+Shift, as other GTK
+    // terminals do.
     let controller = gtk::ShortcutController::new();
     controller.set_scope(gtk::ShortcutScope::Global);
+    // Capture runs before the focused widget sees the key. In the default
+    // bubble phase a terminal would send these keys to the shell first.
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let shortcuts = [
-        ("<Control>p", AppMsg::ShowPalette),
-        ("<Control>k", AppMsg::ShowPalette),
-        ("<Control>b", AppMsg::ToggleSidebar),
-        ("<Control>w", AppMsg::CloseCurrentTab),
+        ("<Control><Shift>t", AppMsg::NewTerminal(None)),
+        ("<Control><Shift>p", AppMsg::ShowPalette),
+        ("<Control><Shift>b", AppMsg::ToggleSidebar),
+        ("<Control><Shift>w", AppMsg::CloseCurrentTab),
+        ("<Control><Shift>r", AppMsg::ReloadConfig),
         ("<Control>comma", AppMsg::ShowSettings),
-        ("F2", AppMsg::RenameSelected),
-        ("<Control>r", AppMsg::ReloadConfig),
+        ("<Control>Page_Down", AppMsg::SwitchTab(1)),
+        ("<Control>Page_Up", AppMsg::SwitchTab(-1)),
     ];
     for (trigger, message) in shortcuts {
         let sender = sender.clone();
