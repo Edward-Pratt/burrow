@@ -17,6 +17,10 @@ pub const API_VERSION: u32 = 1;
 /// The `kind` of folder nodes. Every other kind is owned by an addon.
 pub const FOLDER_KIND: &str = "folder";
 
+/// The `kind` of SSH host nodes. `props.alias` names the `Host` in the
+/// user's OpenSSH config; the node's name is used when it is missing.
+pub const SSH_HOST_KIND: &str = "ssh-host";
+
 /// Stable identity of a node. Stored in the node's file, so it survives
 /// renames and moves and can be used in references between nodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -121,6 +125,71 @@ impl Drop for SecretValue {
     }
 }
 
+/// Identifies a session opened with [`Command::OpenTerminal`]. Unique for
+/// as long as the core runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(pub u64);
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SessionState {
+    /// Still connecting. `step` says what is happening, such as "Checking
+    /// the host key".
+    Connecting {
+        step: String,
+    },
+    Connected,
+    /// Over. `error` is `None` when the remote shell ended normally.
+    Closed {
+        error: Option<String>,
+    },
+}
+
+/// A question a session needs answered before it can go on, such as
+/// whether to trust a new host key, or a password.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Prompt {
+    /// Unique within its session.
+    pub id: u32,
+    pub kind: PromptKind,
+    pub title: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptKind {
+    /// Yes or no.
+    Confirm,
+    /// A hidden answer, such as a password. When `can_save` is set the
+    /// client may offer to keep it in the keyring.
+    Secret { can_save: bool },
+    /// A visible answer.
+    Text,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptAnswer {
+    Cancel,
+    /// "Yes" to a [`PromptKind::Confirm`].
+    Confirm,
+    /// The answer to a `Secret` or `Text` prompt. `save` asks the core to
+    /// keep a `Secret` answer once it has worked.
+    Text {
+        value: SecretValue,
+        #[serde(default)]
+        save: bool,
+    },
+}
+
 /// A config file the core could not load. The rest of the tree still loads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Problem {
@@ -181,6 +250,34 @@ pub enum Command {
     /// Re-reads the tree from disk. The file watcher does this
     /// automatically.
     ReloadConfig,
+    /// Connects to an SSH host node and starts a shell in a terminal of
+    /// `cols` x `rows`. Returns [`Response::Session`] straight away; progress
+    /// arrives as [`Event::SessionChanged`] and output on the session's
+    /// output stream ([`Core::take_output`](crate::Core::take_output)).
+    OpenTerminal {
+        node: NodeId,
+        cols: u16,
+        rows: u16,
+    },
+    /// Sends keyboard input to the remote shell.
+    WriteTerminal {
+        session: SessionId,
+        data: Vec<u8>,
+    },
+    ResizeTerminal {
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+    },
+    AnswerPrompt {
+        session: SessionId,
+        prompt: u32,
+        answer: PromptAnswer,
+    },
+    /// Disconnects. The session then reports [`SessionState::Closed`].
+    CloseSession {
+        session: SessionId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -190,6 +287,7 @@ pub enum Response {
     Nodes { nodes: Vec<Node> },
     Node { node: Node },
     Problems { problems: Vec<Problem> },
+    Session { session: SessionId },
     Ok,
 }
 
@@ -210,5 +308,15 @@ pub enum Event {
     },
     ProblemsChanged {
         problems: Vec<Problem>,
+    },
+    SessionChanged {
+        session: SessionId,
+        node: NodeId,
+        state: SessionState,
+    },
+    /// The session waits for [`Command::AnswerPrompt`].
+    PromptRequested {
+        session: SessionId,
+        prompt: Prompt,
     },
 }

@@ -86,7 +86,7 @@ All non-secret state lives as TOML files in `$XDG_CONFIG_HOME/burrow/` (default 
 |---|---|
 | Secrets | Secret Service through the `keyring` crate (gnome-keyring or KWallet) |
 | Local terminal | VTE starts and runs the shell itself; read the shell list from `$SHELL` and `/etc/shells`. `portable-pty` only if the core ever needs a PTY without the UI. |
-| SSH | `russh`; agent auth through `SSH_AUTH_SOCK`; reads `~/.ssh/config` and `known_hosts` |
+| SSH | `russh`; host settings from `ssh -G <alias>` (OpenSSH resolves `Include`/`Match`/patterns itself); agent auth through `IdentityAgent` / `SSH_AUTH_SOCK`; own `known_hosts` reader and writer (russh's skips markers and wildcards) |
 | Paths | XDG base directories (`directories` crate) |
 | Notifications | `GNotification` (freedesktop D-Bus, works with mako and swaync) |
 | Packaging | AUR PKGBUILD as the main channel, with no self-updater. Not Flatpak: its sandbox blocks host shells, the SSH agent and `~/.ssh`. |

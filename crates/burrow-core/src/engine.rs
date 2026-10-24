@@ -1,11 +1,14 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
-use crate::api::{API_VERSION, Command, Event, NodeId, Problem, Response, SecretValue};
+use crate::api::{
+    API_VERSION, Command, Event, NodeId, Problem, Response, SSH_HOST_KIND, SecretValue, SessionId,
+};
 use crate::error::{Error, Result};
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
+use crate::ssh::{self, Input, Sessions};
 use crate::tree::{Entry, Tree};
 
 /// How many events a slow subscriber can fall behind before it starts
@@ -16,6 +19,9 @@ pub struct CoreOptions {
     /// Burrow's config directory. The tree lives in its `tree/` subfolder.
     pub config_dir: PathBuf,
     pub secrets: Arc<dyn SecretStore>,
+    /// Used instead of `~/.ssh/config`, as `ssh -F` does. `None` reads the
+    /// user's own.
+    pub ssh_config: Option<PathBuf>,
 }
 
 impl CoreOptions {
@@ -26,6 +32,7 @@ impl CoreOptions {
         Ok(CoreOptions {
             config_dir: dirs.config_dir().to_path_buf(),
             secrets: Arc::new(KeyringStore::new()?),
+            ssh_config: None,
         })
     }
 }
@@ -41,6 +48,8 @@ struct Inner {
     problems: Mutex<Vec<Problem>>,
     events: broadcast::Sender<Event>,
     secrets: Arc<dyn SecretStore>,
+    sessions: Sessions,
+    ssh_config: Option<PathBuf>,
 }
 
 impl Core {
@@ -53,6 +62,8 @@ impl Core {
                 problems: Mutex::new(problems),
                 events,
                 secrets: options.secrets,
+                sessions: Sessions::default(),
+                ssh_config: options.ssh_config,
             }),
         })
     }
@@ -68,12 +79,46 @@ impl Core {
     }
 
     /// Runs one command. File and keyring I/O happen on a blocking thread so
-    /// callers on an async runtime are never stalled.
+    /// callers on an async runtime are never stalled. Session commands are
+    /// only messages to a running session and are handled directly.
     pub async fn execute(&self, command: Command) -> Result<Response> {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || inner.execute(command))
-            .await
-            .map_err(|e| Error::Task(e.to_string()))?
+        let sessions = &self.inner.sessions;
+        let (session, input) = match command {
+            Command::OpenTerminal { node, cols, rows } => {
+                let node = self.inner.tree().get(node)?.node.clone();
+                if node.kind != SSH_HOST_KIND {
+                    return Err(Error::invalid(
+                        "node",
+                        format!("{} is a {}, not an SSH host", node.name, node.kind),
+                    ));
+                }
+                let session = ssh::open(self, node, cols, rows);
+                return Ok(Response::Session { session });
+            }
+            Command::AnswerPrompt {
+                session,
+                prompt,
+                answer,
+            } => {
+                sessions.answer(session, prompt, answer)?;
+                return Ok(Response::Ok);
+            }
+            Command::WriteTerminal { session, data } => (session, Input::Write(data)),
+            Command::ResizeTerminal {
+                session,
+                cols,
+                rows,
+            } => (session, Input::Resize { cols, rows }),
+            Command::CloseSession { session } => (session, Input::Close),
+            command => {
+                let inner = self.inner.clone();
+                return tokio::task::spawn_blocking(move || inner.execute(command))
+                    .await
+                    .map_err(|e| Error::Task(e.to_string()))?;
+            }
+        };
+        sessions.send(session, input)?;
+        Ok(Response::Ok)
     }
 
     /// Looks up a node's secret.
@@ -87,6 +132,26 @@ impl Core {
         tokio::task::spawn_blocking(move || inner.resolve_secret(id, &field))
             .await
             .map_err(|e| Error::Task(e.to_string()))?
+    }
+
+    /// Takes a session's terminal output stream: the bytes the remote shell
+    /// writes, in order. It can be taken once. The session ends when the
+    /// stream is dropped, so a client that is done with a terminal can just
+    /// let go of it.
+    pub fn take_output(&self, session: SessionId) -> Result<mpsc::Receiver<Vec<u8>>> {
+        self.inner.sessions.take_output(session)
+    }
+
+    pub(crate) fn sessions(&self) -> &Sessions {
+        &self.inner.sessions
+    }
+
+    pub(crate) fn emit(&self, event: Event) {
+        self.inner.emit(event);
+    }
+
+    pub(crate) fn ssh_config(&self) -> Option<&Path> {
+        self.inner.ssh_config.as_deref()
     }
 
     /// Re-reads the tree from disk and sends events for whatever changed.
@@ -197,6 +262,12 @@ impl Inner {
                 self.reload()?;
                 Ok(Response::Ok)
             }
+            // Handled by `Core::execute` before it gets here.
+            Command::OpenTerminal { .. }
+            | Command::WriteTerminal { .. }
+            | Command::ResizeTerminal { .. }
+            | Command::AnswerPrompt { .. }
+            | Command::CloseSession { .. } => unreachable!("session command on the blocking path"),
         }
     }
 

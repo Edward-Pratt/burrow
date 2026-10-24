@@ -37,6 +37,11 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `clear_secret` | `id`, `field` | `node { node }` |
 | `list_problems` | | `problems { problems }` |
 | `reload_config` | | `ok` |
+| `open_terminal` | `node`, `cols`, `rows` | `session { session }` |
+| `write_terminal` | `session`, `data` (bytes) | `ok` |
+| `resize_terminal` | `session`, `cols`, `rows` | `ok` |
+| `answer_prompt` | `session`, `prompt`, `answer` | `ok` |
+| `close_session` | `session` | `ok` |
 
 Rules:
 - **`update_node` patch:** a missing field is left as it is. `"color": null` clears the color. `props` replaces all props.
@@ -60,8 +65,36 @@ Every subscriber receives events. They are sent for changes made through command
 | `node_updated` | `node` | A node changed, including a move to another folder. |
 | `node_deleted` | `id` | A node was removed. Children are announced before their parents. |
 | `problems_changed` | `problems` | The set of config files that fail to load changed. |
+| `session_changed` | `session`, `node`, `state` | A session moved on: `connecting { step }`, `connected`, or `closed { error }` (`error` is null when the shell ended normally). |
+| `prompt_requested` | `session`, `prompt { id, kind, title, message }` | A session waits for `answer_prompt`. |
 
 A subscriber that falls more than 256 events behind gets a "lagged" error and should call `list_nodes` again.
+
+## SSH sessions
+
+`open_terminal` on an `ssh-host` node replies at once with a session id. The session then connects in the background and reports each step as `session_changed`.
+
+- **Host settings** come from `ssh -G <alias>`, so `Include`, `Match`, `Host` patterns and defaults apply exactly as for `ssh <alias>`. `props.alias` is the alias (the node's name when missing). An alias that is empty, starts with `-`, or has spaces or control characters is refused, because node files can come from a shared folder.
+- **Host keys** are checked against the `UserKnownHostsFile` and `GlobalKnownHostsFile` files, following `StrictHostKeyChecking`. A changed or `@revoked` key is always refused. A new key is asked about (`ask`) or added (`accept-new`/`no`), except when the host has known keys of another type, which is always asked about. New keys go into the first user file, hashed if `HashKnownHosts` is on.
+- **Signing in** tries agent keys (`IdentityAgent`, configured keys first, only those with `IdentitiesOnly`), then key files (asking for passphrases), then a password, then keyboard-interactive.
+- **Saved passwords** are kept in the keyring with the `user@host:port` they were used for (`password-target`), and are only sent there.
+- **Not yet supported:** `ProxyJump` and `ProxyCommand` make the session fail with a message, rather than being ignored.
+
+### Prompts
+
+`prompt.kind` is one of:
+
+| `type` | Answer with |
+|---|---|
+| `confirm` | `{"type": "confirm"}` or `{"type": "cancel"}` |
+| `secret` (`can_save`) | `{"type": "text", "value": "…", "save": false}`, or `cancel` |
+| `text` | `{"type": "text", "value": "…"}`, or `cancel` |
+
+A prompt left unanswered when the session closes counts as cancelled.
+
+### Output stream
+
+Terminal output is not sent as events: a burst of output would push every subscriber past its event buffer. In-process clients take each session's output with `Core::take_output(session)`, once. It is a bounded stream, so a slow reader slows the SSH channel down instead of losing output. Dropping the stream ends the session. Out-of-process clients will receive the same bytes as notifications (milestone 8).
 
 ## Secrets
 
