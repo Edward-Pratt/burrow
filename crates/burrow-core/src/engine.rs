@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use tokio::sync::{broadcast, mpsc};
 
+use crate::addon::{Host, Manifest, Permission};
 use crate::api::{
     API_VERSION, Command, Event, NodeId, Problem, Response, SSH_HOST_KIND, SecretValue, SessionId,
+    View,
 };
 use crate::error::{Error, Result};
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
@@ -16,8 +18,12 @@ use crate::tree::{Entry, Tree};
 const EVENT_BUFFER: usize = 256;
 
 pub struct CoreOptions {
-    /// Burrow's config directory. The tree lives in its `tree/` subfolder.
+    /// Burrow's config directory. The tree lives in its `tree/` subfolder
+    /// and addons in `addons/`.
     pub config_dir: PathBuf,
+    /// Where runtime state goes, such as which addons are approved. Kept
+    /// apart from the config directory, which may be shared.
+    pub state_dir: PathBuf,
     pub secrets: Arc<dyn SecretStore>,
     /// Used instead of `~/.ssh/config`, as `ssh -F` does. `None` reads the
     /// user's own.
@@ -29,8 +35,13 @@ impl CoreOptions {
     pub fn system() -> Result<Self> {
         let dirs = directories::ProjectDirs::from("", "", "burrow")
             .ok_or_else(|| Error::invalid("config dir", "could not find the home directory"))?;
+        let state_dir = dirs
+            .state_dir()
+            .unwrap_or_else(|| dirs.data_local_dir())
+            .to_path_buf();
         Ok(CoreOptions {
             config_dir: dirs.config_dir().to_path_buf(),
+            state_dir,
             secrets: Arc::new(KeyringStore::new()?),
             ssh_config: None,
         })
@@ -45,7 +56,11 @@ pub struct Core {
 
 struct Inner {
     tree: Mutex<Tree>,
+    /// The tree's problems; the addon host keeps its own.
+    tree_problems: Mutex<Vec<Problem>>,
+    /// Both together, as last announced.
     problems: Mutex<Vec<Problem>>,
+    addons: Host,
     events: broadcast::Sender<Event>,
     secrets: Arc<dyn SecretStore>,
     sessions: Sessions,
@@ -54,12 +69,19 @@ struct Inner {
 
 impl Core {
     pub fn open(options: CoreOptions) -> Result<Core> {
-        let (tree, problems) = Tree::load(&options.config_dir.join("tree"))?;
+        let (tree, tree_problems) = Tree::load(&options.config_dir.join("tree"))?;
+        let addons_dir = options.config_dir.join("addons");
+        std::fs::create_dir_all(&addons_dir).map_err(|e| Error::io(&addons_dir, e))?;
+        let addons = Host::new(addons_dir, options.state_dir.join("addons.toml"));
+        addons.rescan();
+        let problems = [tree_problems.clone(), addons.problems()].concat();
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         Ok(Core {
             inner: Arc::new(Inner {
                 tree: Mutex::new(tree),
+                tree_problems: Mutex::new(tree_problems),
                 problems: Mutex::new(problems),
+                addons,
                 events,
                 secrets: options.secrets,
                 sessions: Sessions::default(),
@@ -76,6 +98,11 @@ impl Core {
     /// The directory holding the node files.
     pub fn tree_dir(&self) -> PathBuf {
         self.inner.tree().dir().to_path_buf()
+    }
+
+    /// The directory holding addon folders.
+    pub fn addons_dir(&self) -> PathBuf {
+        self.inner.addons.dir().to_path_buf()
     }
 
     /// Runs one command. File and keyring I/O happen on a blocking thread so
@@ -110,6 +137,47 @@ impl Core {
                 rows,
             } => (session, Input::Resize { cols, rows }),
             Command::CloseSession { session } => (session, Input::Close),
+            Command::OpenView { node } => {
+                let node = self.inner.tree().get(node)?.node.clone();
+                let manifest = self.inner.addons.owner(&node.kind).ok_or_else(|| {
+                    Error::invalid("node", format!("no addon handles {} nodes", node.kind))
+                })?;
+                let view = self.inner.addons.open_view(self, &manifest, node).await?;
+                return Ok(Response::View { view });
+            }
+            Command::InvokeAction {
+                addon,
+                action,
+                node,
+                values,
+            } => {
+                let manifest = self.inner.addons.manifest(&addon)?;
+                let node = match node {
+                    Some(id) => Some(self.inner.tree().get(id)?.node.clone()),
+                    None => None,
+                };
+                let offered = match &node {
+                    // Buttons and forms in its own views can send anything.
+                    Some(node) if manifest.owns(&node.kind) => true,
+                    Some(node) => manifest
+                        .actions
+                        .iter()
+                        .any(|a| a.id == action && a.kinds.contains(&node.kind)),
+                    None => manifest.commands.iter().any(|c| c.id == action),
+                };
+                if !offered {
+                    return Err(Error::invalid(
+                        "action",
+                        format!("addon {addon} offers no {action:?} here"),
+                    ));
+                }
+                let message = self
+                    .inner
+                    .addons
+                    .invoke(self, &manifest, &action, node, values)
+                    .await?;
+                return Ok(Response::Invoked { message });
+            }
             command => {
                 let inner = self.inner.clone();
                 return tokio::task::spawn_blocking(move || inner.execute(command))
@@ -142,6 +210,37 @@ impl Core {
         self.inner.sessions.take_output(session)
     }
 
+    /// Runs a command an addon sent, if its permissions allow it.
+    pub(crate) async fn execute_as_addon(
+        &self,
+        manifest: Arc<Manifest>,
+        command: Command,
+    ) -> Result<Response> {
+        self.inner.permit(&manifest, &command)?;
+        self.execute(command).await
+    }
+
+    /// An addon redrew the view of one of its own nodes.
+    pub(crate) fn view_changed(&self, manifest: &Manifest, node: NodeId, view: View) -> Result<()> {
+        let kind = self.inner.tree().get(node)?.node.kind.clone();
+        if !manifest.owns(&kind) {
+            return Err(Error::PermissionDenied(format!(
+                "{node} is a {kind} node, which addon {} does not own",
+                manifest.id
+            )));
+        }
+        self.emit(Event::ViewChanged { node, view });
+        Ok(())
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakCore {
+        WeakCore(Arc::downgrade(&self.inner))
+    }
+
+    pub(crate) fn addons(&self) -> &Host {
+        &self.inner.addons
+    }
+
     pub(crate) fn sessions(&self) -> &Sessions {
         &self.inner.sessions
     }
@@ -157,6 +256,16 @@ impl Core {
     /// Re-reads the tree from disk and sends events for whatever changed.
     pub(crate) fn reload(&self) -> Result<()> {
         self.inner.reload()
+    }
+}
+
+/// A [`Core`] that does not keep it alive, for tasks it owns.
+#[derive(Clone)]
+pub(crate) struct WeakCore(Weak<Inner>);
+
+impl WeakCore {
+    pub fn upgrade(&self) -> Option<Core> {
+        self.0.upgrade().map(|inner| Core { inner })
     }
 }
 
@@ -255,6 +364,23 @@ impl Inner {
                 }
                 Ok(Response::Node { node })
             }
+            Command::ListAddons => Ok(Response::Addons {
+                addons: self.addons.infos(),
+            }),
+            Command::ApproveAddon { id, fingerprint } => {
+                self.addons.approve(&id, &fingerprint)?;
+                self.emit(Event::AddonsChanged {
+                    addons: self.addons.infos(),
+                });
+                Ok(Response::Ok)
+            }
+            Command::RevokeAddon { id } => {
+                self.addons.revoke(&id)?;
+                self.emit(Event::AddonsChanged {
+                    addons: self.addons.infos(),
+                });
+                Ok(Response::Ok)
+            }
             Command::ListProblems => Ok(Response::Problems {
                 problems: self.problems.lock().unwrap().clone(),
             }),
@@ -267,7 +393,52 @@ impl Inner {
             | Command::WriteTerminal { .. }
             | Command::ResizeTerminal { .. }
             | Command::AnswerPrompt { .. }
-            | Command::CloseSession { .. } => unreachable!("session command on the blocking path"),
+            | Command::CloseSession { .. }
+            | Command::OpenView { .. }
+            | Command::InvokeAction { .. } => unreachable!("async command on the blocking path"),
+        }
+    }
+
+    /// The permission table for commands sent by addons. Anything not
+    /// listed, such as secrets, sessions and managing addons, is refused.
+    fn permit(&self, manifest: &Manifest, command: &Command) -> Result<()> {
+        let need = |permission: Permission| {
+            if manifest.has(permission) {
+                Ok(())
+            } else {
+                Err(Error::PermissionDenied(format!(
+                    "addon {} lacks {permission}",
+                    manifest.id
+                )))
+            }
+        };
+        let own = |kind: &str| {
+            if manifest.owns(kind) {
+                Ok(())
+            } else {
+                Err(Error::PermissionDenied(format!(
+                    "addon {} may only change its own kinds of node, not {kind}",
+                    manifest.id
+                )))
+            }
+        };
+        match command {
+            Command::Version => Ok(()),
+            Command::ListNodes | Command::GetNode { .. } => need(Permission::NodesRead),
+            Command::CreateNode { kind, .. } => {
+                need(Permission::NodesWrite)?;
+                own(kind)
+            }
+            Command::UpdateNode { id, .. }
+            | Command::MoveNode { id, .. }
+            | Command::DeleteNode { id, .. } => {
+                need(Permission::NodesWrite)?;
+                own(&self.tree().get(*id)?.node.kind)
+            }
+            _ => Err(Error::PermissionDenied(format!(
+                "addons may not send {}",
+                command_name(command)
+            ))),
         }
     }
 
@@ -300,7 +471,7 @@ impl Inner {
 
     fn reload(&self) -> Result<()> {
         let mut tree = self.tree();
-        let (new, problems) = Tree::load(tree.dir())?;
+        let (new, tree_problems) = Tree::load(tree.dir())?;
         let events = diff(&tree, &new);
         *tree = new;
         drop(tree);
@@ -308,6 +479,13 @@ impl Inner {
         for event in events {
             self.emit(event);
         }
+        if self.addons.rescan() {
+            self.emit(Event::AddonsChanged {
+                addons: self.addons.infos(),
+            });
+        }
+        *self.tree_problems.lock().unwrap() = tree_problems.clone();
+        let problems = [tree_problems, self.addons.problems()].concat();
         let mut current = self.problems.lock().unwrap();
         if *current != problems {
             current.clone_from(&problems);
@@ -350,6 +528,14 @@ fn diff(old: &Tree, new: &Tree) -> Vec<Event> {
         }))
         .chain(updated)
         .collect()
+}
+
+/// The command's `type`, as it appears in JSON.
+fn command_name(command: &Command) -> String {
+    serde_json::to_value(command)
+        .ok()
+        .and_then(|v| v.get("type")?.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 fn validate_field(field: &str) -> Result<()> {

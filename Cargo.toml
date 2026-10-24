@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/burrow-core", "crates/burrow-gtk"]
+members = ["crates/burrow-core", "crates/burrow-gtk", "crates/burrow-addon-notes"]
 
 [workspace.package]
 version = "0.1.0"

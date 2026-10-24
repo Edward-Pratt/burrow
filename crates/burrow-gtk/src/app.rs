@@ -461,6 +461,8 @@ impl App {
             Event::ProblemsChanged { problems } => self.problems = problems,
             // Handled by `session_event`, which needs the window.
             Event::SessionChanged { .. } | Event::PromptRequested { .. } => {}
+            // Not drawn yet.
+            Event::AddonsChanged { .. } | Event::ViewChanged { .. } => {}
         }
     }
 

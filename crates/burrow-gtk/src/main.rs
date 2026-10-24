@@ -32,13 +32,17 @@ fn main() {
     app.run::<app::App>(app::Init { core, config_dir });
 }
 
-/// `BURROW_CONFIG_DIR` points Burrow at another config folder, and
+/// `BURROW_CONFIG_DIR` points Burrow at another config folder,
+/// `BURROW_STATE_DIR` at another state folder (addon approvals), and
 /// `BURROW_SSH_CONFIG` at another OpenSSH config (as `ssh -F`), which keeps
 /// development runs away from your real ones.
 fn core_options() -> burrow_core::Result<CoreOptions> {
     let mut options = CoreOptions::system()?;
     if let Some(dir) = std::env::var_os("BURROW_CONFIG_DIR") {
         options.config_dir = PathBuf::from(dir);
+    }
+    if let Some(dir) = std::env::var_os("BURROW_STATE_DIR") {
+        options.state_dir = PathBuf::from(dir);
     }
     if let Some(file) = std::env::var_os("BURROW_SSH_CONFIG") {
         options.ssh_config = Some(PathBuf::from(file));

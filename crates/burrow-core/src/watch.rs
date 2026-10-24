@@ -19,7 +19,7 @@ pub struct Watcher {
 }
 
 impl Core {
-    /// Starts watching the tree directory. Must be called from inside a
+    /// Starts watching the tree and addon directories. Must be called from inside a
     /// tokio runtime.
     pub fn watch(&self) -> Result<Watcher> {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -27,9 +27,11 @@ impl Core {
             let _ = tx.send(result);
         })
         .map_err(|e| Error::Watch(e.to_string()))?;
-        debouncer
-            .watch(self.tree_dir(), RecursiveMode::Recursive)
-            .map_err(|e| Error::Watch(e.to_string()))?;
+        for dir in [self.tree_dir(), self.addons_dir()] {
+            debouncer
+                .watch(dir, RecursiveMode::Recursive)
+                .map_err(|e| Error::Watch(e.to_string()))?;
+        }
 
         // The loop ends when the debouncer, and with it `tx`, is dropped.
         let core = self.clone();

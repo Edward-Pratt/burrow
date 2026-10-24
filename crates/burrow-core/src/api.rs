@@ -3,7 +3,7 @@
 //! backwards compatible. All of them serialize to JSON for out-of-process
 //! clients (addons, CLI, MCP bridge).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -190,6 +190,163 @@ pub enum PromptAnswer {
     },
 }
 
+/// An addon found in the `addons/` folder, as [`Command::ListAddons`]
+/// reports it. Everything but `state` comes from its `addon.toml`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AddonInfo {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    /// What the addon may do through the API, such as `"nodes:read"`.
+    pub permissions: Vec<String>,
+    /// Node kinds the addon owns. Only it can create or change their nodes,
+    /// and it draws their tabs.
+    pub kinds: Vec<AddonKind>,
+    /// Palette commands.
+    pub commands: Vec<AddonCommand>,
+    /// Sidebar context-menu actions.
+    pub actions: Vec<AddonAction>,
+    /// The program that runs, resolved inside the addon's folder.
+    pub program: PathBuf,
+    /// A hash of everything an approval covers: the id, permissions, kinds,
+    /// program path, its arguments and the program file itself.
+    /// [`Command::ApproveAddon`] must repeat it, so the user approves
+    /// exactly what they were shown.
+    pub fingerprint: String,
+    #[serde(flatten)]
+    pub state: AddonState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddonKind {
+    pub kind: String,
+    /// Shown in "New …" menus, such as "PostgreSQL database".
+    pub label: String,
+    /// A symbolic icon name from the icon theme.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddonCommand {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddonAction {
+    pub id: String,
+    pub title: String,
+    /// The node kinds it is offered on.
+    pub kinds: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AddonState {
+    /// Never approved, or `changed` since it was: a new program file, other
+    /// permissions or other kinds. It does not run until approved.
+    NeedsApproval {
+        changed: bool,
+    },
+    /// Approved. It starts when first used.
+    Ready,
+    Running,
+    /// It stopped by itself or broke the protocol. It is started again on
+    /// the next use, after a growing delay.
+    Failed {
+        error: String,
+    },
+}
+
+/// What an addon draws for one of its nodes. The client turns the blocks
+/// into native widgets, top to bottom.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct View {
+    pub blocks: Vec<Block>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Block {
+    Heading {
+        text: String,
+    },
+    Text {
+        text: String,
+    },
+    /// Label and value pairs.
+    Fields {
+        fields: Vec<Field>,
+    },
+    Table {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+    /// Submitting sends `action` with the field values to the addon.
+    Form {
+        action: String,
+        fields: Vec<FormField>,
+        submit: String,
+    },
+    /// Each button sends its `action` to the addon.
+    Buttons {
+        buttons: Vec<Button>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Field {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FormField {
+    /// The key of its value in [`Command::InvokeAction`]'s `values`.
+    pub name: String,
+    pub label: String,
+    #[serde(flatten)]
+    pub input: FormInput,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "input", rename_all = "snake_case")]
+pub enum FormInput {
+    Text {
+        #[serde(default)]
+        value: String,
+    },
+    Multiline {
+        #[serde(default)]
+        value: String,
+    },
+    Check {
+        #[serde(default)]
+        value: bool,
+    },
+    /// One of `options`.
+    Choice {
+        options: Vec<String>,
+        #[serde(default)]
+        value: String,
+    },
+}
+
+/// A form field's value: a bool for `check`, text for the rest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FormValue {
+    Bool(bool),
+    Text(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Button {
+    pub action: String,
+    pub label: String,
+}
+
 /// A config file the core could not load. The rest of the tree still loads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Problem {
@@ -278,16 +435,65 @@ pub enum Command {
     CloseSession {
         session: SessionId,
     },
+    /// Returns every addon as [`Response::Addons`], sorted by id.
+    ListAddons,
+    /// Lets an addon run. `fingerprint` must match the one `list_addons`
+    /// reported, so a change made meanwhile is not approved unseen.
+    ApproveAddon {
+        id: String,
+        fingerprint: String,
+    },
+    /// Withdraws an approval and stops the addon.
+    RevokeAddon {
+        id: String,
+    },
+    /// Asks the addon that owns the node's kind what to draw for it.
+    /// Returns [`Response::View`]. Later versions of the view arrive as
+    /// [`Event::ViewChanged`].
+    OpenView {
+        node: NodeId,
+    },
+    /// Sends an action to an addon: a palette command (no `node`), a
+    /// context-menu action, or a button or form in one of its views.
+    /// Returns [`Response::Invoked`].
+    InvokeAction {
+        addon: String,
+        action: String,
+        #[serde(default)]
+        node: Option<NodeId>,
+        #[serde(default)]
+        values: BTreeMap<String, FormValue>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    Version { api: u32 },
-    Nodes { nodes: Vec<Node> },
-    Node { node: Node },
-    Problems { problems: Vec<Problem> },
-    Session { session: SessionId },
+    Version {
+        api: u32,
+    },
+    Nodes {
+        nodes: Vec<Node>,
+    },
+    Node {
+        node: Node,
+    },
+    Problems {
+        problems: Vec<Problem>,
+    },
+    Session {
+        session: SessionId,
+    },
+    Addons {
+        addons: Vec<AddonInfo>,
+    },
+    View {
+        view: View,
+    },
+    /// `message` is something the addon wants shown to the user.
+    Invoked {
+        message: Option<String>,
+    },
     Ok,
 }
 
@@ -318,5 +524,14 @@ pub enum Event {
     PromptRequested {
         session: SessionId,
         prompt: Prompt,
+    },
+    /// An addon was added, removed, approved, revoked, started or stopped.
+    AddonsChanged {
+        addons: Vec<AddonInfo>,
+    },
+    /// The addon that owns `node` redrew its view.
+    ViewChanged {
+        node: NodeId,
+        view: View,
     },
 }

@@ -40,6 +40,18 @@ pub enum Error {
     #[error("session {0} not found")]
     SessionNotFound(crate::api::SessionId),
 
+    #[error("addon {0} not found")]
+    AddonNotFound(String),
+
+    #[error("addon {0} is not approved")]
+    AddonNotApproved(String),
+
+    #[error("addon {id}: {message}")]
+    Addon { id: String, message: String },
+
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("background task failed: {0}")]
     Task(String),
 }

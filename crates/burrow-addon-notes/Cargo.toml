@@ -1,0 +1,19 @@
+[package]
+name = "burrow-addon-notes"
+description = "An example Burrow addon: plain-text notes in the sidebar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Only `serde_json`: the point is to show the wire protocol, which any
+# language can speak, not to depend on `burrow-core`.
+[dependencies]
+serde_json = "1.0.154"
+
+[dev-dependencies]
+burrow-core = { version = "0.1.0", path = "../burrow-core" }
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
+toml = "1.1.8"
