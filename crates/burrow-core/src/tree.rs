@@ -15,6 +15,7 @@ use tempfile::NamedTempFile;
 
 use crate::api::{FOLDER_KIND, Node, NodeId, NodePatch, Problem};
 use crate::error::{Error, Result};
+use crate::secrets::SecretKey;
 
 pub(crate) const FOLDER_FILE: &str = "_folder.toml";
 const LEAF_EXT: &str = "toml";
@@ -109,18 +110,19 @@ impl Tree {
 
         let mut needs_write = !meta.exists();
         let id = self.claim_id(file.id, &mut needs_write);
+        let secrets = owned_refs(id, file.secrets, &meta, problems);
         let entry = Entry {
             node: Node {
                 id,
                 parent,
                 kind: FOLDER_KIND.to_string(),
-                name: file.name.unwrap_or_else(|| file_label(dir)),
+                name: file.name.unwrap_or_else(|| dir_name(dir)),
                 color: file.color,
                 props: file.props,
-                secrets: file.secrets.keys().cloned().collect(),
+                secrets: secrets.keys().cloned().collect(),
             },
             path: dir.to_path_buf(),
-            secret_refs: file.secrets,
+            secret_refs: secrets,
         };
         // Never overwrite a file we failed to parse: the user may be halfway
         // through editing it. The folder gets a temporary id instead.
@@ -159,6 +161,7 @@ impl Tree {
 
         let mut needs_write = false;
         let id = self.claim_id(file.id, &mut needs_write);
+        let secrets = owned_refs(id, file.secrets, path, problems);
         let entry = Entry {
             node: Node {
                 id,
@@ -167,10 +170,10 @@ impl Tree {
                 name: file.name.unwrap_or_else(|| file_label(path)),
                 color: file.color,
                 props: file.props,
-                secrets: file.secrets.keys().cloned().collect(),
+                secrets: secrets.keys().cloned().collect(),
             },
             path: path.to_path_buf(),
-            secret_refs: file.secrets,
+            secret_refs: secrets,
         };
         if needs_write && let Err(e) = write_entry(&entry) {
             problems.push(problem(path, e));
@@ -306,12 +309,9 @@ impl Tree {
         }
         let dir = self.folder_dir(parent)?;
         let stem = if old.node.is_folder() {
-            file_label(&old.path)
+            dir_name(&old.path)
         } else {
-            old.path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| slug(&old.node.name))
+            file_label(&old.path)
         };
         let target = unique_path(&dir, &stem, extension(&old), None);
         fs::rename(&old.path, &target).map_err(|e| Error::io(&old.path, e))?;
@@ -415,6 +415,29 @@ impl Tree {
     }
 }
 
+/// Keeps only the secret references this node owns. Anything else, such as
+/// a hand-edited reference to another app's keyring entry or a copied
+/// file's references to the original node's secrets, is reported and
+/// ignored, so the core never follows it.
+fn owned_refs(
+    id: NodeId,
+    refs: BTreeMap<String, String>,
+    path: &Path,
+    problems: &mut Vec<Problem>,
+) -> BTreeMap<String, String> {
+    refs.into_iter()
+        .filter(
+            |(field, reference)| match SecretKey::for_node_ref(id, field, reference) {
+                Ok(_) => true,
+                Err(e) => {
+                    problems.push(problem(path, format!("{e}; ignored")));
+                    false
+                }
+            },
+        )
+        .collect()
+}
+
 fn read_node_file(path: &Path) -> Result<NodeFile, Problem> {
     let text = fs::read_to_string(path).map_err(|e| problem(path, e))?;
     toml::from_str(&text).map_err(|e| problem(path, e.message()))
@@ -505,9 +528,17 @@ fn parent_dir(path: &Path) -> PathBuf {
     path.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
-/// A file or directory name without its extension, used as a default name.
+/// A leaf file's name without `.toml`, used as a default node name.
 fn file_label(path: &Path) -> String {
     path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// A folder's full directory name. Unlike [`file_label`] it keeps dots, so
+/// `example.com/` stays "example.com".
+fn dir_name(path: &Path) -> String {
+    path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
 }

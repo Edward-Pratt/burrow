@@ -259,6 +259,77 @@ async fn secrets_stay_out_of_config_files_and_the_api() {
 }
 
 #[tokio::test]
+async fn foreign_secret_references_are_never_followed() {
+    let f = Fixture::new();
+    let host = f.create(None, "ssh-host", "h").await;
+    let victim = burrow_core::SecretKey {
+        service: "other-app".into(),
+        user: "token".into(),
+    };
+    burrow_core::SecretStore::set(&*f.secrets, &victim, &SecretValue::new("theirs")).unwrap();
+
+    // Point the node's password at another app's keyring entry by hand.
+    let path = f.tree().join("h.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        format!("{text}\n[secrets]\npassword = \"keyring:other-app/token\"\n"),
+    )
+    .unwrap();
+    f.reload().await;
+
+    let problems = match f.run(Command::ListProblems).await {
+        Response::Problems { problems } => problems,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        f.core
+            .resolve_secret(host.id, "password")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    f.run(Command::DeleteNode {
+        id: host.id,
+        recursive: false,
+    })
+    .await;
+    let still_there = burrow_core::SecretStore::get(&*f.secrets, &victim).unwrap();
+    assert_eq!(still_there.unwrap().expose(), "theirs");
+}
+
+#[tokio::test]
+async fn deleting_a_copied_file_keeps_the_original_secret() {
+    let f = Fixture::new();
+    let host = f.create(None, "ssh-host", "a").await;
+    f.run(Command::SetSecret {
+        id: host.id,
+        field: "password".into(),
+        value: SecretValue::new("hunter2"),
+    })
+    .await;
+    fs::copy(f.tree().join("a.toml"), f.tree().join("b.toml")).unwrap();
+    f.reload().await;
+
+    let copy = f
+        .nodes()
+        .await
+        .into_iter()
+        .find(|n| n.id != host.id)
+        .unwrap();
+    assert!(copy.secrets.is_empty());
+    f.run(Command::DeleteNode {
+        id: copy.id,
+        recursive: false,
+    })
+    .await;
+    let value = f.core.resolve_secret(host.id, "password").await.unwrap();
+    assert_eq!(value.unwrap().expose(), "hunter2");
+}
+
+#[tokio::test]
 async fn rejects_bad_input() {
     let f = Fixture::new();
     let host = f.create(None, "ssh-host", "h").await;
@@ -329,6 +400,24 @@ async fn hand_written_files_get_an_id_once() {
     );
     f.reload().await;
     assert_eq!(drain(&mut rx), vec![]);
+}
+
+#[tokio::test]
+async fn folder_names_keep_their_dots() {
+    let f = Fixture::new();
+    fs::create_dir(f.tree().join("example.com")).unwrap();
+    f.reload().await;
+    let folder = f.nodes().await.pop().unwrap();
+    assert_eq!(folder.name, "example.com");
+
+    // Moving it keeps the directory name too.
+    let other = f.create(None, "folder", "other").await;
+    f.run(Command::MoveNode {
+        id: folder.id,
+        parent: Some(other.id),
+    })
+    .await;
+    assert!(f.tree().join("other/example.com/_folder.toml").is_file());
 }
 
 #[tokio::test]

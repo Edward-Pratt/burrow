@@ -70,6 +70,7 @@ Secret values only flow into the core: `set_secret` stores them, and nothing ret
 - **What the config file holds:** a reference to the keyring entry, for example `password = "keyring:burrow/<node-id>/password"`.
 - **Who can read them:** only trusted in-process code, such as the core's own SSH and database connectors, through `Core::resolve_secret`. It is deliberately not a command.
 - **Cleanup:** deleting a node also deletes its secrets from the keyring.
+- **References are pinned to their owner:** a reference is only followed if it is exactly `keyring:burrow/<this node's id>/<field>`. Config files can come from a shared folder or a `git pull`, so anything else is reported in `list_problems` and ignored. That includes a reference to another app's keyring entry, or a copied file's references to the original node's secrets. Burrow never reads, overwrites or deletes through such a reference.
 
 ## On-disk layout
 

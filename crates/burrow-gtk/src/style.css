@@ -1,0 +1,87 @@
+/* Burrow's own stylesheet on top of plain GTK. Kept small so system and
+   tiling-WM themes still show through. */
+
+.sidebar {
+  border-right: 1px solid alpha(currentColor, 0.12);
+}
+
+.sidebar list {
+  background: transparent;
+}
+
+.sidebar row {
+  padding: 4px 8px;
+  margin: 1px 6px;
+  border-radius: 6px;
+}
+
+.statusbar {
+  padding: 2px 10px;
+  font-size: smaller;
+  border-top: 1px solid alpha(currentColor, 0.12);
+}
+
+.statusbar .error {
+  color: #e01b24;
+}
+
+.statusbar button.warning {
+  color: #c88800;
+  padding: 0 6px;
+  min-height: 0;
+}
+
+.page-title {
+  font-size: 1.6em;
+  font-weight: bold;
+}
+
+.props {
+  font-family: monospace;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: alpha(currentColor, 0.05);
+}
+
+.dim {
+  opacity: 0.65;
+}
+
+.welcome-title {
+  font-size: 2.4em;
+  font-weight: 800;
+  margin-bottom: 12px;
+}
+
+.kbd {
+  font-family: monospace;
+  font-size: smaller;
+  padding: 1px 6px;
+  border: 1px solid alpha(currentColor, 0.25);
+  border-radius: 4px;
+}
+
+.palette {
+  border-radius: 12px;
+}
+
+.palette entry {
+  font-size: 1.1em;
+  padding: 4px 8px;
+}
+
+.palette-subtitle {
+  opacity: 0.6;
+  font-size: smaller;
+}
+
+.tab-close {
+  min-width: 18px;
+  min-height: 18px;
+  padding: 0;
+}
+
+popover.menu button {
+  padding: 4px 12px;
+}
