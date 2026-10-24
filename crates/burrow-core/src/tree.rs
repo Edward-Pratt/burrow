@@ -114,7 +114,7 @@ impl Tree {
                 id,
                 parent,
                 kind: FOLDER_KIND.to_string(),
-                name: file.name.unwrap_or_else(|| file_label(dir)),
+                name: file.name.unwrap_or_else(|| dir_name(dir)),
                 color: file.color,
                 props: file.props,
                 secrets: file.secrets.keys().cloned().collect(),
@@ -306,12 +306,9 @@ impl Tree {
         }
         let dir = self.folder_dir(parent)?;
         let stem = if old.node.is_folder() {
-            file_label(&old.path)
+            dir_name(&old.path)
         } else {
-            old.path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| slug(&old.node.name))
+            file_label(&old.path)
         };
         let target = unique_path(&dir, &stem, extension(&old), None);
         fs::rename(&old.path, &target).map_err(|e| Error::io(&old.path, e))?;
@@ -505,9 +502,17 @@ fn parent_dir(path: &Path) -> PathBuf {
     path.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
-/// A file or directory name without its extension, used as a default name.
+/// A leaf file's name without `.toml`, used as a default node name.
 fn file_label(path: &Path) -> String {
     path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// A folder's full directory name. Unlike [`file_label`] it keeps dots, so
+/// `example.com/` stays "example.com".
+fn dir_name(path: &Path) -> String {
+    path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
