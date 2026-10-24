@@ -6,10 +6,15 @@
 //! output (`cat` of a big file) would push every subscriber past its event
 //! buffer. Each session has its own bounded output stream instead, so a slow
 //! reader slows the SSH channel down rather than losing output.
+//!
+//! Sessions on the same host share one connection ([`Connections`]).
 
 mod config;
+mod connection;
 mod known_hosts;
 mod session;
+
+pub(crate) use connection::Connections;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

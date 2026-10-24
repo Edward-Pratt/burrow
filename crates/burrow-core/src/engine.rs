@@ -10,7 +10,7 @@ use crate::api::{
 };
 use crate::error::{Error, Result};
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
-use crate::ssh::{self, Input, Sessions};
+use crate::ssh::{self, Connections, Input, Sessions};
 use crate::tree::{Entry, Tree};
 
 /// How many events a slow subscriber can fall behind before it starts
@@ -64,6 +64,7 @@ struct Inner {
     events: broadcast::Sender<Event>,
     secrets: Arc<dyn SecretStore>,
     sessions: Sessions,
+    connections: Connections,
     ssh_config: Option<PathBuf>,
 }
 
@@ -89,6 +90,7 @@ impl Core {
                 events,
                 secrets: options.secrets,
                 sessions: Sessions::default(),
+                connections: Connections::default(),
                 ssh_config: options.ssh_config,
             }),
         })
@@ -247,6 +249,10 @@ impl Core {
 
     pub(crate) fn sessions(&self) -> &Sessions {
         &self.inner.sessions
+    }
+
+    pub(crate) fn connections(&self) -> &Connections {
+        &self.inner.connections
     }
 
     pub(crate) fn emit(&self, event: Event) {

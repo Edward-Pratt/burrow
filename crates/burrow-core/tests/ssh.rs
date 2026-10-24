@@ -603,3 +603,80 @@ async fn signs_in_with_a_key_only_the_agent_holds() {
         SessionState::Connected
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_on_one_host_share_its_connection() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    // A passphrase is asked for on every sign-in, so a second prompt would
+    // mean a second connection.
+    let key = server.path("client_key");
+    let status = Process::new("ssh-keygen")
+        .args(["-q", "-p", "-P", "", "-N", "open sesame", "-f"])
+        .arg(&key)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let host_key = fs::read_to_string(server.path("host_key.pub")).unwrap();
+    fs::write(
+        server.path("known_hosts"),
+        format!("[127.0.0.1]:{} {host_key}", server.port),
+    )
+    .unwrap();
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let mut events = core.subscribe();
+
+    let (first, _first_output) = open(&core, &node).await;
+    let prompt = expect_prompt(&mut events, first).await;
+    let passphrase = PromptAnswer::Text {
+        value: SecretValue::new("open sesame"),
+        save: false,
+    };
+    answer(&core, first, &prompt, passphrase).await;
+    assert_eq!(
+        expect_state(&mut events, first).await,
+        SessionState::Connected
+    );
+
+    let (second, mut output) = open(&core, &node).await;
+    assert_eq!(
+        expect_state(&mut events, second).await,
+        SessionState::Connected
+    );
+
+    // Closing one session leaves the connection to the other.
+    core.execute(Command::CloseSession { session: first })
+        .await
+        .unwrap();
+    assert_eq!(closed_error(expect_state(&mut events, first).await), None);
+    write(&core, second, "echo still-$((20 + 22))\n").await;
+    read_until(&mut output, "still-42").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_waiting_on_another_takes_over_when_it_closes() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let mut events = core.subscribe();
+
+    let (first, _first_output) = open(&core, &node).await;
+    expect_prompt(&mut events, first).await;
+    // Waits for the first session's connection instead of asking too.
+    let (second, _second_output) = open(&core, &node).await;
+    core.execute(Command::CloseSession { session: first })
+        .await
+        .unwrap();
+    assert_eq!(closed_error(expect_state(&mut events, first).await), None);
+
+    let prompt = expect_prompt(&mut events, second).await;
+    answer(&core, second, &prompt, PromptAnswer::Confirm).await;
+    assert_eq!(
+        expect_state(&mut events, second).await,
+        SessionState::Connected
+    );
+}
