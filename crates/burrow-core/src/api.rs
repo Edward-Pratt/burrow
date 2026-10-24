@@ -21,6 +21,10 @@ pub const FOLDER_KIND: &str = "folder";
 /// user's OpenSSH config; the node's name is used when it is missing.
 pub const SSH_HOST_KIND: &str = "ssh-host";
 
+/// The `kind` of SSH tunnel nodes. Their props say which host to go
+/// through and what to forward; see [`Command::StartTunnel`].
+pub const SSH_TUNNEL_KIND: &str = "ssh-tunnel";
+
 /// Stable identity of a node. Stored in the node's file, so it survives
 /// renames and moves and can be used in references between nodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -125,8 +129,8 @@ impl Drop for SecretValue {
     }
 }
 
-/// Identifies a session opened with [`Command::OpenTerminal`]. Unique for
-/// as long as the core runs.
+/// Identifies a session opened with [`Command::OpenTerminal`] or
+/// [`Command::StartTunnel`]. Unique for as long as the core runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(pub u64);
@@ -150,6 +154,24 @@ pub enum SessionState {
     Closed {
         error: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Terminal,
+    Tunnel,
+}
+
+/// A running session, as [`Command::ListSessions`] reports it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session: SessionId,
+    /// The SSH host of a terminal, or the tunnel node of a tunnel.
+    pub node: NodeId,
+    pub kind: SessionKind,
+    #[serde(flatten)]
+    pub state: SessionState,
 }
 
 /// A question a session needs answered before it can go on, such as
@@ -431,9 +453,27 @@ pub enum Command {
         prompt: u32,
         answer: PromptAnswer,
     },
-    /// Disconnects. The session then reports [`SessionState::Closed`].
+    /// Disconnects a terminal or stops a tunnel. The session then reports
+    /// [`SessionState::Closed`].
     CloseSession {
         session: SessionId,
+    },
+    /// Returns every running session as [`Response::Sessions`].
+    ListSessions,
+    /// Starts an SSH tunnel node. Returns [`Response::Session`] straight
+    /// away, or the tunnel's session if it is already running. Progress
+    /// arrives as [`Event::SessionChanged`], as for a terminal.
+    StartTunnel {
+        node: NodeId,
+    },
+    /// Returns the tunnels that start with Burrow, as [`Response::Autostart`].
+    ListAutostart,
+    /// Makes a tunnel start with Burrow, or stops it doing so. The choice is
+    /// kept on this computer, not in the tunnel's file, and only holds while
+    /// the tunnel's settings stay as they were.
+    SetAutostart {
+        node: NodeId,
+        enabled: bool,
     },
     /// Returns every addon as [`Response::Addons`], sorted by id.
     ListAddons,
@@ -484,6 +524,13 @@ pub enum Response {
     Session {
         session: SessionId,
     },
+    Sessions {
+        sessions: Vec<SessionInfo>,
+    },
+    /// Tunnel nodes that start with Burrow.
+    Autostart {
+        nodes: Vec<NodeId>,
+    },
     Addons {
         addons: Vec<AddonInfo>,
     },
@@ -519,6 +566,10 @@ pub enum Event {
         session: SessionId,
         node: NodeId,
         state: SessionState,
+    },
+    /// The tunnels that start with Burrow changed.
+    AutostartChanged {
+        nodes: Vec<NodeId>,
     },
     /// The session waits for [`Command::AnswerPrompt`].
     PromptRequested {

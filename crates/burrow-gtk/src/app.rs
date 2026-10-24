@@ -594,6 +594,7 @@ impl App {
             Event::SessionChanged { .. } | Event::PromptRequested { .. } => {}
             Event::AddonsChanged { addons } => self.set_addons(addons, widgets, sender),
             Event::ViewChanged { node, view } => self.show_view(node, Ok(view), sender),
+            Event::AutostartChanged { .. } => {}
         }
     }
 

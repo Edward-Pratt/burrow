@@ -5,12 +5,12 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::addon::{Host, Manifest, Permission};
 use crate::api::{
-    API_VERSION, Command, Event, NodeId, Problem, Response, SSH_HOST_KIND, SecretValue, SessionId,
-    View,
+    API_VERSION, Command, Event, Node, NodeId, Problem, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND,
+    SecretValue, SessionId, SessionKind, View,
 };
 use crate::error::{Error, Result};
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
-use crate::ssh::{self, Connections, Input, Sessions};
+use crate::ssh::{self, Autostart, Connections, Input, Sessions};
 use crate::tree::{Entry, Tree};
 
 /// How many events a slow subscriber can fall behind before it starts
@@ -65,6 +65,9 @@ struct Inner {
     secrets: Arc<dyn SecretStore>,
     sessions: Sessions,
     connections: Connections,
+    autostart: Autostart,
+    /// The tunnels starting with Burrow, as last announced.
+    autostart_nodes: Mutex<Vec<NodeId>>,
     ssh_config: Option<PathBuf>,
 }
 
@@ -81,7 +84,7 @@ impl Core {
         addons.rescan();
         let problems = [tree_problems.clone(), addons.problems()].concat();
         let (events, _) = broadcast::channel(EVENT_BUFFER);
-        Ok(Core {
+        let core = Core {
             inner: Arc::new(Inner {
                 tree: Mutex::new(tree),
                 tree_problems: Mutex::new(tree_problems),
@@ -91,9 +94,29 @@ impl Core {
                 secrets: options.secrets,
                 sessions: Sessions::default(),
                 connections: Connections::default(),
+                autostart: Autostart::load(options.state_dir.join("autostart.toml")),
+                autostart_nodes: Mutex::default(),
                 ssh_config: options.ssh_config,
             }),
-        })
+        };
+        *core.inner.autostart_nodes.lock().unwrap() = core.inner.autostart_enabled();
+        Ok(core)
+    }
+
+    /// Starts the tunnels the user chose to start with Burrow. The process
+    /// that hosts the core calls this once, on its runtime.
+    pub fn autostart(&self) {
+        for node in self.inner.autostart_enabled() {
+            if let Ok(node) = self.node(node)
+                && self
+                    .inner
+                    .sessions
+                    .find(node.id, SessionKind::Tunnel)
+                    .is_none()
+            {
+                ssh::open_tunnel(self, node);
+            }
+        }
     }
 
     /// Receives every [`Event`] sent after this call.
@@ -125,8 +148,27 @@ impl Core {
                         format!("{} is a {}, not an SSH host", node.name, node.kind),
                     ));
                 }
-                let session = ssh::open(self, node, cols, rows);
+                let session = ssh::open_terminal(self, node, cols, rows);
                 return Ok(Response::Session { session });
+            }
+            Command::StartTunnel { node } => {
+                let node = self.node(node)?;
+                if node.kind != SSH_TUNNEL_KIND {
+                    return Err(Error::invalid(
+                        "node",
+                        format!("{} is a {}, not an SSH tunnel", node.name, node.kind),
+                    ));
+                }
+                let session = match sessions.find(node.id, SessionKind::Tunnel) {
+                    Some(session) => session,
+                    None => ssh::open_tunnel(self, node),
+                };
+                return Ok(Response::Session { session });
+            }
+            Command::ListSessions => {
+                return Ok(Response::Sessions {
+                    sessions: sessions.list(),
+                });
             }
             Command::AnswerPrompt {
                 session,
@@ -251,6 +293,10 @@ impl Core {
         &self.inner.sessions
     }
 
+    pub(crate) fn node(&self, id: NodeId) -> Result<Node> {
+        Ok(self.inner.tree().get(id)?.node.clone())
+    }
+
     pub(crate) fn connections(&self) -> &Connections {
         &self.inner.connections
     }
@@ -287,11 +333,52 @@ impl Inner {
     }
 
     fn emit(&self, event: Event) {
+        match &event {
+            Event::SessionChanged { session, state, .. } => self.sessions.record(*session, state),
+            Event::NodeDeleted { id } => self.sessions.close_node(*id),
+            _ => {}
+        }
         // Fails only when nobody is subscribed, which is fine.
         let _ = self.events.send(event);
     }
 
+    fn lookup(&self) -> impl Fn(NodeId) -> Option<Node> + '_ {
+        |id| self.tree().get(id).ok().map(|e| e.node.clone())
+    }
+
+    fn autostart_enabled(&self) -> Vec<NodeId> {
+        self.autostart.enabled(&self.lookup())
+    }
+
+    /// Announces a change in which tunnels start with Burrow, such as an
+    /// edit that withdrew a consent. Called with the tree unlocked.
+    fn check_autostart(&self) {
+        let nodes = self.autostart_enabled();
+        let mut current = self.autostart_nodes.lock().unwrap();
+        if *current != nodes {
+            current.clone_from(&nodes);
+            drop(current);
+            self.emit(Event::AutostartChanged { nodes });
+        }
+    }
+
     fn execute(&self, command: Command) -> Result<Response> {
+        let changes_tree = matches!(
+            command,
+            Command::CreateNode { .. }
+                | Command::UpdateNode { .. }
+                | Command::MoveNode { .. }
+                | Command::DeleteNode { .. }
+                | Command::SetAutostart { .. }
+        );
+        let response = self.execute_inner(command);
+        if changes_tree {
+            self.check_autostart();
+        }
+        response
+    }
+
+    fn execute_inner(&self, command: Command) -> Result<Response> {
         match command {
             Command::Version => Ok(Response::Version { api: API_VERSION }),
             Command::ListNodes => Ok(Response::Nodes {
@@ -335,6 +422,8 @@ impl Inner {
                     self.emit(Event::NodeDeleted { id: entry.node.id });
                 }
                 self.forget_secrets(&removed);
+                let ids: Vec<NodeId> = removed.iter().map(|e| e.node.id).collect();
+                self.autostart.forget(&ids);
                 Ok(Response::Ok)
             }
             Command::SetSecret { id, field, value } => {
@@ -391,6 +480,20 @@ impl Inner {
                 });
                 Ok(Response::Ok)
             }
+            Command::ListAutostart => Ok(Response::Autostart {
+                nodes: self.autostart_nodes.lock().unwrap().clone(),
+            }),
+            Command::SetAutostart { node, enabled } => {
+                let node = self.tree().get(node)?.node.clone();
+                if node.kind != SSH_TUNNEL_KIND {
+                    return Err(Error::invalid(
+                        "node",
+                        format!("{} is a {}, not an SSH tunnel", node.name, node.kind),
+                    ));
+                }
+                self.autostart.set(&self.lookup(), &node, enabled)?;
+                Ok(Response::Ok)
+            }
             Command::ListProblems => Ok(Response::Problems {
                 problems: self.problems.lock().unwrap().clone(),
             }),
@@ -404,6 +507,8 @@ impl Inner {
             | Command::ResizeTerminal { .. }
             | Command::AnswerPrompt { .. }
             | Command::CloseSession { .. }
+            | Command::ListSessions
+            | Command::StartTunnel { .. }
             | Command::OpenView { .. }
             | Command::InvokeAction { .. } => unreachable!("async command on the blocking path"),
         }
@@ -489,6 +594,7 @@ impl Inner {
         for event in events {
             self.emit(event);
         }
+        self.check_autostart();
         if self.addons.rescan() {
             self.emit(Event::AddonsChanged {
                 addons: self.addons.infos(),

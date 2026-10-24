@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::api::{
     API_VERSION, AddonAction, AddonCommand, AddonKind, FOLDER_KIND, Problem, SSH_HOST_KIND,
+    SSH_TUNNEL_KIND,
 };
 use crate::tree::validate_kind;
 
@@ -26,7 +27,7 @@ pub(crate) const MANIFEST_FILE: &str = "addon.toml";
 const PROTOCOL: &str = "jsonrpc-stdio";
 
 /// Kinds the core handles itself, which no addon may claim.
-const RESERVED_KINDS: [&str; 2] = [FOLDER_KIND, SSH_HOST_KIND];
+const RESERVED_KINDS: [&str; 3] = [FOLDER_KIND, SSH_HOST_KIND, SSH_TUNNEL_KIND];
 
 /// What an addon may do through the API. This limits the Burrow API only:
 /// an addon is a normal program running as the user.

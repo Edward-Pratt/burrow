@@ -12,10 +12,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use burrow_core::{
-    Command, Core, CoreOptions, Event, MemoryStore, Node, Prompt, PromptAnswer, PromptKind,
-    Response, SecretValue, SessionId, SessionState,
+    Command, Core, CoreOptions, Event, MemoryStore, Node, NodePatch, Prompt, PromptAnswer,
+    PromptKind, Response, SecretValue, SessionId, SessionKind, SessionState,
 };
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 
 const SSHD: &str = "/usr/bin/sshd";
@@ -679,4 +681,260 @@ async fn a_session_waiting_on_another_takes_over_when_it_closes() {
         expect_state(&mut events, second).await,
         SessionState::Connected
     );
+}
+
+/// Writes the server's host key to known_hosts, so connecting asks nothing.
+fn trust(server: &Server) {
+    let host_key = fs::read_to_string(server.path("host_key.pub")).unwrap();
+    fs::write(
+        server.path("known_hosts"),
+        format!("[127.0.0.1]:{} {host_key}", server.port),
+    )
+    .unwrap();
+}
+
+/// A TCP server on 127.0.0.1 that sends back whatever it gets.
+async fn echo_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = socket.split();
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+    port
+}
+
+async fn tunnel(core: &Core, via: &Node, props: &str) -> Node {
+    let mut props: toml::Table = toml::from_str(props).unwrap();
+    props.insert("via".into(), via.id.to_string().into());
+    let command = Command::CreateNode {
+        parent: None,
+        kind: "ssh-tunnel".into(),
+        name: "tunnel".into(),
+        color: None,
+        props,
+    };
+    match core.execute(command).await.unwrap() {
+        Response::Node { node } => node,
+        other => panic!("expected a node, got {other:?}"),
+    }
+}
+
+async fn start_tunnel(core: &Core, node: &Node) -> SessionId {
+    match core
+        .execute(Command::StartTunnel { node: node.id })
+        .await
+        .unwrap()
+    {
+        Response::Session { session } => session,
+        other => panic!("expected a session, got {other:?}"),
+    }
+}
+
+/// Sends `text` and expects it back.
+async fn echoes(socket: &mut TcpStream, text: &str) {
+    socket.write_all(text.as_bytes()).await.unwrap();
+    let mut back = vec![0; text.len()];
+    tokio::time::timeout(WAIT, socket.read_exact(&mut back))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back, text.as_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_tunnel_forwards_to_its_target() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let host = host(&core, "test").await;
+    let (target, port) = (echo_server().await, free_port());
+    let node = tunnel(
+        &core,
+        &host,
+        &format!(
+            "type = \"local\"\nport = {port}\ntarget_host = \"127.0.0.1\"\ntarget_port = {target}"
+        ),
+    )
+    .await;
+    let mut events = core.subscribe();
+    let session = start_tunnel(&core, &node).await;
+    assert_eq!(
+        expect_state(&mut events, session).await,
+        SessionState::Connected
+    );
+    // Starting it again gives the running one.
+    assert_eq!(start_tunnel(&core, &node).await, session);
+
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    echoes(&mut socket, "through the tunnel").await;
+
+    let sessions = match core.execute(Command::ListSessions).await.unwrap() {
+        Response::Sessions { sessions } => sessions,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].kind, SessionKind::Tunnel);
+    assert_eq!(sessions[0].state, SessionState::Connected);
+
+    core.execute(Command::CloseSession { session })
+        .await
+        .unwrap();
+    assert_eq!(closed_error(expect_state(&mut events, session).await), None);
+    // The forwarded connection ended with it, and nothing listens.
+    let mut rest = Vec::new();
+    let _ = tokio::time::timeout(WAIT, socket.read_to_end(&mut rest))
+        .await
+        .unwrap();
+    assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dynamic_tunnel_is_a_socks_proxy() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let host = host(&core, "test").await;
+    let (target, port) = (echo_server().await, free_port());
+    let node = tunnel(&core, &host, &format!("type = \"dynamic\"\nport = {port}")).await;
+    let mut events = core.subscribe();
+    let session = start_tunnel(&core, &node).await;
+    assert_eq!(
+        expect_state(&mut events, session).await,
+        SessionState::Connected
+    );
+
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    socket.write_all(&[5, 1, 0]).await.unwrap();
+    let mut greeting = [0; 2];
+    socket.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [5, 0]);
+    // CONNECT to "localhost" by name, which the SSH host resolves.
+    let mut request = vec![5, 1, 0, 3, 9];
+    request.extend(b"localhost");
+    request.extend(target.to_be_bytes());
+    socket.write_all(&request).await.unwrap();
+    let mut reply = [0; 10];
+    socket.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[..2], [5, 0]);
+    echoes(&mut socket, "through the proxy").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tunnel_only_listens_on_loopback() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    let core = server.core();
+    let host = host(&core, "test").await;
+    let node = tunnel(
+        &core,
+        &host,
+        &format!(
+            "type = \"dynamic\"\nport = {}\nbind = \"0.0.0.0\"",
+            free_port()
+        ),
+    )
+    .await;
+    let mut events = core.subscribe();
+    let session = start_tunnel(&core, &node).await;
+    let error = closed_error(expect_state(&mut events, session).await).unwrap();
+    assert!(error.contains("loopback"), "{error}");
+}
+
+async fn autostart(core: &Core) -> Vec<burrow_core::NodeId> {
+    match core.execute(Command::ListAutostart).await.unwrap() {
+        Response::Autostart { nodes } => nodes,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn autostart_is_kept_locally_and_pinned_to_the_settings() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let host = host(&core, "test").await;
+    let port = free_port();
+    let props = format!("type = \"dynamic\"\nport = {port}");
+    let node = tunnel(&core, &host, &props).await;
+    let enable = Command::SetAutostart {
+        node: node.id,
+        enabled: true,
+    };
+    core.execute(enable.clone()).await.unwrap();
+    assert_eq!(autostart(&core).await, vec![node.id]);
+    let tunnel_file = fs::read_to_string(server.path("burrow/tree/tunnel.toml")).unwrap();
+    assert!(!tunnel_file.contains("autostart"), "{tunnel_file}");
+
+    // Pointing the host at another server withdraws it.
+    let mut events = core.subscribe();
+    let mut moved = host.props.clone();
+    moved.insert("alias".into(), "elsewhere".into());
+    let patch = NodePatch {
+        props: Some(moved),
+        ..Default::default()
+    };
+    core.execute(Command::UpdateNode { id: host.id, patch })
+        .await
+        .unwrap();
+    assert!(autostart(&core).await.is_empty());
+    let changed = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::AutostartChanged { nodes } = events.recv().await.unwrap() {
+                return nodes;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(changed.is_empty());
+    let patch = NodePatch {
+        props: Some(host.props.clone()),
+        ..Default::default()
+    };
+    core.execute(Command::UpdateNode { id: host.id, patch })
+        .await
+        .unwrap();
+    assert_eq!(autostart(&core).await, vec![node.id]);
+    drop(core);
+
+    // A new core starts it.
+    let core = server.core();
+    let mut events = core.subscribe();
+    core.autostart();
+    let session = loop {
+        match tokio::time::timeout(WAIT, events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::SessionChanged {
+                session,
+                state: SessionState::Connected,
+                ..
+            } => break session,
+            Event::SessionChanged {
+                state: SessionState::Closed { error },
+                ..
+            } => panic!("autostart failed: {error:?}"),
+            _ => {}
+        }
+    };
+    let sessions = match core.execute(Command::ListSessions).await.unwrap() {
+        Response::Sessions { sessions } => sessions,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(sessions[0].session, session);
+    assert_eq!(sessions[0].node, node.id);
 }

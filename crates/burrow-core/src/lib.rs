@@ -17,8 +17,8 @@ mod watch;
 pub use api::{
     API_VERSION, AddonAction, AddonCommand, AddonInfo, AddonKind, AddonState, Block, Button,
     Command, Event, FOLDER_KIND, Field, FormField, FormInput, FormValue, Node, NodeId, NodePatch,
-    Problem, Prompt, PromptAnswer, PromptKind, Response, SSH_HOST_KIND, SecretValue, SessionId,
-    SessionState, View,
+    Problem, Prompt, PromptAnswer, PromptKind, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND,
+    SecretValue, SessionId, SessionInfo, SessionKind, SessionState, View,
 };
 pub use engine::{Core, CoreOptions};
 pub use error::{Error, Result};
