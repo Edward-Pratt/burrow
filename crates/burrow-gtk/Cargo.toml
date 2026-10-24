@@ -1,0 +1,16 @@
+[package]
+description = "Burrow's GTK4 desktop client"
+name = "burrow-gtk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+burrow-core = { version = "0.1.0", path = "../burrow-core" }
+gtk = { version = "0.11", package = "gtk4", features = ["v4_20"] }
+relm4 = "0.11"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
+toml = "1.1.8"

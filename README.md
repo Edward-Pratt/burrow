@@ -6,7 +6,7 @@ Inspired by [Tusk](https://github.com/repticJS/tusk). Burrow is written from scr
 
 ## Status
 
-Milestone 1 (core) in progress. See [docs/DESIGN.md](docs/DESIGN.md).
+Milestones 1 (core) and 2 (GTK shell) in review. See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Goals
 
@@ -22,3 +22,11 @@ Native Rust + GTK4 (gtk4-rs + relm4). No webview. The core (`burrow-core`) is se
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE). Addons run as separate processes and may use any license.
+
+## Running it
+
+```sh
+cargo run -p burrow-gtk
+```
+
+Set `BURROW_CONFIG_DIR=/some/folder` to use a different config folder from `~/.config/burrow`, for example while developing.
