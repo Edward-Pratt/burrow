@@ -473,3 +473,45 @@ async fn an_encrypted_key_asks_for_its_passphrase() {
         SessionState::Connected
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unfamiliar_key_type_warns_even_under_accept_new() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    // The server only has an ed25519 key; known_hosts only an ECDSA one.
+    let status = Process::new("ssh-keygen")
+        .args(["-q", "-t", "ecdsa", "-N", "", "-C", "", "-f"])
+        .arg(server.path("ecdsa_key"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let ecdsa = fs::read_to_string(server.path("ecdsa_key.pub")).unwrap();
+    fs::write(
+        server.path("known_hosts"),
+        format!("[127.0.0.1]:{} {ecdsa}", server.port),
+    )
+    .unwrap();
+    let config = fs::read_to_string(server.path("ssh_config")).unwrap();
+    fs::write(
+        server.path("ssh_config"),
+        config.replace(
+            "StrictHostKeyChecking ask",
+            "StrictHostKeyChecking accept-new",
+        ),
+    )
+    .unwrap();
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let mut events = core.subscribe();
+    let (session, _output) = open(&core, &node).await;
+
+    let prompt = expect_prompt(&mut events, session).await;
+    assert!(
+        prompt.message.contains("intercepting"),
+        "{}",
+        prompt.message
+    );
+    answer(&core, session, &prompt, PromptAnswer::Cancel).await;
+    assert!(closed_error(expect_state(&mut events, session).await).is_some());
+}

@@ -11,15 +11,20 @@ use std::path::{Path, PathBuf};
 
 use data_encoding::BASE64;
 use hmac::{Hmac, KeyInit, Mac};
-use russh::keys::PublicKey;
+use russh::keys::{Algorithm, PublicKey};
 use sha1::Sha1;
 
 /// What the `known_hosts` files say about a host's key.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Check {
     Known,
-    /// No line for this host has this key or another key of its type.
+    /// No line for this host has a key at all.
     Unknown,
+    /// The host has known keys, but only of other types. Servers normally
+    /// offer a type the client already knows, so this needs a warning.
+    OtherTypes {
+        known: Vec<String>,
+    },
     /// A line for this host has a different key of the same type: the host
     /// was reinstalled, or someone is in the middle.
     Changed {
@@ -39,6 +44,7 @@ pub fn check(files: &[PathBuf], host: &str, port: u16, key: &PublicKey) -> Check
     let name = lookup_name(host, port);
     let mut known = false;
     let mut changed = None;
+    let mut other_types = Vec::new();
     for path in files {
         let Ok(file) = File::open(path) else { continue };
         for (index, line) in BufReader::new(file).lines().enumerate() {
@@ -61,14 +67,57 @@ pub fn check(files: &[PathBuf], host: &str, port: u16, key: &PublicKey) -> Check
                 None if entry.key.algorithm() == key.algorithm() => {
                     changed.get_or_insert_with(at);
                 }
-                None => {}
+                None => other_types.push(entry.key.algorithm().to_string()),
             }
         }
     }
     match (known, changed) {
         (true, _) => Check::Known,
         (false, Some((path, line))) => Check::Changed { path, line },
-        (false, None) => Check::Unknown,
+        (false, None) if other_types.is_empty() => Check::Unknown,
+        (false, None) => {
+            other_types.dedup();
+            Check::OtherTypes { known: other_types }
+        }
+    }
+}
+
+/// The key types already known for a host, so the connection can ask the
+/// server for one of those first, as OpenSSH does.
+pub fn known_algorithms(files: &[PathBuf], host: &str, port: u16) -> Vec<Algorithm> {
+    let name = lookup_name(host, port);
+    let mut algorithms = Vec::new();
+    for path in files {
+        let Ok(file) = File::open(path) else { continue };
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if let Some(entry) = Entry::parse(&line)
+                && entry.marker.is_none()
+                && entry.matches(&name)
+                && !algorithms.contains(&entry.key.algorithm())
+            {
+                algorithms.push(entry.key.algorithm());
+            }
+        }
+    }
+    algorithms
+}
+
+/// Host names Burrow will write into `known_hosts`: letters, digits, `.`,
+/// `-`, `_` and `:` (IPv6). Anything else could be read as a pattern. A
+/// host named `*` or `a,*` would otherwise be recorded as trusting this key
+/// for every host.
+pub fn check_host_name(host: &str) -> Result<(), String> {
+    let ok = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "the host name {host:?} can't be recorded in known_hosts; \
+             use a plain host name or IP address"
+        ))
     }
 }
 
@@ -81,6 +130,7 @@ pub fn learn(
     key: &PublicKey,
     hashed: bool,
 ) -> std::io::Result<()> {
+    check_host_name(host).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -264,10 +314,16 @@ mod tests {
             check(&files, "example.com", 22, &key(ED_B)),
             Check::Changed { path, line: 2 }
         );
-        // A key of another type is just not known yet.
+        // A key of another type gets a warning, not a quiet "new host".
         assert_eq!(
             check(&files, "example.com", 22, &key(ECDSA)),
-            Check::Unknown
+            Check::OtherTypes {
+                known: vec!["ssh-ed25519".into()]
+            }
+        );
+        assert_eq!(
+            known_algorithms(&files, "example.com", 22),
+            [key(ED_A).algorithm()]
         );
     }
 
@@ -325,6 +381,23 @@ mod tests {
         assert_eq!(check(&files, "example.com", 2222, &key(ED_A)), Check::Known);
         assert_eq!(check(&files, "hidden.com", 22, &key(ED_B)), Check::Known);
         assert_eq!(check(&files, "other", 22, &key(ECDSA)), Check::Known);
+    }
+
+    #[test]
+    fn pattern_characters_are_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        for host in [
+            "*", "a,*", "!b", "h?st", "[x]", "|1|x", "#c", "@revoked", "",
+        ] {
+            assert!(
+                learn(&path, host, 22, &key(ED_A), false).is_err(),
+                "{host:?}"
+            );
+        }
+        assert!(!path.exists());
+        assert!(check_host_name("fe80::1").is_ok());
+        assert!(check_host_name("web-1.example_corp.com").is_ok());
     }
 
     #[test]

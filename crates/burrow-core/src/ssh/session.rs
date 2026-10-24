@@ -10,7 +10,7 @@ use russh::client::{self, AuthResult, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
-use russh::{ChannelMsg, Disconnect, MethodKind, MethodSet};
+use russh::{ChannelMsg, Disconnect, MethodKind, MethodSet, Preferred};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -149,8 +149,29 @@ async fn connect(
         prompter: prompter.clone(),
         rejection: rejection.clone(),
     };
+    // Ask for a key type known_hosts already has, so a known host isn't
+    // mistaken for a new one because it offered a different type first.
+    let known = {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || {
+            let files: Vec<_> = config
+                .user_known_hosts
+                .iter()
+                .chain(&config.global_known_hosts)
+                .cloned()
+                .collect();
+            known_hosts::known_algorithms(&files, config.host_key_name(), config.port)
+        })
+        .await
+        .map_err(text)?
+    };
+    let mut preferred = Preferred::default();
+    let mut keys = preferred.key.to_vec();
+    keys.sort_by_key(|algorithm| !known.contains(algorithm));
+    preferred.key = keys.into();
     let russh_config = client::Config {
         keepalive_interval: config.server_alive_interval,
+        preferred,
         ..Default::default()
     };
     step("Checking the host key".into());
@@ -215,7 +236,7 @@ async fn verify_host_key(config: &HostConfig, key: &PublicKey, prompter: &Prompt
             .map_err(text)?
     };
     let fingerprint = key.fingerprint(HashAlg::Sha256);
-    match check {
+    match check.clone() {
         Check::Known => return Ok(()),
         Check::Revoked { path, line } => {
             return Err(format!(
@@ -234,21 +255,43 @@ async fn verify_host_key(config: &HostConfig, key: &PublicKey, prompter: &Prompt
                 path.display()
             ));
         }
-        Check::Unknown => {}
+        Check::Unknown | Check::OtherTypes { .. } => {}
     }
+    // Checked before asking, so the user isn't asked to trust a key Burrow
+    // then can't record.
+    known_hosts::check_host_name(&name)?;
 
-    match config.strict_host_key_checking {
-        StrictHostKeyChecking::Yes => {
+    // Only a host with no known keys at all is quietly accepted under
+    // `accept-new`. One that offers an unfamiliar key type always asks.
+    let warning = match &check {
+        Check::OtherTypes { known } => Some(format!(
+            "Burrow knows a {} key for {name}, but the server offered a {} key \
+             instead. That can happen after a server change, or when someone is \
+             intercepting the connection.\n\n",
+            known.join(" / "),
+            key.algorithm()
+        )),
+        _ => None,
+    };
+    match (config.strict_host_key_checking, &warning) {
+        (StrictHostKeyChecking::Yes, _) => {
             return Err(format!(
-                "{name} is not in known_hosts and StrictHostKeyChecking is on"
+                "the {} key for {name} is not in known_hosts and StrictHostKeyChecking is on",
+                key.algorithm()
             ));
         }
-        StrictHostKeyChecking::AcceptNew => {}
-        StrictHostKeyChecking::Ask => {
+        (StrictHostKeyChecking::AcceptNew, None) => {}
+        (StrictHostKeyChecking::AcceptNew | StrictHostKeyChecking::Ask, warning) => {
             let message = format!(
-                "Burrow has not connected to {name} before.\n\n\
+                "{}{}\n\n\
                  {} key fingerprint:\n{fingerprint}\n\n\
                  Only trust it if this matches the server's real key.",
+                warning.as_deref().unwrap_or_default(),
+                if warning.is_some() {
+                    "Check this key with the server's administrator."
+                } else {
+                    "Burrow has not connected to this host before."
+                },
                 key.algorithm()
             );
             let answer = prompter
@@ -392,19 +435,19 @@ async fn authenticate(
 
     // 3. A password: the saved one first, then ask.
     if allowed(&methods, MethodKind::Password) {
-        let saved = core
-            .resolve_secret(node.id, "password")
-            .await
-            .ok()
-            .flatten();
-        for attempt in 0..ATTEMPTS + usize::from(saved.is_some()) {
+        let target = password_target(config);
+        let saved = saved_password(core, node, &target).await;
+        for attempt in 0..ATTEMPTS + usize::from(matches!(saved, Saved::Matches(_))) {
             let (password, save) = match (&saved, attempt) {
-                (Some(saved), 0) => (saved.clone(), false),
+                (Saved::Matches(saved), 0) => (saved.clone(), false),
                 _ => {
-                    let message = if attempt == 0 {
-                        format!("Password for {user}@{host}")
-                    } else {
-                        format!("That didn't work. Password for {user}@{host}")
+                    let message = match (&saved, attempt) {
+                        (Saved::ForElsewhere(other), 0) => format!(
+                            "The saved password is for {other}, so Burrow didn't send it. \
+                             Password for {target}"
+                        ),
+                        (_, 0) => format!("Password for {target}"),
+                        _ => format!("That didn't work. Password for {target}"),
                     };
                     match prompter
                         .ask(PromptKind::Secret { can_save: true }, "Password", &message)
@@ -422,7 +465,7 @@ async fn authenticate(
             {
                 AuthResult::Success => {
                     if save {
-                        save_password(core, node, password).await;
+                        save_password(core, node, password, target).await;
                     }
                     return Ok(());
                 }
@@ -543,14 +586,54 @@ async fn load_key(path: &Path, prompter: &Prompter) -> Result<Option<PrivateKey>
     Ok(None)
 }
 
-/// Best effort: the user is signed in either way.
-async fn save_password(core: &Core, node: &Node, password: SecretValue) {
-    let command = Command::SetSecret {
-        id: node.id,
-        field: "password".into(),
-        value: password,
+/// The keyring field recording where the saved password belongs.
+const PASSWORD_TARGET: &str = "password-target";
+
+/// `user@host:port`, where a password is sent.
+fn password_target(config: &HostConfig) -> String {
+    format!("{}@{}:{}", config.user, config.hostname, config.port)
+}
+
+enum Saved {
+    None,
+    Matches(SecretValue),
+    /// Saved for another destination, so not sent.
+    ForElsewhere(String),
+}
+
+/// The saved password, if it was saved for `target`.
+///
+/// A node's file can be changed by a `git pull` or a shared folder, and its
+/// alias pointed at another server. The keyring can't be changed that way,
+/// so it records where the password was used, and the password is only sent
+/// there.
+async fn saved_password(core: &Core, node: &Node, target: &str) -> Saved {
+    let get = |field| async move { core.resolve_secret(node.id, field).await.ok().flatten() };
+    let Some(password) = get("password").await else {
+        return Saved::None;
     };
-    if let Err(e) = core.execute(command).await {
-        tracing::warn!("could not save the password for {}: {e}", node.name);
+    match get(PASSWORD_TARGET).await {
+        Some(saved) if saved.expose() == target => Saved::Matches(password),
+        Some(saved) => Saved::ForElsewhere(saved.expose().to_string()),
+        None => Saved::ForElsewhere("an unknown host".into()),
+    }
+}
+
+/// Best effort: the user is signed in either way. The target is stored
+/// first, so a failure part way never leaves a password without one.
+async fn save_password(core: &Core, node: &Node, password: SecretValue, target: String) {
+    for (field, value) in [
+        (PASSWORD_TARGET, SecretValue::new(target)),
+        ("password", password),
+    ] {
+        let command = Command::SetSecret {
+            id: node.id,
+            field: field.into(),
+            value,
+        };
+        if let Err(e) = core.execute(command).await {
+            tracing::warn!("could not save the password for {}: {e}", node.name);
+            return;
+        }
     }
 }
