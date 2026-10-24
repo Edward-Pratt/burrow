@@ -13,12 +13,12 @@ jobs:
   check:
     runs-on: ubuntu-latest
     # Arch, so the GTK, VTE and GtkSourceView versions match what Burrow
-    # targets.
+    # targets. openssh provides `ssh -G` and the sshd the SSH tests run.
     container: archlinux:latest
     steps:
       - name: Install system packages
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rustup gtk4 vte4 gtksourceview5 libsecret
+          pacman -Syu --noconfirm --needed base-devel git rustup gtk4 vte4 gtksourceview5 libsecret openssh
           rustup default stable
           rustup component add rustfmt clippy
 
