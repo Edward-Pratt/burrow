@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use burrow_core::{
     Command, Core, CoreOptions, Event, MemoryStore, Node, NodePatch, Prompt, PromptAnswer,
-    PromptKind, Response, SecretValue, SessionId, SessionKind, SessionState,
+    PromptKind, Response, SecretValue, SessionId, SessionKind, SessionState, TransferId,
+    TransferState,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -81,6 +82,7 @@ impl Server {
                  StrictModes no\n\
                  PidFile none\n\
                  PerSourcePenalties no\n\
+                 Subsystem sftp internal-sftp\n\
                  LogLevel ERROR\n",
                 host_key = path("host_key").display(),
                 authorized = path("authorized_keys").display(),
@@ -937,4 +939,280 @@ async fn autostart_is_kept_locally_and_pinned_to_the_settings() {
     };
     assert_eq!(sessions[0].session, session);
     assert_eq!(sessions[0].node, node.id);
+}
+
+async fn open_files(
+    core: &Core,
+    node: &Node,
+    events: &mut broadcast::Receiver<Event>,
+) -> SessionId {
+    let session = match core
+        .execute(Command::OpenFiles { node: node.id })
+        .await
+        .unwrap()
+    {
+        Response::Session { session } => session,
+        other => panic!("expected a session, got {other:?}"),
+    };
+    assert_eq!(expect_state(events, session).await, SessionState::Connected);
+    session
+}
+
+async fn transferred(
+    core: &Core,
+    events: &mut broadcast::Receiver<Event>,
+    command: Command,
+) -> TransferState {
+    let transfer: TransferId = match core.execute(command).await.unwrap() {
+        Response::Transfer { transfer } => transfer,
+        other => panic!("expected a transfer, got {other:?}"),
+    };
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match events.recv().await.unwrap() {
+                Event::TransferChanged {
+                    transfer: t, state, ..
+                } if t == transfer && !matches!(state, TransferState::Running { .. }) => {
+                    return state;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the transfer")
+}
+
+fn remote(path: &Path) -> String {
+    path.to_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_file_panel_lists_changes_and_copies_files() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let mut events = core.subscribe();
+    let session = open_files(&core, &node, &mut events).await;
+
+    // The server is this machine, so remote paths are local ones.
+    let root = server.path("remote");
+    fs::create_dir(&root).unwrap();
+    let ok = |result: burrow_core::Result<Response>| assert_eq!(result.unwrap(), Response::Ok);
+    ok(core
+        .execute(Command::MakeDir {
+            session,
+            path: remote(&root.join("docs")),
+        })
+        .await);
+    let local = server.path("hello.txt");
+    fs::write(&local, "hello over sftp").unwrap();
+    let upload = Command::Upload {
+        session,
+        local: local.clone(),
+        remote: remote(&root.join("docs/hello.txt")),
+        overwrite: false,
+    };
+    assert_eq!(
+        transferred(&core, &mut events, upload.clone()).await,
+        TransferState::Finished
+    );
+    // A second upload to the same name is refused unless asked.
+    match transferred(&core, &mut events, upload).await {
+        TransferState::Failed { error } => assert!(error.contains("already exists"), "{error}"),
+        other => panic!("{other:?}"),
+    }
+
+    ok(core
+        .execute(Command::RenamePath {
+            session,
+            from: remote(&root.join("docs/hello.txt")),
+            to: remote(&root.join("docs/greeting.txt")),
+        })
+        .await);
+    let (path, entries) = match core
+        .execute(Command::ListDir {
+            session,
+            path: remote(&root.join("docs")),
+        })
+        .await
+        .unwrap()
+    {
+        Response::Dir { path, entries } => (path, entries),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(path, remote(&fs::canonicalize(root.join("docs")).unwrap()));
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "greeting.txt");
+    assert_eq!(entries[0].size, 15);
+
+    let copy = server.path("copy.txt");
+    let download = Command::Download {
+        session,
+        remote: remote(&root.join("docs/greeting.txt")),
+        local: copy.clone(),
+        overwrite: false,
+    };
+    assert_eq!(
+        transferred(&core, &mut events, download).await,
+        TransferState::Finished
+    );
+    assert_eq!(fs::read_to_string(&copy).unwrap(), "hello over sftp");
+
+    ok(core
+        .execute(Command::RemovePath {
+            session,
+            path: remote(&root.join("docs")),
+        })
+        .await);
+    assert!(!root.join("docs").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn folders_copy_whole_but_symlinks_inside_are_skipped() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let mut events = core.subscribe();
+    let session = open_files(&core, &node, &mut events).await;
+
+    let tree = server.path("tree");
+    fs::create_dir_all(tree.join("a/b")).unwrap();
+    fs::write(tree.join("a/b/deep.txt"), "deep").unwrap();
+    fs::write(tree.join("top.txt"), "top").unwrap();
+    fs::write(server.path("secret.txt"), "outside").unwrap();
+    std::os::unix::fs::symlink(server.path("secret.txt"), tree.join("link.txt")).unwrap();
+
+    let uploaded = server.path("uploaded");
+    let upload = Command::Upload {
+        session,
+        local: tree.clone(),
+        remote: remote(&uploaded),
+        overwrite: false,
+    };
+    assert_eq!(
+        transferred(&core, &mut events, upload).await,
+        TransferState::Finished
+    );
+    assert_eq!(
+        fs::read_to_string(uploaded.join("a/b/deep.txt")).unwrap(),
+        "deep"
+    );
+    assert_eq!(fs::read_to_string(uploaded.join("top.txt")).unwrap(), "top");
+    assert!(!uploaded.join("link.txt").exists());
+
+    std::os::unix::fs::symlink(server.path("secret.txt"), uploaded.join("link.txt")).unwrap();
+    let downloaded = server.path("downloaded");
+    let download = Command::Download {
+        session,
+        remote: remote(&uploaded),
+        local: downloaded.clone(),
+        overwrite: false,
+    };
+    assert_eq!(
+        transferred(&core, &mut events, download).await,
+        TransferState::Finished
+    );
+    assert_eq!(
+        fs::read_to_string(downloaded.join("a/b/deep.txt")).unwrap(),
+        "deep"
+    );
+    assert!(fs::symlink_metadata(downloaded.join("link.txt")).is_err());
+    // No leftover partial files.
+    let names: Vec<_> = fs::read_dir(&downloaded)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(names.iter().all(|n| !n.starts_with('.')), "{names:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_commands_need_a_connected_file_session() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let mut events = core.subscribe();
+    let (terminal, _output) = open(&core, &node).await;
+    assert_eq!(
+        expect_state(&mut events, terminal).await,
+        SessionState::Connected
+    );
+    let list = Command::ListDir {
+        session: terminal,
+        path: String::new(),
+    };
+    let error = core.execute(list).await.unwrap_err().to_string();
+    assert!(error.contains("not a file session"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_upload_leaves_no_partial_file() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let mut events = core.subscribe();
+    let session = open_files(&core, &node, &mut events).await;
+
+    let big = server.path("big.bin");
+    fs::File::create(&big)
+        .unwrap()
+        .set_len(512 * 1024 * 1024)
+        .unwrap();
+    let target = server.path("big-copy.bin");
+    let upload = Command::Upload {
+        session,
+        local: big,
+        remote: remote(&target),
+        overwrite: false,
+    };
+    let transfer = match core.execute(upload).await.unwrap() {
+        Response::Transfer { transfer } => transfer,
+        other => panic!("{other:?}"),
+    };
+    // Cancel once some bytes have moved.
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::TransferChanged {
+                state: TransferState::Running { done, .. },
+                ..
+            } = events.recv().await.unwrap()
+                && done > 0
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    core.execute(Command::CancelTransfer { transfer })
+        .await
+        .unwrap();
+    let state = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::TransferChanged {
+                transfer: t, state, ..
+            } = events.recv().await.unwrap()
+                && t == transfer
+                && !matches!(state, TransferState::Running { .. })
+            {
+                return state;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(state, TransferState::Cancelled);
+    assert!(!target.exists(), "{} was left behind", target.display());
 }

@@ -1,7 +1,7 @@
-//! SSH sessions: terminals and tunnels. Each one runs as its own task: it
+//! SSH sessions: terminals, tunnels and file panels. Each one runs as its own task: it
 //! reads the host's settings from the OpenSSH config, connects with russh,
-//! checks the host key, signs in, then runs a shell or forwards ports,
-//! reporting progress as events.
+//! checks the host key, signs in, then runs a shell, forwards ports or
+//! speaks SFTP, reporting progress as events.
 //!
 //! Terminal output does not go through the event broadcast. A burst of
 //! output (`cat` of a big file) would push every subscriber past its event
@@ -12,18 +12,21 @@
 
 mod config;
 mod connection;
+pub(crate) mod files;
 mod known_hosts;
 mod session;
 mod socks;
 mod tunnel;
 
 pub(crate) use connection::Connections;
+pub(crate) use files::Transfers;
 pub(crate) use tunnel::Autostart;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use russh_sftp::client::SftpSession;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::api::{
@@ -61,6 +64,8 @@ struct Entry {
     prompts: Pending,
     /// Until a client takes it with [`Core::take_output`].
     output: Option<mpsc::Receiver<Vec<u8>>>,
+    /// A file session's SFTP client, once it has connected.
+    sftp: Option<Arc<SftpSession>>,
 }
 
 /// Prompts waiting for an answer, by prompt id.
@@ -121,6 +126,31 @@ impl Sessions {
             .map(|s| s.session)
     }
 
+    /// The SFTP client of a connected file session.
+    pub fn sftp(&self, id: SessionId) -> Result<Arc<SftpSession>> {
+        let map = self.map.lock().unwrap();
+        let entry = map
+            .get(&id)
+            .filter(|e| e.input.is_some())
+            .ok_or(Error::SessionNotFound(id))?;
+        if entry.kind != SessionKind::Files {
+            return Err(Error::invalid(
+                "session",
+                format!("{id} is not a file session"),
+            ));
+        }
+        entry
+            .sftp
+            .clone()
+            .ok_or_else(|| Error::invalid("session", format!("{id} has not connected yet")))
+    }
+
+    fn set_sftp(&self, id: SessionId, sftp: Arc<SftpSession>) {
+        if let Some(entry) = self.map.lock().unwrap().get_mut(&id) {
+            entry.sftp = Some(sftp);
+        }
+    }
+
     /// Records a session's new state as it is announced.
     pub fn record(&self, id: SessionId, state: &SessionState) {
         if let Some(entry) = self.map.lock().unwrap().get_mut(&id) {
@@ -164,6 +194,7 @@ impl Sessions {
         match map.get_mut(&id) {
             Some(entry) if entry.output.is_some() => {
                 entry.input = None;
+                entry.sftp = None;
                 entry.prompts.lock().unwrap().clear();
             }
             _ => {
@@ -201,6 +232,18 @@ pub(crate) fn open_tunnel(core: &Core, node: Node) -> SessionId {
     )
 }
 
+/// Opens an SFTP session for an SSH host node's file panel. It runs until a
+/// client closes it or the connection fails.
+pub(crate) fn open_files(core: &Core, node: Node) -> SessionId {
+    spawn(
+        core,
+        node,
+        SessionKind::Files,
+        None,
+        |core, node, input, prompter| async move { files::run(&core, &node, input, &prompter).await },
+    )
+}
+
 /// Registers a session and runs `body` as its task. Whatever `body`
 /// returns becomes the session's [`SessionState::Closed`].
 fn spawn<F, Fut>(
@@ -228,6 +271,7 @@ where
             input: Some(input_tx),
             prompts: prompts.clone(),
             output,
+            sftp: None,
         },
     );
     let prompter = Prompter {
@@ -241,6 +285,7 @@ where
         let node_id = node.id;
         let result = body(core.clone(), node, input_rx, prompter).await;
         core.sessions().finish(id);
+        core.transfers().cancel_session(id);
         core.emit(Event::SessionChanged {
             session: id,
             node: node_id,

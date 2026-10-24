@@ -129,8 +129,9 @@ impl Drop for SecretValue {
     }
 }
 
-/// Identifies a session opened with [`Command::OpenTerminal`] or
-/// [`Command::StartTunnel`]. Unique for as long as the core runs.
+/// Identifies a session opened with [`Command::OpenTerminal`],
+/// [`Command::StartTunnel`] or [`Command::OpenFiles`]. Unique for as long as
+/// the core runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(pub u64);
@@ -161,6 +162,59 @@ pub enum SessionState {
 pub enum SessionKind {
     Terminal,
     Tunnel,
+    /// An SFTP session, for a file panel.
+    Files,
+}
+
+/// Identifies a download or upload. Unique for as long as the core runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TransferId(pub u64);
+
+impl fmt::Display for TransferId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TransferState {
+    /// `done` of `total` bytes so far.
+    Running {
+        done: u64,
+        total: u64,
+    },
+    Finished,
+    Failed {
+        error: String,
+    },
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileKind {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+/// One entry of a remote folder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// As the server sent it. It can hold any character but `/`, including
+    /// control characters, so clients must not print it raw.
+    pub name: String,
+    pub kind: FileKind,
+    pub size: u64,
+    /// Seconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<u64>,
+    /// Unix mode bits, such as `0o644`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<u32>,
 }
 
 /// A running session, as [`Command::ListSessions`] reports it.
@@ -466,6 +520,59 @@ pub enum Command {
     StartTunnel {
         node: NodeId,
     },
+    /// Opens an SFTP session on an SSH host node, for a file panel. Returns
+    /// [`Response::Session`] straight away; progress arrives as
+    /// [`Event::SessionChanged`], as for a terminal.
+    OpenFiles {
+        node: NodeId,
+    },
+    /// Lists a remote folder. An empty `path` is the home folder. Returns
+    /// [`Response::Dir`].
+    ListDir {
+        session: SessionId,
+        #[serde(default)]
+        path: String,
+    },
+    MakeDir {
+        session: SessionId,
+        path: String,
+    },
+    /// Renames or moves a remote file or folder. Fails if `to` exists.
+    RenamePath {
+        session: SessionId,
+        from: String,
+        to: String,
+    },
+    /// Deletes a remote file, symlink or folder, with everything in it.
+    /// Symlinks are removed, never followed.
+    RemovePath {
+        session: SessionId,
+        path: String,
+    },
+    /// Copies a remote file or folder to `local`, an absolute path that
+    /// names the copy itself. Fails if `local` exists, unless `overwrite`
+    /// is set: then files are replaced and folders merged. Returns
+    /// [`Response::Transfer`]; progress arrives as
+    /// [`Event::TransferChanged`].
+    Download {
+        session: SessionId,
+        remote: String,
+        local: PathBuf,
+        #[serde(default)]
+        overwrite: bool,
+    },
+    /// Copies a local file or folder to `remote`, the same way round as
+    /// [`Command::Download`].
+    Upload {
+        session: SessionId,
+        local: PathBuf,
+        remote: String,
+        #[serde(default)]
+        overwrite: bool,
+    },
+    CancelTransfer {
+        transfer: TransferId,
+    },
     /// Returns the tunnels that start with Burrow, as [`Response::Autostart`].
     ListAutostart,
     /// Makes a tunnel start with Burrow, or stops it doing so. The choice is
@@ -531,6 +638,14 @@ pub enum Response {
     Autostart {
         nodes: Vec<NodeId>,
     },
+    /// A remote folder: its absolute `path` and its entries, sorted by name.
+    Dir {
+        path: String,
+        entries: Vec<FileEntry>,
+    },
+    Transfer {
+        transfer: TransferId,
+    },
     Addons {
         addons: Vec<AddonInfo>,
     },
@@ -566,6 +681,13 @@ pub enum Event {
         session: SessionId,
         node: NodeId,
         state: SessionState,
+    },
+    /// A download or upload moved on. `running` is sent at most a few
+    /// times a second.
+    TransferChanged {
+        transfer: TransferId,
+        session: SessionId,
+        state: TransferState,
     },
     /// The tunnels that start with Burrow changed.
     AutostartChanged {

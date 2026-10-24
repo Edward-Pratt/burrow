@@ -10,7 +10,7 @@ use crate::api::{
 };
 use crate::error::{Error, Result};
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
-use crate::ssh::{self, Autostart, Connections, Input, Sessions};
+use crate::ssh::{self, Autostart, Connections, Input, Sessions, Transfers, files};
 use crate::tree::{Entry, Tree};
 
 /// How many events a slow subscriber can fall behind before it starts
@@ -65,6 +65,7 @@ struct Inner {
     secrets: Arc<dyn SecretStore>,
     sessions: Sessions,
     connections: Connections,
+    transfers: Transfers,
     autostart: Autostart,
     /// The tunnels starting with Burrow, as last announced.
     autostart_nodes: Mutex<Vec<NodeId>>,
@@ -94,6 +95,7 @@ impl Core {
                 secrets: options.secrets,
                 sessions: Sessions::default(),
                 connections: Connections::default(),
+                transfers: Transfers::default(),
                 autostart: Autostart::load(options.state_dir.join("autostart.toml")),
                 autostart_nodes: Mutex::default(),
                 ssh_config: options.ssh_config,
@@ -164,6 +166,65 @@ impl Core {
                     None => ssh::open_tunnel(self, node),
                 };
                 return Ok(Response::Session { session });
+            }
+            Command::OpenFiles { node } => {
+                let node = self.node(node)?;
+                if node.kind != SSH_HOST_KIND {
+                    return Err(Error::invalid(
+                        "node",
+                        format!("{} is a {}, not an SSH host", node.name, node.kind),
+                    ));
+                }
+                let session = ssh::open_files(self, node);
+                return Ok(Response::Session { session });
+            }
+            Command::ListDir { session, path } => {
+                let sftp = sessions.sftp(session)?;
+                let (path, entries) = files::list_dir(&sftp, &path).await.map_err(Error::Remote)?;
+                return Ok(Response::Dir { path, entries });
+            }
+            Command::MakeDir { session, path } => {
+                let sftp = sessions.sftp(session)?;
+                files::make_dir(&sftp, &path).await.map_err(Error::Remote)?;
+                return Ok(Response::Ok);
+            }
+            Command::RenamePath { session, from, to } => {
+                let sftp = sessions.sftp(session)?;
+                files::rename(&sftp, &from, &to)
+                    .await
+                    .map_err(Error::Remote)?;
+                return Ok(Response::Ok);
+            }
+            Command::RemovePath { session, path } => {
+                let sftp = sessions.sftp(session)?;
+                files::remove(&sftp, &path).await.map_err(Error::Remote)?;
+                return Ok(Response::Ok);
+            }
+            Command::Download {
+                session,
+                remote,
+                local,
+                overwrite,
+            } => {
+                let sftp = sessions.sftp(session)?;
+                let direction = files::Direction::Download { remote, local };
+                let transfer = files::start(self, session, sftp, direction, overwrite);
+                return Ok(Response::Transfer { transfer });
+            }
+            Command::Upload {
+                session,
+                local,
+                remote,
+                overwrite,
+            } => {
+                let sftp = sessions.sftp(session)?;
+                let direction = files::Direction::Upload { local, remote };
+                let transfer = files::start(self, session, sftp, direction, overwrite);
+                return Ok(Response::Transfer { transfer });
+            }
+            Command::CancelTransfer { transfer } => {
+                self.inner.transfers.cancel(transfer)?;
+                return Ok(Response::Ok);
             }
             Command::ListSessions => {
                 return Ok(Response::Sessions {
@@ -295,6 +356,10 @@ impl Core {
 
     pub(crate) fn node(&self, id: NodeId) -> Result<Node> {
         Ok(self.inner.tree().get(id)?.node.clone())
+    }
+
+    pub(crate) fn transfers(&self) -> &Transfers {
+        &self.inner.transfers
     }
 
     pub(crate) fn connections(&self) -> &Connections {
@@ -509,6 +574,14 @@ impl Inner {
             | Command::CloseSession { .. }
             | Command::ListSessions
             | Command::StartTunnel { .. }
+            | Command::OpenFiles { .. }
+            | Command::ListDir { .. }
+            | Command::MakeDir { .. }
+            | Command::RenamePath { .. }
+            | Command::RemovePath { .. }
+            | Command::Download { .. }
+            | Command::Upload { .. }
+            | Command::CancelTransfer { .. }
             | Command::OpenView { .. }
             | Command::InvokeAction { .. } => unreachable!("async command on the blocking path"),
         }
