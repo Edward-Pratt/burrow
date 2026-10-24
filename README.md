@@ -6,7 +6,7 @@ Inspired by [Tusk](https://github.com/repticJS/tusk). Burrow is written from scr
 
 ## Status
 
-Planning. See [docs/DESIGN.md](docs/DESIGN.md).
+Milestone 1 (core) in progress. See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Goals
 

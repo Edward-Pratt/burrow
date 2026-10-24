@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Arch, so the GTK, VTE and GtkSourceView versions match what Burrow
+    # targets.
+    container: archlinux:latest
+    steps:
+      - name: Install system packages
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rustup gtk4 vte4 gtksourceview5 libsecret
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
