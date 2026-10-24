@@ -44,6 +44,14 @@
   background: alpha(currentColor, 0.05);
 }
 
+.addon-view {
+  margin: 24px;
+}
+
+.warning-text {
+  color: #c88800;
+}
+
 .dim {
   opacity: 0.65;
 }

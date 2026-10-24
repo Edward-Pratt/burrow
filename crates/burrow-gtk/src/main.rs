@@ -1,6 +1,7 @@
 //! Burrow's GTK4 front end. It is a thin client: every change goes through
 //! `burrow_core::Core`, and the window redraws from the core's events.
 
+mod addons;
 mod app;
 mod dialogs;
 mod palette;
