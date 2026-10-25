@@ -23,13 +23,13 @@ mod tree;
 mod watch;
 
 pub use api::{
-    API_VERSION, AddonAction, AddonCommand, AddonInfo, AddonKind, AddonState, Block, Button,
-    Capability, Command, DbColumn, DbSchema, DbTable, DbTableKind, Event, ExecResult, FOLDER_KIND,
-    Field, FileEntry, FileKind, FormField, FormInput, FormValue, Grant, GrantShown, HistoryEntry,
-    MonitorHistory, Node, NodeId, NodePatch, POSTGRES_KIND, Problem, Prompt, PromptAnswer,
-    PromptKind, QueryError, QueryResult, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue,
-    SessionId, SessionInfo, SessionKind, SessionState, StatementResult, TransferId, TransferState,
-    TrendRange, TunnelShown, View, monitor,
+    API_VERSION, AddonAction, AddonCommand, AddonInfo, AddonKind, AddonState, Alert, AlertId,
+    AlertKind, Block, Button, Capability, Command, DbColumn, DbSchema, DbTable, DbTableKind, Event,
+    ExecResult, FOLDER_KIND, Field, FileEntry, FileKind, FormField, FormInput, FormValue, Grant,
+    GrantShown, HistoryEntry, MonitorHistory, Node, NodeId, NodePatch, POSTGRES_KIND, Problem,
+    Prompt, PromptAnswer, PromptKind, QueryError, QueryResult, Response, SSH_HOST_KIND,
+    SSH_TUNNEL_KIND, SecretValue, SessionId, SessionInfo, SessionKind, SessionState,
+    StatementResult, TransferId, TransferState, TrendRange, TunnelShown, View, monitor,
 };
 pub use engine::{Core, CoreOptions, Paths};
 pub use error::{Error, Result};

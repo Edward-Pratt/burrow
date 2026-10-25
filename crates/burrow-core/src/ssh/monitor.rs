@@ -17,9 +17,10 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::agent::{self, printable, quote};
+use super::alerts::{self, Rule};
 use super::trend::{self, Rollup};
 use super::{Attached, Input, Prompter};
-use crate::api::{Event, MonitorHistory, Node, SessionState};
+use crate::api::{AlertKind, Event, MonitorHistory, Node, SessionState};
 use crate::engine::Core;
 
 /// Seconds between samples.
@@ -44,10 +45,27 @@ const _: () = assert!(HISTORY * MAX_SAMPLE + MAX_LINE < crate::ipc::MAX_LINE / 2
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const QUIET_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a background monitor waits before it reconnects: the first
-/// time, and at most, as the wait doubles while it keeps failing.
-const RETRY_FIRST: Duration = Duration::from_secs(30);
-const RETRY_MAX: Duration = Duration::from_secs(300);
+/// How long a background monitor waits.
+#[derive(Clone, Copy)]
+pub(crate) struct Waits {
+    /// Before it reconnects the first time, and at most, as the wait
+    /// doubles while it keeps failing.
+    pub retry: Duration,
+    pub retry_max: Duration,
+    /// How long it may go without answering, once it had connected,
+    /// before its host is reported unreachable.
+    pub unreachable: Duration,
+}
+
+impl Default for Waits {
+    fn default() -> Waits {
+        Waits {
+            retry: Duration::from_secs(30),
+            retry_max: Duration::from_secs(300),
+            unreachable: Duration::from_secs(60),
+        }
+    }
+}
 
 /// Limits on what is kept of each sample and unit list.
 const MAX_TEXT: usize = 256;
@@ -80,6 +98,12 @@ impl Monitor {
             minute: Some(Mutex::new(Rollup::new(trend::MINUTE))),
             ..Monitor::default()
         }
+    }
+
+    /// Whether this is a background monitor, which keeps history on disk
+    /// and raises alerts.
+    fn background(&self) -> bool {
+        self.minute.is_some()
     }
 
     pub fn history(&self) -> MonitorHistory {
@@ -157,6 +181,9 @@ pub(super) async fn run(
                                     node: node.id,
                                     state: SessionState::Connected,
                                 });
+                                if monitor.background() {
+                                    core.set_alerts(node.id, Rule::Reachable, Vec::new());
+                                }
                             }
                             (Message::Hello { .. }, true) | (_, false) => {
                                 return Err("burrow-agent sent something unexpected".into());
@@ -172,10 +199,18 @@ pub(super) async fn run(
                                 let point = monitor.minute.as_ref().and_then(|minute| {
                                     minute.lock().unwrap().push(trend::now(), &sample)
                                 });
-                                if let Some(point) = point
-                                    && let Err(e) = core.trends().append(node.id, &point)
-                                {
-                                    tracing::warn!("could not keep {}'s history: {e}", node.name);
+                                if let Some(point) = point {
+                                    if let Err(e) = core.trends().append(node.id, &point) {
+                                        tracing::warn!(
+                                            "could not keep {}'s history: {e}",
+                                            node.name
+                                        );
+                                    }
+                                    let alerts = core.alerts();
+                                    let disks = alerts.full_disks(node.id, &point);
+                                    let memory = alerts.low_memory(node.id, &point);
+                                    core.set_alerts(node.id, Rule::Disks, disks);
+                                    core.set_alerts(node.id, Rule::Memory, memory);
                                 }
                                 core.emit(Event::MonitorSample {
                                     session: prompter.session,
@@ -189,6 +224,10 @@ pub(super) async fn run(
                                 if history.units.as_ref() != Some(&units) {
                                     history.units = Some(units.clone());
                                     drop(history);
+                                    if monitor.background() {
+                                        let failed = alerts::failed_units(&units);
+                                        core.set_alerts(node.id, Rule::Units, failed);
+                                    }
                                     core.emit(Event::MonitorUnits {
                                         session: prompter.session,
                                         node: node.id,
@@ -239,14 +278,22 @@ pub(super) async fn run_background(
     prompter: &Prompter,
 ) -> Result<(), String> {
     let monitor = Arc::new(Monitor::recording());
-    let mut wait = RETRY_FIRST;
+    let waits = core.monitor_waits();
+    let mut wait = waits.retry;
+    // When it stopped answering, if it had connected before. A host that
+    // never connected since Burrow started isn't reported, or every login
+    // would report hosts whose network is still coming up.
+    let mut down: Option<Instant> = None;
+    let mut reported = false;
     loop {
         let error = match run(core, node, &mut input, prompter, true, &monitor).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => break,
             Err(error) => error,
         };
         if monitor.connected.swap(false, Ordering::Relaxed) {
-            wait = RETRY_FIRST;
+            wait = waits.retry;
+            down = Some(Instant::now());
+            reported = false;
         }
         core.emit(Event::SessionChanged {
             session: prompter.session,
@@ -255,12 +302,33 @@ pub(super) async fn run_background(
                 step: format!("Reconnecting in {} s: {error}", wait.as_secs()),
             },
         });
-        tokio::select! {
-            () = tokio::time::sleep(wait) => {}
-            () = closed(&mut input) => return Ok(()),
+        let retry = Instant::now() + wait;
+        loop {
+            let report = down
+                .filter(|_| !reported)
+                .map(|down| down + waits.unreachable);
+            tokio::select! {
+                () = tokio::time::sleep_until(report.map_or(retry, |at| at.min(retry))) => {}
+                () = closed(&mut input) => {
+                    core.clear_alerts(node.id);
+                    return Ok(());
+                }
+            }
+            if report.is_some_and(|at| Instant::now() >= at) {
+                let error = AlertKind::Unreachable {
+                    error: error.clone(),
+                };
+                core.set_alerts(node.id, Rule::Reachable, vec![error]);
+                reported = true;
+            }
+            if Instant::now() >= retry {
+                break;
+            }
         }
-        wait = (wait * 2).min(RETRY_MAX);
+        wait = (wait * 2).min(waits.retry_max);
     }
+    core.clear_alerts(node.id);
+    Ok(())
 }
 
 /// Returns once a client closes the session.

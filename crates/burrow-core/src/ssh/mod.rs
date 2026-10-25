@@ -11,6 +11,7 @@
 //! Sessions on the same host share one connection ([`Connections`]).
 
 pub(crate) mod agent;
+pub(crate) mod alerts;
 pub(crate) mod config;
 mod connection;
 pub(crate) mod exec;
@@ -26,6 +27,7 @@ mod tunnel;
 pub(crate) use agent::Agents;
 pub(crate) use connection::{Connection, Connections, alias};
 pub(crate) use files::Transfers;
+pub(crate) use monitor::Waits;
 pub(crate) use tunnel::Autostart;
 
 use std::collections::HashMap;

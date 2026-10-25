@@ -63,6 +63,7 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `monitor_history` | `session` | `monitor { history }` |
 | `monitor_trend` | `node`, `range` (`hour`, `day` or `week`) | `trend { points }` |
 | `list_monitoring` | | `monitoring { nodes }` |
+| `list_alerts` | | `alerts { alerts }` |
 | `set_monitoring` | `node`, `enabled`, `expect?` | `ok` |
 | `open_database` | `node` | `session { session }` |
 | `run_query` | `session`, `sql`, `limit?` | `query { result }` |
@@ -107,6 +108,8 @@ Every subscriber receives events. They are sent for changes made through command
 | `monitor_sample` | `session`, `node`, `sample` | A monitor's server sent new stats, every 2 s. |
 | `monitor_units` | `session`, `node`, `units` | A monitor's server listed its services, and they differ from the last list. |
 | `autostart_changed` | `nodes` | The tunnels that start with Burrow changed. |
+| `alert_raised` | `alert` | Something went wrong on a host monitored in the background. |
+| `alert_cleared` | `alert` | An alert's condition ended, or its host stopped being monitored. |
 | `monitoring_changed` | `nodes` | The SSH hosts monitored in the background changed, including one dropping out because its node changed. |
 | `prompt_requested` | `session`, `prompt { id, kind, title, message, action? }` | A session waits for `answer_prompt`. |
 | `prompt_closed` | `session`, `prompt` (the id) | A prompt stopped waiting: a client answered it, or its session ended. A client still showing it should close it. |
@@ -216,6 +219,16 @@ target_port = 5432           # "local" only
 - **In the background:** `set_monitoring` with `enabled: true` monitors an SSH host from when Burrow starts, whether or not a client is open. Like autostart, the choice is kept on this computer, in `$XDG_STATE_HOME/burrow/monitoring.toml`, so a node file can't turn it on. It is pinned to the host's name and props, and to the node it goes through, the way a grant is: turning it on needs `expect { name, props, via? }`, the host as the user was shown it, and a change to the host afterwards turns it off and stops its monitor (`monitoring_changed`).
 - **One session per host:** a background monitor is a single session for as long as monitoring stays on, with `background: true` in `list_sessions`. `open_monitor` on that host returns it rather than starting another. `close_session` on it fails: only `set_monitoring` with `enabled: false`, or deleting the host, stops it. When the connection or the agent stops, it says `connecting { step: "Reconnecting in 30 s: <why>" }` and tries again, waiting twice as long each time up to 5 minutes, and keeps its samples. It may put the agent on the server like any monitor, so the per-host install consent still decides the first upload; until a client answers that, or any other prompt, it waits. It only runs while `burrowd` does, so to monitor from login, enable `burrowd.service`.
 - **History on disk:** a background monitor averages each minute of samples into one point and appends it to `$XDG_STATE_HOME/burrow/monitor/<node>/<YYYY-MM-DD>.jsonl`, a file per UTC day by this computer's clock, since the server's isn't trusted. Points have the shape of a sample, with `time` at the start of their minute. Files more than a week old are deleted, and so is the folder when the host is deleted. A point keeps at most 32 disks and 32 interfaces and at most 4 KiB, so a host's week stays under about 40 MB. `monitor_trend` reads them back by host, with no monitor running: an `hour` or a `day` as one point a minute, a `week` as one every 5 minutes, at most 2016 points.
+- **Alerts:** a background monitor raises an alert, `{"id": 3, "node": "…", "kind": "disk_full", "mount": "/", "percent": 93.2, "since": 1792948331514}`, when one of these fixed rules starts to hold, and clears it when the rule stops holding. `since` is this computer's clock.
+
+  | `kind` | Fields | Raised when | Cleared when |
+  |---|---|---|---|
+  | `unit_failed` | `unit` | a systemd service is `failed` | it isn't |
+  | `disk_full` | `mount`, `percent` (used) | a minute's average is over 90% used | it is under 85% |
+  | `memory_low` | `percent` (available) | a minute's average is under 10% available | it is over 15% |
+  | `unreachable` | `error` | the monitor has not answered for 60 s, after it had connected since Burrow started | it connects again |
+
+  Each alert is raised once, with `alert_raised`, and keeps its id until `alert_cleared`. `list_alerts` returns those that hold now. They are kept in memory, so after a restart whatever still holds is raised again. Turning monitoring off, or deleting the host, clears its alerts.
 - **The agent:** `burrow-agent` is a static program, built for x86_64 and aarch64 Linux servers, that only reads. It never listens on the network, and it stops when Burrow closes the session. Burrow puts it at `~/.local/share/burrow/burrow-agent-<version>` over SFTP on the host's shared connection, and removes other versions it finds there.
 - **Asked once per host:** before the first upload, the session asks a `confirm` prompt naming the host, the path and the program's SHA-256. The answer is kept in `$XDG_STATE_HOME/burrow/agent.toml`, pinned to the host node like a grant, so a node file can't approve it. Uploads after that, such as a new version, don't ask.
 - **Checked every time:** each `open_monitor` reads the file back and compares its hash with Burrow's copy, and replaces it if they differ. A symlink at the path, or on the way to it, fails the session: Burrow won't run or write through one.
@@ -412,7 +425,7 @@ The daemon sends:
 | `files-read` | `ssh-host` | `open_files`, `list_dir`, `read_file` |
 | `files-write` | `ssh-host` | the above, `write_file`, `make_dir`, `rename_path`, `remove_path` |
 | `tunnel` | `ssh-tunnel` | `start_tunnel`, and `close_session` on that tunnel |
-| `monitor-read` | `ssh-host` | `open_monitor`, `monitor_history` and `monitor_trend`, running only an agent the user already put there |
+| `monitor-read` | `ssh-host` | `open_monitor`, `monitor_history` and `monitor_trend`, running only an agent the user already put there, and the host's alerts in `list_alerts`, which leaves out other hosts' |
 
 - **Always allowed:** `version`, `list_nodes`, `get_node`, `list_sessions` and `list_grants`. Nodes hold no secrets.
 - **Never allowed:** changing nodes, secrets, prompts, autostart, background monitoring, addons, grants, terminals and history, and adding SSH hosts (`check_ssh_include`, `add_ssh_host`). `download`, `upload` and `export_query` are refused because they take a local path. The bridge works with contents instead (`read_file`, `write_file`), so it can't read or overwrite the user's own files.

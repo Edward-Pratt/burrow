@@ -320,6 +320,8 @@ enum Rule {
     ReadOnlyQuery,
     /// A monitor that runs only the agent the user put on the server.
     MonitorWithoutInstall,
+    /// Only the alerts of hosts it may monitor.
+    GrantedAlerts,
 }
 
 impl Conn {
@@ -346,6 +348,22 @@ impl Conn {
                     .map(|session| Response::Session { session }),
                 _ => unreachable!("only monitors install"),
             },
+            Ok(Rule::GrantedAlerts) => {
+                self.core
+                    .execute(command)
+                    .await
+                    .map(|response| match response {
+                        Response::Alerts { alerts } => Response::Alerts {
+                            alerts: alerts
+                                .into_iter()
+                                .filter(|alert| {
+                                    self.core.granted(alert.node, Capability::MonitorRead)
+                                })
+                                .collect(),
+                        },
+                        other => other,
+                    })
+            }
         };
         entry["ok"] = json!(result.is_ok());
         if let Err(e) = &result {
@@ -402,6 +420,7 @@ impl Conn {
             }
             Command::MonitorHistory { session: s } => session(*s, MonitorRead)?,
             Command::MonitorTrend { node: id, .. } => node(*id, MonitorRead)?,
+            Command::ListAlerts => return Ok(Rule::GrantedAlerts),
             Command::CloseSession { session: s } => {
                 if self.own_session(*s).is_err() {
                     let tunnel = self

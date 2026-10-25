@@ -1,20 +1,24 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc};
 
 use crate::addon::{Host, Manifest, Permission};
 use crate::api::{
-    API_VERSION, Capability, Command, Event, Grant, Node, NodeId, POSTGRES_KIND, Problem, Response,
-    SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionKind, View,
+    API_VERSION, AlertKind, Capability, Command, Event, Grant, Node, NodeId, POSTGRES_KIND,
+    Problem, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionKind, View,
 };
 use crate::db;
 use crate::error::{Error, Result};
 use crate::grants::{self, Grants};
 use crate::pins::Pins;
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
+use crate::ssh::alerts::{Alerts, Rule};
 use crate::ssh::trend::{self, Trends};
-use crate::ssh::{self, Agents, Autostart, Connections, Input, Sessions, Transfers, files, hosts};
+use crate::ssh::{
+    self, Agents, Autostart, Connections, Input, Sessions, Transfers, Waits, files, hosts,
+};
 use crate::tree::{Entry, Tree};
 
 /// How many events a slow subscriber can fall behind before it starts
@@ -103,6 +107,10 @@ struct Inner {
     monitoring_nodes: Mutex<Vec<NodeId>>,
     /// Their history on disk.
     trends: Trends,
+    /// What their monitors found wrong.
+    alerts: Alerts,
+    /// How long their monitors wait, which tests shorten.
+    monitor_waits: Mutex<Waits>,
     grants: Grants,
     /// Where each command the MCP bridge sends is recorded.
     audit_log: PathBuf,
@@ -145,6 +153,8 @@ impl Core {
                 monitoring: Pins::load(options.state_dir.join("monitoring.toml")),
                 monitoring_nodes: Mutex::default(),
                 trends: Trends::new(options.state_dir.join("monitor")),
+                alerts: Alerts::default(),
+                monitor_waits: Mutex::default(),
                 grants: Grants::load(options.state_dir.join("mcp.toml")),
                 audit_log: options.state_dir.join("mcp-audit.log"),
                 grants_shown: Mutex::default(),
@@ -530,6 +540,21 @@ impl Core {
         self.inner.agents.set_dirs(local, remote);
     }
 
+    /// For tests: how long background monitors wait before they reconnect,
+    /// and before they report a host unreachable.
+    #[doc(hidden)]
+    pub fn set_monitor_waits(&self, retry: Duration, unreachable: Duration) {
+        *self.inner.monitor_waits.lock().unwrap() = Waits {
+            retry,
+            retry_max: retry,
+            unreachable,
+        };
+    }
+
+    pub(crate) fn monitor_waits(&self) -> Waits {
+        *self.inner.monitor_waits.lock().unwrap()
+    }
+
     /// Looks up a node's secret.
     ///
     /// This is deliberately not a [`Command`]: secrets never cross the API
@@ -654,6 +679,24 @@ impl Core {
 
     pub(crate) fn trends(&self) -> &Trends {
         &self.inner.trends
+    }
+
+    pub(crate) fn alerts(&self) -> &Alerts {
+        &self.inner.alerts
+    }
+
+    /// Sets what `rule` finds on `node` now, announcing what changed.
+    pub(crate) fn set_alerts(&self, node: NodeId, rule: Rule, found: Vec<AlertKind>) {
+        for event in self.inner.alerts.set(node, rule, found, trend::now()) {
+            self.emit(event);
+        }
+    }
+
+    /// Clears `node`'s alerts, as when its monitor stops.
+    pub(crate) fn clear_alerts(&self, node: NodeId) {
+        for event in self.inner.alerts.clear(node) {
+            self.emit(event);
+        }
     }
 
     pub(crate) fn connections(&self) -> &Connections {
@@ -976,6 +1019,9 @@ impl Inner {
                     points: self.trends.points(node.id, range, trend::now()),
                 })
             }
+            Command::ListAlerts => Ok(Response::Alerts {
+                alerts: self.alerts.list(),
+            }),
             Command::ListMonitoring => Ok(Response::Monitoring {
                 nodes: self.monitoring_nodes.lock().unwrap().clone(),
             }),

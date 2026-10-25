@@ -941,7 +941,9 @@ impl App {
             Event::SessionChanged { .. }
             | Event::PromptRequested { .. }
             | Event::GrantsChanged { .. }
-            | Event::MonitoringChanged { .. } => {}
+            | Event::MonitoringChanged { .. }
+            | Event::AlertRaised { .. }
+            | Event::AlertCleared { .. } => {}
             Event::PromptClosed { session, prompt } => {
                 if let Some(dialog) = self.prompts.get_mut().remove(&(session, prompt)) {
                     dialog.dismiss();

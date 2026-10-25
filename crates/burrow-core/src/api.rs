@@ -534,6 +534,39 @@ impl GrantShown {
     }
 }
 
+/// Identifies an alert. Unique for as long as the core runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AlertId(pub u64);
+
+/// Something wrong on an SSH host monitored in the background. It is
+/// raised once, and cleared once the condition ends.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Alert {
+    pub id: AlertId,
+    pub node: NodeId,
+    #[serde(flatten)]
+    pub kind: AlertKind,
+    /// When it was raised, in Unix milliseconds by this computer's clock.
+    pub since: u64,
+}
+
+/// What an [`Alert`] is about. Names come from the server, cleaned.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AlertKind {
+    /// A systemd service failed.
+    UnitFailed { unit: String },
+    /// A disk is over 90% full, by a minute's average. It clears below 85%.
+    DiskFull { mount: String, percent: f64 },
+    /// Under 10% of memory is available, by a minute's average. It clears
+    /// above 15%.
+    MemoryLow { percent: f64 },
+    /// The host or its agent stopped answering for a minute, after the
+    /// monitor had connected.
+    Unreachable { error: String },
+}
+
 /// How far back [`Command::MonitorTrend`] looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -891,6 +924,9 @@ pub enum Command {
     /// Returns the SSH hosts monitored in the background, as
     /// [`Response::Monitoring`].
     ListMonitoring,
+    /// Returns the alerts that hold now, oldest first, as
+    /// [`Response::Alerts`].
+    ListAlerts,
     /// Monitors an SSH host in the background, from when Burrow starts, or
     /// stops doing so. Like autostart, the choice is kept on this computer
     /// and only holds while the host's settings stay as they were, and
@@ -1033,6 +1069,9 @@ pub enum Response {
     Monitoring {
         nodes: Vec<NodeId>,
     },
+    Alerts {
+        alerts: Vec<Alert>,
+    },
     /// Points averaged from a host's samples, oldest first: one a minute,
     /// or one every 5 minutes over a week.
     Trend {
@@ -1144,6 +1183,14 @@ pub enum Event {
     /// The SSH hosts monitored in the background changed.
     MonitoringChanged {
         nodes: Vec<NodeId>,
+    },
+    /// Something went wrong on a host monitored in the background.
+    AlertRaised {
+        alert: Alert,
+    },
+    /// An alert's condition ended, or its host stopped being monitored.
+    AlertCleared {
+        alert: Alert,
     },
     /// The session waits for [`Command::AnswerPrompt`].
     PromptRequested {
