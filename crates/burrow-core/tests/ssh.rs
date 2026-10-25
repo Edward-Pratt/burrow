@@ -1127,16 +1127,23 @@ async fn exec_returns_output_and_status() {
     let core = server.core();
     let node = host(&core, "test").await;
 
+    let mut events = core.subscribe();
     let result = exec(&core, &node, "echo out; echo err >&2; exit 3", None).await;
     assert_eq!(result.stdout, "out\n");
     assert_eq!(result.stderr, "err\n");
     assert_eq!(result.status, Some(3));
     assert!(!result.truncated && !result.timed_out);
-    // It was a session while it ran, and is gone now.
-    assert!(match core.execute(Command::ListSessions).await.unwrap() {
-        Response::Sessions { sessions } => sessions.is_empty(),
-        _ => false,
-    });
+    // It ran as a session, which closes once it has answered.
+    let session = loop {
+        if let Event::SessionChanged { session, .. } = events.recv().await.unwrap() {
+            break session;
+        }
+    };
+    assert_eq!(
+        expect_state(&mut events, session).await,
+        SessionState::Connected
+    );
+    assert_eq!(closed_error(expect_state(&mut events, session).await), None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
