@@ -7,9 +7,10 @@ A Linux-first desktop app for servers and databases, in Rust + GTK4 (gtk4-rs + r
 - `crates/burrow-core`: everything that isn't drawing. It owns config, secrets, SSH, tunnels, SFTP and the addon host. Clients drive it only through `Core::execute(Command)` and `Core::subscribe()` (`src/api.rs` is the contract).
   - `src/ssh/`: `connection.rs` shares one connection per host; `session.rs` holds terminals, `tunnel.rs` tunnels, `files.rs` SFTP.
   - `src/addon/`: manifests, approval, JSON-RPC over stdio.
-- `crates/burrow-gtk`: a thin client. State flows one way: user action → `Command` → core `Event` → redraw. Each tab kind has a module: `terminal.rs`/`remote.rs` (terminals), `tunnels.rs`, `files.rs`, `addons.rs`. `app.rs` routes messages and session events between them.
+- `crates/burrow-gtk`: a thin client of the core in `burrowd`. State flows one way: user action → `Command` → core `Event` → redraw. Each tab kind has a module: `terminal.rs`/`remote.rs` (terminals), `tunnels.rs`, `files.rs`, `addons.rs`. `app.rs` routes messages and session events between them.
 - `crates/burrow-addon-notes`: the example addon, plus the addon integration tests.
-- `crates/burrowd`: the daemon binary. The daemon itself is `burrow-core/src/daemon.rs`, and the socket protocol (server, client, finding and starting the daemon) is `src/ipc/`.
+- `crates/burrowd`: the daemon binary. The daemon itself is `burrow-core/src/daemon.rs`, and the socket protocol (server, client, finding and starting the daemon, and what each role may run) is `src/ipc/`.
+- `crates/burrow-cli`: the `burrow` command, and `burrow mcp serve` in `src/mcp.rs`. What the MCP bridge may do is decided in the daemon (`ipc/server.rs`, `grants.rs`), never in the bridge.
 
 ## Checks
 

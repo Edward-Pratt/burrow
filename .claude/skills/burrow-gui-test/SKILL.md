@@ -41,6 +41,8 @@ $R/rig.sh stop                # always, at the end
 
 ## Known quirks
 
+- The app runs as a client of its own `burrowd`, with its socket in `/run/user/$UID/burrow-rig`. `rig.sh app` restarts it too, so a rebuilt core takes effect, and `rig.sh stop` stops it. To drive the same daemon from the CLI, export the same `BURROW_*` variables the rig sets, including `BURROW_RUNTIME_DIR`.
+
 - Icons not in the Adwaita symbolic set show a broken image. Check the name exists under `/usr/share/icons/Adwaita/symbolic/`.
 - A `GtkSpinButton` only takes typed text on `update()`. Read values after calling it.
 - `GTK_DEBUG`/`GDK_DEBUG=no-portals` is set by `rig.sh`. Without it, `GtkFileDialog` opens through the desktop portal, on the user's screen.
