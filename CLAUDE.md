@@ -47,7 +47,7 @@ cargo test --workspace
 cargo run -p burrow-gtk
 ```
 
-The window is a client of `burrowd`. If no daemon is running, it starts its own binary again with `--burrowd`, so the daemon is always the same build. The daemon stops after a minute with no clients and no sessions. Its log is `burrowd.log` in the state folder.
+The window is a client of `burrowd`. If no daemon is running, it starts its own binary again with `--burrowd`, so the daemon is always the same build. The daemon stops after a minute with no clients and no sessions. Its log is `burrowd.log` in the state folder. `burrow doctor` (`burrow-core/src/doctor.rs`) checks what the machine is missing; the window shows the same checks when it can't start.
 
 For dev runs, point Burrow away from the user's real setup:
 - `BURROW_CONFIG_DIR` sets the config folder.

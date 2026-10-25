@@ -10,8 +10,8 @@
 //!
 //! Sessions on the same host share one connection ([`Connections`]).
 
-mod agent;
-mod config;
+pub(crate) mod agent;
+pub(crate) mod config;
 mod connection;
 pub(crate) mod exec;
 pub(crate) mod files;

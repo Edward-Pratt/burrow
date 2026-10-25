@@ -127,11 +127,11 @@ async fn connect_or_start(socket: &Path, role: Role) -> Result<Client> {
         // A second daemon started at the same time gives up quietly, so
         // an exit is only a failure once the deadline passes.
         let exited = child.try_wait().ok().flatten();
-        if Instant::now() > deadline || exited.is_some_and(|status| !status.success()) {
-            return Err(Error::Remote(format!(
-                "burrowd did not start; see {}",
-                log.display()
-            )));
+        if exited.is_some_and(|status| !status.success()) {
+            return Err(did_not_start(&log, true));
+        }
+        if Instant::now() > deadline {
+            return Err(did_not_start(&log, false));
         }
     }
 }
@@ -179,6 +179,34 @@ pub async fn stop(dir: &Path) -> Result<bool> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err(Error::Remote("burrowd did not stop".to_string()))
+}
+
+/// Why the daemon the client started isn't answering. One that `stopped`
+/// printed its error last, so the log's last line says why; one still
+/// running has only logged progress, which would mislead.
+fn did_not_start(log: &Path, stopped: bool) -> Error {
+    let line = if stopped { last_line(log) } else { None };
+    Error::Remote(match line {
+        Some(line) => format!("burrowd did not start: {line} (see {})", log.display()),
+        None if stopped => format!("burrowd did not start; see {}", log.display()),
+        None => format!(
+            "burrowd did not answer within {} seconds; see {}",
+            START_TIMEOUT.as_secs(),
+            log.display()
+        ),
+    })
+}
+
+/// The last line of the log, without the program name the daemon prefixes
+/// to its error.
+fn last_line(log: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(log).ok()?;
+    let line = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    Some(line.strip_prefix("burrowd: ").unwrap_or(line).to_string())
 }
 
 fn not_running(error: &Error) -> bool {
@@ -254,6 +282,20 @@ mod tests {
             ("BURROW_CONFIG_DIR", "/tmp/a"),
         ]);
         assert_eq!(chosen, Path::new("/x"));
+    }
+
+    #[test]
+    fn a_stopped_daemon_is_quoted_and_a_stalled_one_is_not() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let log = temp.path().join("burrowd.log");
+        std::fs::write(&log, "INFO serving\nburrowd: secret store: gone\n\n").unwrap();
+        let stopped = did_not_start(&log, true).to_string();
+        assert!(stopped.starts_with("burrowd did not start: secret store: gone (see "));
+        let stalled = did_not_start(&log, false).to_string();
+        assert!(stalled.starts_with("burrowd did not answer within 10 seconds; see "));
+        std::fs::write(&log, "").unwrap();
+        let silent = did_not_start(&log, true).to_string();
+        assert!(silent.starts_with("burrowd did not start; see "));
     }
 
     #[test]

@@ -365,30 +365,14 @@ impl Component for App {
                 sessions,
                 autostart,
             } => {
-                self.nodes = nodes.into_iter().map(|n| (n.id, n)).collect();
-                self.problems = problems;
-                self.autostart = autostart.into_iter().collect();
-                self.set_addons(addons, widgets, &sender);
-                // Events may have been missed, so a tunnel that isn't
-                // running any more has stopped.
-                for status in self.tunnels.values_mut() {
-                    if let Some(session) = status.running()
-                        && !sessions.iter().any(|s| s.session == session)
-                    {
-                        status.session = Some((session, SessionState::Closed { error: None }));
-                    }
-                }
-                self.take_sessions(sessions, window, &sender);
-                let gone: Vec<TabKey> = self
-                    .tabs
-                    .keys()
-                    .filter(|key| key.node().is_some_and(|id| !self.nodes.contains_key(&id)))
-                    .copied()
-                    .collect();
-                for key in gone {
-                    self.close_tab(key, widgets);
-                }
-                self.sidebar_dirty = true;
+                let loaded = Loaded {
+                    nodes,
+                    problems,
+                    addons,
+                    sessions,
+                    autostart,
+                };
+                self.loaded(loaded, widgets, window, &sender);
             }
             AppMsg::CoreEvent(
                 event @ (Event::SessionChanged { .. } | Event::PromptRequested { .. }),
@@ -402,39 +386,7 @@ impl Component for App {
             AppMsg::Disconnected => {
                 self.error = Some("Lost the connection to burrowd. Reconnecting…".to_string());
             }
-            AppMsg::Reconnected(client) => {
-                self.core = client;
-                self.error = stale_daemon(&self.core);
-                // Their sessions are gone, and no answer could reach them.
-                for (_, dialog) in self.prompts.get_mut().drain() {
-                    dialog.dismiss();
-                }
-                // Sessions ended with the daemon that ran them. Tunnels are
-                // settled by the reload; the rest are only known here.
-                let ended: Vec<(NodeId, SessionId)> = (self.remotes.iter())
-                    .map(|(node, r)| (*node, &r.state))
-                    .chain(self.files.iter().map(|(node, p)| (*node, &p.state)))
-                    .chain(self.monitors.iter().map(|(node, p)| (*node, &p.state)))
-                    .chain(self.databases.iter().map(|(node, p)| (*node, &p.state)))
-                    .filter_map(|(node, state)| match state {
-                        remote::State::Running(session) => Some((node, *session)),
-                        _ => None,
-                    })
-                    .collect();
-                for (node, session) in ended {
-                    let state = SessionState::Closed {
-                        error: Some("Burrow's core stopped".to_string()),
-                    };
-                    let event = Event::SessionChanged {
-                        session,
-                        node,
-                        state,
-                    };
-                    self.session_event(event, window, &sender);
-                }
-                listen(&self.core, &sender);
-                load(&self.core, &sender);
-            }
+            AppMsg::Reconnected(client) => self.reconnected(client, window, &sender),
             AppMsg::Failed(error) => self.error = Some(error),
 
             AppMsg::RowActivated(index) => {
@@ -783,34 +735,7 @@ impl Component for App {
             }
         }
 
-        if self.sidebar_dirty {
-            self.sidebar_dirty = false;
-            let selection = selected(widgets);
-            // Rebuilding destroys the focused row; remember whether the
-            // sidebar had focus so keyboard use (arrows, Delete) carries on.
-            let had_focus = widgets.list.focus_child().is_some();
-            let running: HashSet<NodeId> = self
-                .tunnels
-                .iter()
-                .filter(|(_, status)| status.is_up())
-                .map(|(id, _)| *id)
-                .collect();
-            let look = sidebar::Look {
-                expanded: &self.expanded,
-                icons: &self.icons(),
-                running: &running,
-            };
-            widgets.row_ids = sidebar::rebuild(&widgets.list, &self.nodes, &look);
-            let row = selection
-                .and_then(|id| widgets.row_ids.iter().position(|&r| r == id))
-                .and_then(|index| widgets.list.row_at_index(index as i32));
-            if let Some(row) = row {
-                widgets.list.select_row(Some(&row));
-                if had_focus {
-                    row.grab_focus();
-                }
-            }
-        }
+        self.rebuild_sidebar(widgets);
         widgets
             .content
             .set_visible_child_name(if self.tabs.is_empty() {
@@ -822,7 +747,134 @@ impl Component for App {
     }
 }
 
+/// What the core sent on load, together, since the window takes it in
+/// one go.
+struct Loaded {
+    nodes: Vec<Node>,
+    problems: Vec<Problem>,
+    addons: Vec<AddonInfo>,
+    sessions: Vec<SessionInfo>,
+    autostart: Vec<NodeId>,
+}
+
 impl App {
+    /// Takes the core's state, on connecting and after every change that
+    /// needs a full reload.
+    fn loaded(
+        &mut self,
+        loaded: Loaded,
+        widgets: &mut Widgets,
+        window: &gtk::ApplicationWindow,
+        sender: &ComponentSender<Self>,
+    ) {
+        let Loaded {
+            nodes,
+            problems,
+            addons,
+            sessions,
+            autostart,
+        } = loaded;
+        self.nodes = nodes.into_iter().map(|n| (n.id, n)).collect();
+        self.problems = problems;
+        self.autostart = autostart.into_iter().collect();
+        self.set_addons(addons, widgets, sender);
+        // Events may have been missed, so a tunnel that isn't running any
+        // more has stopped.
+        for status in self.tunnels.values_mut() {
+            if let Some(session) = status.running()
+                && !sessions.iter().any(|s| s.session == session)
+            {
+                status.session = Some((session, SessionState::Closed { error: None }));
+            }
+        }
+        self.take_sessions(sessions, window, sender);
+        let gone: Vec<TabKey> = self
+            .tabs
+            .keys()
+            .filter(|key| key.node().is_some_and(|id| !self.nodes.contains_key(&id)))
+            .copied()
+            .collect();
+        for key in gone {
+            self.close_tab(key, widgets);
+        }
+        self.sidebar_dirty = true;
+    }
+
+    /// Switches to a new daemon after the old one went away. What ran in
+    /// the old one is over, and the new one is loaded from scratch.
+    fn reconnected(
+        &mut self,
+        client: Client,
+        window: &gtk::ApplicationWindow,
+        sender: &ComponentSender<Self>,
+    ) {
+        self.core = client;
+        self.error = stale_daemon(&self.core);
+        // Their sessions are gone, and no answer could reach them.
+        for (_, dialog) in self.prompts.get_mut().drain() {
+            dialog.dismiss();
+        }
+        // Sessions ended with the daemon that ran them. Tunnels are settled
+        // by the reload; the rest are only known here.
+        let ended: Vec<(NodeId, SessionId)> = (self.remotes.iter())
+            .map(|(node, r)| (*node, &r.state))
+            .chain(self.files.iter().map(|(node, p)| (*node, &p.state)))
+            .chain(self.monitors.iter().map(|(node, p)| (*node, &p.state)))
+            .chain(self.databases.iter().map(|(node, p)| (*node, &p.state)))
+            .filter_map(|(node, state)| match state {
+                remote::State::Running(session) => Some((node, *session)),
+                _ => None,
+            })
+            .collect();
+        for (node, session) in ended {
+            let state = SessionState::Closed {
+                error: Some("Burrow's core stopped".to_string()),
+            };
+            let event = Event::SessionChanged {
+                session,
+                node,
+                state,
+            };
+            self.session_event(event, window, sender);
+        }
+        listen(&self.core, sender);
+        load(&self.core, sender);
+    }
+
+    /// Redraws the sidebar when something marked it dirty, keeping the
+    /// selection and the focus where they were.
+    fn rebuild_sidebar(&mut self, widgets: &mut Widgets) {
+        if !self.sidebar_dirty {
+            return;
+        }
+        self.sidebar_dirty = false;
+        let selection = selected(widgets);
+        // Rebuilding destroys the focused row; remember whether the sidebar
+        // had focus so keyboard use (arrows, Delete) carries on.
+        let had_focus = widgets.list.focus_child().is_some();
+        let running: HashSet<NodeId> = self
+            .tunnels
+            .iter()
+            .filter(|(_, status)| status.is_up())
+            .map(|(id, _)| *id)
+            .collect();
+        let look = sidebar::Look {
+            expanded: &self.expanded,
+            icons: &self.icons(),
+            running: &running,
+        };
+        widgets.row_ids = sidebar::rebuild(&widgets.list, &self.nodes, &look);
+        let row = selection
+            .and_then(|id| widgets.row_ids.iter().position(|&r| r == id))
+            .and_then(|index| widgets.list.row_at_index(index as i32));
+        if let Some(row) = row {
+            widgets.list.select_row(Some(&row));
+            if had_focus {
+                row.grab_focus();
+            }
+        }
+    }
+
     fn apply_event(&mut self, event: Event, widgets: &Widgets, sender: &ComponentSender<Self>) {
         self.error = None;
         match event {

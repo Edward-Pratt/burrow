@@ -6,7 +6,7 @@ Inspired by [Tusk](https://github.com/repticJS/tusk). Burrow is written from scr
 
 ## Status
 
-Milestones 1–7 (core, GTK shell, local terminal, SSH, addons, tunnels and SFTP, the PostgreSQL client) are done; milestone 8 (`burrowd`, the `burrow` CLI and the MCP bridge) is in review. See [docs/DESIGN.md](docs/DESIGN.md).
+Milestones 1–9 are done: core, GTK shell, local terminal, SSH, addons, tunnels and SFTP, the PostgreSQL client, `burrowd` with the `burrow` CLI and the MCP bridge, and `burrow-agent` with the monitor tab. It is early software, in testing with a few people. See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Goals
 
@@ -22,6 +22,37 @@ Native Rust + GTK4 (gtk4-rs + relm4). No webview. The core (`burrow-core`) runs 
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE). Addons run as separate processes and may use any license.
+
+## Trying it
+
+Burrow needs GTK 4.20 or newer, VTE 4, GtkSourceView 5, OpenSSH and a Secret Service (a keyring daemon such as gnome-keyring, KWallet or KeePassXC). Building it needs Rust 1.93 or newer, best installed with [rustup](https://rustup.rs).
+
+On Arch, the package in `dist/` builds and installs everything: the window, the daemon, the command line, a desktop entry, the systemd units, and the server agent for each musl target you have (`rustup target add x86_64-unknown-linux-musl`, or the `rust-musl` package):
+
+```sh
+git clone https://github.com/Edward-Pratt/burrow
+cd burrow/dist && makepkg -si
+```
+
+Anywhere else, build it from the checkout. If a library is missing, `cargo build` names it.
+
+```sh
+sudo pacman -S --needed gtk4 vte4 gtksourceview5 openssh gnome-keyring   # Arch
+git clone https://github.com/Edward-Pratt/burrow
+cd burrow
+cargo build --release
+./target/release/burrow doctor      # says what is missing, and how to get it
+./target/release/burrow-gtk
+```
+
+`burrow doctor` checks the pieces Burrow needs at run time: the folders it writes to, OpenSSH, the Secret Service, the SSH agent, the agent builds for servers and the daemon itself. The window runs the same checks when it can't start, and shows them. Monitors need the server agent, built once for each kind of server:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build -p burrow-agent --profile agent --target x86_64-unknown-linux-musl
+```
+
+Burrow finds it in the workspace it runs from, in `/usr/lib/burrow/` or in `$BURROW_AGENT_DIR`. When something goes wrong, `burrowd.log` in `~/.local/state/burrow/` has the daemon's side of it.
 
 ## Running it
 

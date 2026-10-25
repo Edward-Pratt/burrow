@@ -479,7 +479,9 @@ async fn a_session_waiting_on_another_takes_over_when_it_closes() {
     );
 }
 
-/// A TCP server on 127.0.0.1 that sends back whatever it gets.
+/// A TCP server on 127.0.0.1 that sends back whatever it gets. It binds
+/// port 0 and keeps the listener, so unlike a port handed to another
+/// process there is no moment when something else could take it.
 async fn echo_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

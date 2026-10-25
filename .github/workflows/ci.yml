@@ -15,7 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     # Arch, so the GTK, VTE and GtkSourceView versions match what Burrow
     # targets. openssh provides `ssh -G` and the sshd the SSH tests run, and
-    # postgresql the server the database tests run.
+    # postgresql the server the database tests run. The keyring is reached
+    # over D-Bus, so no libsecret.
     container: archlinux:latest
     # Lint and test build mostly different artifacts, so they run side by
     # side rather than one after the other. agent builds burrow-agent the
@@ -34,7 +35,7 @@ jobs:
     steps:
       - name: Install system packages
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rustup gtk4 vte4 gtksourceview5 libsecret openssh postgresql
+          pacman -Syu --noconfirm --needed base-devel git rustup gtk4 vte4 gtksourceview5 openssh postgresql
           # initdb refuses to run as root, and the database tests would
           # quietly skip, so the checks run as a normal user.
           useradd --create-home builder
