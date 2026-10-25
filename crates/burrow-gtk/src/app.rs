@@ -200,6 +200,8 @@ pub enum AppMsg {
     ClearNotice(u32),
     /// Empties the status bar's list of errors.
     ClearErrors,
+    /// The window was asked to close.
+    CloseRequested,
     ManageAddons,
     ReviewAddon(String),
     RevokeAddon(String),
@@ -244,6 +246,7 @@ impl AppMsg {
                 | AppMsg::SetAutostart { .. }
                 | AppMsg::Invoke { .. }
                 | AppMsg::ClearErrors
+                | AppMsg::CloseRequested
                 | AppMsg::ManageAddons
                 | AppMsg::ReviewAddon(_)
                 | AppMsg::RevokeAddon(_)
@@ -407,6 +410,15 @@ impl Component for App {
         let widgets = build(&window, &sender);
         widgets.sidebar_pane.set_visible(settings.sidebar_visible);
         add_shortcuts(&window, &sender);
+        // Only `App` knows what is open, so it decides, and destroys the
+        // window itself once it may close.
+        window.connect_close_request({
+            let sender = sender.clone();
+            move |_| {
+                sender.input(AppMsg::CloseRequested);
+                glib::Propagation::Stop
+            }
+        });
 
         let mut model = App {
             core,
@@ -791,6 +803,7 @@ impl Component for App {
                 self.errors = ErrorLog::default();
                 widgets.errors_button.popdown();
             }
+            AppMsg::CloseRequested => self.close_window(window),
             AppMsg::ManageAddons => {
                 let review = {
                     let sender = sender.clone();
@@ -970,6 +983,7 @@ impl App {
         }
         listen(&self.core, sender);
         load(&self.core, sender);
+        sender.input(AppMsg::Notice("Connected to burrowd again".to_string()));
     }
 
     /// Redraws the sidebar when something marked it dirty, keeping the
@@ -2217,6 +2231,32 @@ impl App {
         palette::show(window, items, move |message| sender.input(message));
     }
 
+    /// Closes the window, first asking when that would end terminals: local
+    /// shells end with the window, and burrowd closes this client's SSH
+    /// sessions when it goes.
+    fn close_window(&self, window: &gtk::ApplicationWindow) {
+        let remote = (self.remotes.values())
+            .filter(|r| matches!(r.state, remote::State::Running(_)))
+            .count();
+        let local = (self.tabs.keys())
+            .filter(|key| matches!(key, TabKey::Terminal(_)))
+            .count();
+        let open = remote + local;
+        if open == 0 {
+            window.destroy();
+            return;
+        }
+        let detail = if open == 1 {
+            "A terminal is open. Closing Burrow ends it.".to_string()
+        } else {
+            format!("{open} terminals are open. Closing Burrow ends them.")
+        };
+        let target = window.clone();
+        dialogs::confirm(window, "Close Burrow?", &detail, "Close", move || {
+            target.destroy()
+        });
+    }
+
     fn apply_theme(&self) {
         let Some(settings) = gtk::Settings::default() else {
             return;
@@ -2433,6 +2473,7 @@ fn listen(core: &Client, sender: &ComponentSender<App>) {
         if input.send(AppMsg::Disconnected).is_err() {
             return;
         }
+        let mut last = String::new();
         loop {
             match ipc::connect(Role::Gui).await {
                 Ok(client) => {
@@ -2440,7 +2481,16 @@ fn listen(core: &Client, sender: &ComponentSender<App>) {
                     return;
                 }
                 Err(e) => {
-                    eprintln!("burrow: could not reach burrowd: {e}");
+                    let error = format!("could not reach burrowd: {e}");
+                    eprintln!("burrow: {error}");
+                    // Only a new reason: one every two seconds would push
+                    // everything else out of the errors list.
+                    if error != last {
+                        if input.send(AppMsg::Failed(error.clone())).is_err() {
+                            return; // The window is gone.
+                        }
+                        last = error;
+                    }
                     tokio::time::sleep(RECONNECT_DELAY).await;
                 }
             }
