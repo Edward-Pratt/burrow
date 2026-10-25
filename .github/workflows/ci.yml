@@ -11,11 +11,25 @@ concurrency:
 
 jobs:
   check:
+    name: ${{ matrix.check }}
     runs-on: ubuntu-latest
     # Arch, so the GTK, VTE and GtkSourceView versions match what Burrow
     # targets. openssh provides `ssh -G` and the sshd the SSH tests run, and
     # postgresql the server the database tests run.
     container: archlinux:latest
+    # Lint and test build mostly different artifacts, so they run side by
+    # side rather than one after the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [lint, test]
+    env:
+      # The checks run as builder, but the cache action runs as root and
+      # needs the same toolchain and cargo home.
+      RUSTUP_HOME: /home/builder/.rustup
+      CARGO_HOME: /home/builder/.cargo
+      # Debug info made up most of the cache, and slows linking the tests.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - name: Install system packages
         run: |
@@ -26,25 +40,28 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - uses: actions/cache@v4
-        with:
-          path: |
-            /home/builder/.cargo/registry
-            /home/builder/.cargo/git
-            target
-          key: cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-
-
       - name: Set up Rust
         run: |
           chown -R builder "$GITHUB_WORKSPACE" /home/builder
           su builder -c 'rustup default stable && rustup component add rustfmt clippy'
 
+      # After the toolchain, since its version is part of the key.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.check }}
+          cache-on-failure: true
+
+      - name: Give the cache to builder
+        run: chown -R builder "$GITHUB_WORKSPACE" /home/builder
+
       - name: Format
+        if: matrix.check == 'lint'
         run: su builder -c 'cargo fmt --all --check'
 
       - name: Lint
+        if: matrix.check == 'lint'
         run: su builder -c 'cargo clippy --workspace --all-targets -- -D warnings'
 
       - name: Test
+        if: matrix.check == 'test'
         run: su builder -c 'cargo test --workspace'
