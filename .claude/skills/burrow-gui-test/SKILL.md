@@ -27,8 +27,10 @@ $R/rig.sh stop                # always, at the end
 - **Sidebar and file rows:** have no AT-SPI action. Double-click them with `x.py dbl:X,Y`, or `ui.py select LABEL` then use the toolbar. A single click only selects a file-list row.
 - **Keys:** `x.py Return`, `x.py ctrl+l`. Input goes to the window under the pointer, so click into the target first (`x.py click:X,Y Return`).
 - **Context menu:** `x.py right:X,Y`, then `ui.py click "Browse files"`.
+- **Dragging:** `x.py drag:X1,Y1,X2,Y2` presses, moves in steps and releases. Dropping a sidebar row on a folder row moves it there; below the rows moves it to the top level.
+- **Dialog buttons named like the dialog:** the dialog's frame matches first, so use `ui.py click Rename 1` or `ui.py click Move 1`.
 - **File chooser:** `x.py ctrl+l`, `ui.py set 1 /abs/path/`, then click the accept button ("Upload", "Download here").
-- **Layout:** the main window sits at (0,0), 1100×720. Sidebar rows are at y=78, 124, 170 and so on, x≈100. The file panel's path bar is at y≈129, and its first row at y≈208 with 23 px per row. Take a screenshot when unsure, because layouts shift: a warning line moves the buttons below it down.
+- **Layout:** the main window sits at (0,0), 1100×720. Sidebar rows are at y=78, 124, 170 and so on (46 px apart), x≈100; folder arrows at x≈27 plus 14 px per level. Over AT-SPI each row is a `button` named after the node. The file panel's path bar is at y≈129, and its first row at y≈208 with 23 px per row. Take a screenshot when unsure, because layouts shift: a warning line moves the buttons below it down.
 
 ## Rules
 
