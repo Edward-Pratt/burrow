@@ -9,6 +9,7 @@ mod addon;
 mod api;
 mod engine;
 mod error;
+mod password;
 mod secrets;
 mod ssh;
 mod tree;
