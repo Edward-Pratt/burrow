@@ -42,6 +42,18 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `resize_terminal` | `session`, `cols`, `rows` | `ok` |
 | `answer_prompt` | `session`, `prompt`, `answer` | `ok` |
 | `close_session` | `session` | `ok` |
+| `list_sessions` | | `sessions { sessions }` |
+| `start_tunnel` | `node` | `session { session }` |
+| `list_autostart` | | `autostart { nodes }` |
+| `set_autostart` | `node`, `enabled` | `ok` |
+| `open_files` | `node` | `session { session }` |
+| `list_dir` | `session`, `path?` (empty = home) | `dir { path, entries }` |
+| `make_dir` | `session`, `path` | `ok` |
+| `rename_path` | `session`, `from`, `to` | `ok` |
+| `remove_path` | `session`, `path` | `ok` |
+| `download` | `session`, `remote`, `local`, `overwrite?` | `transfer { transfer }` |
+| `upload` | `session`, `local`, `remote`, `overwrite?` | `transfer { transfer }` |
+| `cancel_transfer` | `transfer` | `ok` |
 | `list_addons` | | `addons { addons }`, sorted by id |
 | `approve_addon` | `id`, `fingerprint` | `ok` |
 | `revoke_addon` | `id` | `ok` |
@@ -70,7 +82,9 @@ Every subscriber receives events. They are sent for changes made through command
 | `node_updated` | `node` | A node changed, including a move to another folder. |
 | `node_deleted` | `id` | A node was removed. Children are announced before their parents. |
 | `problems_changed` | `problems` | The set of config files that fail to load changed. |
-| `session_changed` | `session`, `node`, `state` | A session moved on: `connecting { step }`, `connected`, or `closed { error }` (`error` is null when the shell ended normally). |
+| `session_changed` | `session`, `node`, `state` | A session moved on: `connecting { step }`, `connected`, or `closed { error }` (`error` is null when the shell ended normally). `node` is the SSH host of a terminal or file session, and the tunnel node of a tunnel. |
+| `transfer_changed` | `transfer`, `session`, `state` | A download or upload moved on: `running { done, total }` (at most a few times a second), `finished`, `failed { error }` or `cancelled`. |
+| `autostart_changed` | `nodes` | The tunnels that start with Burrow changed. |
 | `prompt_requested` | `session`, `prompt { id, kind, title, message }` | A session waits for `answer_prompt`. |
 | `addons_changed` | `addons` | An addon was added, removed, changed, approved, revoked, started or stopped. |
 | `view_changed` | `node`, `view` | The addon that owns `node` redrew its view. |
@@ -80,6 +94,8 @@ A subscriber that falls more than 256 events behind gets a "lagged" error and sh
 ## SSH sessions
 
 `open_terminal` on an `ssh-host` node replies at once with a session id. The session then connects in the background and reports each step as `session_changed`.
+
+Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel` or `files`) and `state`.
 
 - **Host settings** come from `ssh -G <alias>`, so `Include`, `Match`, `Host` patterns and defaults apply exactly as for `ssh <alias>`. `props.alias` is the alias (the node's name when missing). An alias that is empty, starts with `-`, or has spaces or control characters is refused, because node files can come from a shared folder.
 - **Host keys** are checked against the `UserKnownHostsFile` and `GlobalKnownHostsFile` files, following `StrictHostKeyChecking`. A changed or `@revoked` key is always refused. A new key is asked about (`ask`) or added (`accept-new`/`no`), except when the host has known keys of another type, which is always asked about. New keys go into the first user file, hashed if `HashKnownHosts` is on.
@@ -102,6 +118,35 @@ A prompt left unanswered when the session closes counts as cancelled.
 ### Output stream
 
 Terminal output is not sent as events: a burst of output would push every subscriber past its event buffer. In-process clients take each session's output with `Core::take_output(session)`, once. It is a bounded stream, so a slow reader slows the SSH channel down instead of losing output. Dropping the stream ends the session. Out-of-process clients will receive the same bytes as notifications (milestone 8).
+
+## SSH tunnels
+
+An `ssh-tunnel` node forwards a port on this computer through an SSH host:
+
+```toml
+[props]
+via = "6f1c…"                # id of the ssh-host node to go through
+type = "local"               # "local" (ssh -L) or "dynamic" (ssh -D, a SOCKS5 proxy)
+bind = "127.0.0.1"           # optional; must be a loopback address
+port = 5433
+target_host = "db.internal"  # "local" only, as the SSH host sees it
+target_port = 5432           # "local" only
+```
+
+- **`start_tunnel`** runs it as a session, so it reports progress and asks its questions like a terminal does. If the tunnel is already running it returns that session. `close_session` stops it.
+- **Checked before binding:** node files can come from a shared folder, so the props are checked before anything listens. A tunnel only listens on a loopback address. The port is bound before signing in, so a port in use fails at once.
+- **Edits apply on restart:** a running tunnel keeps the settings it started with.
+- **Starting with Burrow** is a choice made on this computer with `set_autostart`. It is kept in `$XDG_STATE_HOME/burrow/autostart.toml`, not in the tunnel's file, so a shared folder can't turn it on. The choice is pinned to the tunnel's settings and its host's alias, and a change to either (by hand or by a `git pull`) withdraws it. The process that hosts the core calls `Core::autostart()` once.
+
+## Files (SFTP)
+
+`open_files` on an `ssh-host` node starts an SFTP session for a file panel. Once it reports `connected`, its path commands work. Remote paths are absolute or relative to the home folder.
+
+- **`list_dir`** returns the folder's absolute `path` and its entries, sorted by name. Each entry has a `name`, `kind` (`file`, `dir`, `symlink` or `other`), `size`, and optional `modified` (Unix seconds) and `permissions` (mode bits). Names are sent as the server sent them and can hold control characters, so clients must clean them before showing them. Entries named `.`, `..` or with a `/` are left out.
+- **`rename_path`** fails if `to` exists. **`remove_path`** deletes a folder with everything in it, and removes symlinks rather than following them.
+- **`download` and `upload`** copy a file or a whole folder in the background and reply with a transfer id at once. `local` is an absolute path naming the copy itself. If the target exists they fail, unless `overwrite` is set: then files are replaced and folders merged.
+- **Transfers don't trust names.** A name inside a folder that holds `/`, or is `.` or `..`, fails the transfer rather than writing outside the folder that was picked. Symlinks inside a folder are skipped on both sides, and Burrow won't write through a symlink at the target.
+- **No half-written files:** each file is written to a hidden file next to the target and moved into place when complete. A failed or cancelled transfer removes its partial file. Closing the session cancels its transfers.
 
 ## Addons
 
