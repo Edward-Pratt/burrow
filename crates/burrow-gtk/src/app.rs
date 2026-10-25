@@ -135,6 +135,8 @@ pub enum AppMsg {
     },
     /// Asks which folder to move a node to.
     MoveTo(NodeId),
+    /// Asks which colour to mark a node with.
+    Colour(NodeId),
     RenameSelected,
     DeleteSelected,
     /// Moves the keyboard focus to the sidebar, showing it if it's hidden.
@@ -272,6 +274,7 @@ impl AppMsg {
                 | AppMsg::Rename(_)
                 | AppMsg::MoveNode { .. }
                 | AppMsg::MoveTo(_)
+                | AppMsg::Colour(_)
                 | AppMsg::Delete(_)
                 | AppMsg::RenameSelected
                 | AppMsg::DeleteSelected
@@ -565,6 +568,7 @@ impl Component for App {
                 execute(&self.core, &sender, Command::MoveNode { id, parent });
             }
             AppMsg::MoveTo(id) => self.move_to(id, window, &sender),
+            AppMsg::Colour(id) => self.colour(id, window, &sender),
             AppMsg::RenameSelected => {
                 if let Some(id) = selected(widgets) {
                     self.rename(id, window, &sender);
@@ -2096,6 +2100,22 @@ impl App {
         });
     }
 
+    fn colour(&self, id: NodeId, window: &gtk::ApplicationWindow, sender: &ComponentSender<Self>) {
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        let (core, sender, current) = (self.core.clone(), sender.clone(), node.color.clone());
+        sidebar::colour_dialog(window, node, move |color| {
+            if color != current {
+                let patch = NodePatch {
+                    color: Some(color),
+                    ..Default::default()
+                };
+                execute(&core, &sender, Command::UpdateNode { id, patch });
+            }
+        });
+    }
+
     fn context_menu(
         &self,
         id: Option<NodeId>,
@@ -2150,6 +2170,7 @@ impl App {
         if let Some(node) = node {
             entries.push(("Rename…".into(), AppMsg::Rename(node.id)));
             entries.push(("Move to…".into(), AppMsg::MoveTo(node.id)));
+            entries.push(("Colour…".into(), AppMsg::Colour(node.id)));
             entries.push(("Delete…".into(), AppMsg::Delete(node.id)));
         }
         let popover = menu_popover(entries, sender);
