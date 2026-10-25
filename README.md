@@ -6,12 +6,12 @@ Inspired by [Tusk](https://github.com/repticJS/tusk). Burrow is written from scr
 
 ## Status
 
-Milestones 1–5 (core, GTK shell, local terminal, SSH, addons) are done; milestone 6 (SSH tunnels and the SFTP file panel) is in review. See [docs/DESIGN.md](docs/DESIGN.md).
+Milestones 1–6 (core, GTK shell, local terminal, SSH, addons, tunnels and SFTP) are done; milestone 7 (the PostgreSQL client) is in review. See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Goals
 
 - **Linux first.** Built for Arch and Wayland (Hyprland) first, with other distros next. Windows is not a target.
-- **Small core, everything else an addon.** The core provides tabs, sidebar, command palette, secrets and the addon API. Features such as the SSH terminal, the Postgres client and SFTP are addons, including the built-in ones.
+- **Small core, everything else an addon.** The core provides tabs, sidebar, command palette, secrets and the addon API. Features that need secrets, such as SSH, SFTP and the Postgres client, are built into the core. The rest are addons.
 - **Secrets stay in the core.** Addons work with connection handles. They never see passwords or private keys.
 - **Addons describe their UI as data.** They run as separate processes, and the core draws their UI with native widgets.
 
