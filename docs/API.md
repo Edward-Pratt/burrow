@@ -485,6 +485,7 @@ password = "keyring:burrow/6f1c…/password"
 - **Parent:** a node's parent is the directory it sits in, so moving a file in a file manager moves the node.
 - **Hand-written files:** a file without an `id` gets one written back on load, and so does a copied file whose `id` is already taken. A directory without `_folder.toml` gets one.
 - **Broken files:** a file that fails to parse is reported in `list_problems` and never overwritten. The rest of the tree still loads.
+- **Names with control characters:** a name reaches every client, so a file whose `name` has control characters is reported the same way, and so is one without a `name` whose file name has them. A folder whose `_folder.toml` has such a name loads under its directory's name, as when that file doesn't parse. A directory whose own name has them is left out with everything in it. Names are otherwise loaded as written, so one that `create_node` would trim or refuse as empty still loads.
 - **Writes:** Burrow writes every file atomically (a temporary file, then a rename).
 - **Live reload:** the file watcher reloads the tree about 250 ms after edits stop and sends events for whatever changed.
 
