@@ -128,6 +128,13 @@ pub enum AppMsg {
     Open(NodeId),
     Rename(NodeId),
     Delete(NodeId),
+    /// Moves a node into a folder, or to the top level.
+    MoveNode {
+        id: NodeId,
+        parent: Option<NodeId>,
+    },
+    /// Asks which folder to move a node to.
+    MoveTo(NodeId),
     RenameSelected,
     DeleteSelected,
     /// Moves the keyboard focus to the sidebar, showing it if it's hidden.
@@ -263,6 +270,8 @@ impl AppMsg {
                 | AppMsg::New { .. }
                 | AppMsg::Open(_)
                 | AppMsg::Rename(_)
+                | AppMsg::MoveNode { .. }
+                | AppMsg::MoveTo(_)
                 | AppMsg::Delete(_)
                 | AppMsg::RenameSelected
                 | AppMsg::DeleteSelected
@@ -552,6 +561,10 @@ impl Component for App {
             AppMsg::Open(id) => self.open_tab(id, widgets, &sender),
             AppMsg::Rename(id) => self.rename(id, window, &sender),
             AppMsg::Delete(id) => self.delete(id, window, &sender),
+            AppMsg::MoveNode { id, parent } => {
+                execute(&self.core, &sender, Command::MoveNode { id, parent });
+            }
+            AppMsg::MoveTo(id) => self.move_to(id, window, &sender),
             AppMsg::RenameSelected => {
                 if let Some(id) = selected(widgets) {
                     self.rename(id, window, &sender);
@@ -2070,6 +2083,19 @@ impl App {
         );
     }
 
+    /// "Move to…", for keyboard users and long lists, where dragging is
+    /// awkward.
+    fn move_to(&self, id: NodeId, window: &gtk::ApplicationWindow, sender: &ComponentSender<Self>) {
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        let choices = sidebar::move_choices(&self.nodes, id);
+        let (core, sender) = (self.core.clone(), sender.clone());
+        sidebar::move_dialog(window, node, choices, move |parent| {
+            execute(&core, &sender, Command::MoveNode { id, parent });
+        });
+    }
+
     fn context_menu(
         &self,
         id: Option<NodeId>,
@@ -2123,6 +2149,7 @@ impl App {
         }
         if let Some(node) = node {
             entries.push(("Rename…".into(), AppMsg::Rename(node.id)));
+            entries.push(("Move to…".into(), AppMsg::MoveTo(node.id)));
             entries.push(("Delete…".into(), AppMsg::Delete(node.id)));
         }
         let popover = menu_popover(entries, sender);

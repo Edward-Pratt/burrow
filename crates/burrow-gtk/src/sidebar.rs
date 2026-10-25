@@ -6,7 +6,7 @@
 //! place and rows redraw from them, so the selection, the focus and the
 //! scroll position survive them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -18,6 +18,7 @@ use relm4::gtk::{gdk, gio, glib, graphene};
 use relm4::{ComponentSender, gtk};
 
 use crate::app::{App, AppMsg};
+use crate::dialogs;
 
 /// The children of `parent`: folders first, then by name.
 pub fn children(nodes: &HashMap<NodeId, Node>, parent: Option<NodeId>) -> Vec<&Node> {
@@ -58,6 +59,118 @@ fn ancestors(id: NodeId, parent: impl Fn(NodeId) -> Option<NodeId>) -> Vec<NodeI
         current = parent(folder);
     }
     found
+}
+
+/// Whether node `id` can move into `to` (`None` is the top level): not
+/// where it already is, and for a folder, not into itself or a folder
+/// inside it.
+fn can_move(id: NodeId, to: Option<NodeId>, parent: impl Fn(NodeId) -> Option<NodeId>) -> bool {
+    if parent(id) == to {
+        return false;
+    }
+    match to {
+        None => true,
+        Some(folder) => folder != id && !ancestors(folder, parent).contains(&id),
+    }
+}
+
+/// Where "Move to…" offers to put node `id`: "Top level" first, then every
+/// folder by its path, leaving out the node itself and folders inside it.
+pub fn move_choices(nodes: &HashMap<NodeId, Node>, id: NodeId) -> Vec<(Option<NodeId>, String)> {
+    let parent = |n: NodeId| nodes.get(&n).and_then(|n| n.parent);
+    let mut folders: Vec<(Option<NodeId>, String)> = nodes
+        .values()
+        .filter(|n| n.is_folder() && n.id != id && !ancestors(n.id, parent).contains(&id))
+        .map(|n| {
+            let location = location(nodes, n);
+            let path = if location.is_empty() {
+                n.name.clone()
+            } else {
+                format!("{location} / {}", n.name)
+            };
+            (Some(n.id), path)
+        })
+        .collect();
+    folders.sort_by_cached_key(|(id, path)| (path.to_lowercase(), *id));
+    folders.insert(0, (None, "Top level".to_string()));
+    folders
+}
+
+/// Asks which folder to move `node` to, from `choices` as
+/// [`move_choices`] makes them, and calls `done` with a new one.
+pub fn move_dialog(
+    parent: &impl IsA<gtk::Window>,
+    node: &Node,
+    choices: Vec<(Option<NodeId>, String)>,
+    done: impl Fn(Option<NodeId>) + 'static,
+) {
+    let window = gtk::Window::builder()
+        .title("Move")
+        .modal(true)
+        .transient_for(parent)
+        .resizable(false)
+        .default_width(380)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+
+    let label = gtk::Label::new(Some(&format!("Move “{}” to", node.name)));
+    label.set_xalign(0.0);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    let labels: Vec<&str> = choices.iter().map(|(_, path)| path.as_str()).collect();
+    let folders = gtk::DropDown::from_strings(&labels);
+    let current = choices.iter().position(|(id, _)| *id == node.parent);
+    folders.set_selected(current.unwrap_or(0) as u32);
+    content.append(&label);
+    content.append(&folders);
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    buttons.set_margin_top(6);
+    let cancel = gtk::Button::with_label("Cancel");
+    let ok = gtk::Button::with_label("Move");
+    ok.add_css_class("suggested-action");
+    buttons.append(&cancel);
+    buttons.append(&ok);
+    content.append(&buttons);
+    window.set_child(Some(&content));
+
+    // Moving to where it is already would do nothing, so the button says so.
+    let from = node.parent;
+    let chosen = move |folders: &gtk::DropDown| {
+        let index = folders.selected() as usize;
+        choices.get(index).map(|(id, _)| *id)
+    };
+    let chosen = Rc::new(chosen);
+    ok.set_sensitive(false);
+    folders.connect_selected_notify(glib::clone!(
+        #[weak]
+        ok,
+        #[strong]
+        chosen,
+        move |folders| ok.set_sensitive(chosen(folders).is_some_and(|to| to != from))
+    ));
+    // The window is held weakly by everything inside it, or it would keep
+    // itself alive after closing.
+    ok.connect_clicked(glib::clone!(
+        #[weak]
+        window,
+        #[weak]
+        folders,
+        move |_| {
+            if let Some(to) = chosen(&folders).filter(|to| *to != from) {
+                window.close();
+                done(to);
+            }
+        }
+    ));
+    dialogs::close_on_cancel(&window, &cancel);
+    dialogs::close_on_escape(&window);
+    window.present();
+    folders.grab_focus();
 }
 
 /// `icons` maps addon kinds to the icons their addons chose.
@@ -223,6 +336,9 @@ struct State {
     expanded: RefCell<HashSet<NodeId>>,
     /// Nodes marked as running, such as connected tunnels.
     running: RefCell<HashSet<NodeId>>,
+    /// The node being dragged, so a drop spot can be refused while the
+    /// pointer is still moving.
+    dragged: Cell<Option<NodeId>>,
 }
 
 impl State {
@@ -353,6 +469,7 @@ impl Sidebar {
             state,
         };
         sidebar.add_keys(sender);
+        sidebar.add_drop(sender);
         sidebar
     }
 
@@ -385,6 +502,81 @@ impl Sidebar {
             }
         ));
         self.view.add_controller(keys);
+    }
+
+    /// Lets rows be dropped on a folder row to move into it, on a leaf to
+    /// move beside it, and below the rows to move to the top level.
+    fn add_drop(&self, sender: &ComponentSender<App>) {
+        let drop = gtk::DropTarget::new(NodeObject::static_type(), gdk::DragAction::MOVE);
+        // The row or list lit up as the drop spot.
+        let lit: Rc<RefCell<Option<gtk::Widget>>> = Rc::default();
+        let hover = Rc::new(glib::clone!(
+            #[weak(rename_to = view)]
+            self.view,
+            #[strong(rename_to = state)]
+            self.state,
+            #[strong]
+            lit,
+            #[upgrade_or]
+            gdk::DragAction::empty(),
+            move |x: f64, y: f64| {
+                let (row, folder) = drop_spot(&view, x, y);
+                let allowed = (state.dragged.get())
+                    .is_some_and(|id| can_move(id, folder, |id| state.parent_of(id)));
+                let spot = match row {
+                    _ if !allowed => None,
+                    Some(row) => row_widget(&view, &row),
+                    None => Some(view.clone().upcast()),
+                };
+                light(&lit, spot);
+                if allowed {
+                    gdk::DragAction::MOVE
+                } else {
+                    gdk::DragAction::empty()
+                }
+            }
+        ));
+        drop.connect_enter({
+            let hover = hover.clone();
+            move |_, x, y| hover(x, y)
+        });
+        drop.connect_motion(move |_, x, y| hover(x, y));
+        drop.connect_leave({
+            let lit = lit.clone();
+            move |_| light(&lit, None)
+        });
+        let sender = sender.clone();
+        drop.connect_drop(glib::clone!(
+            #[weak(rename_to = view)]
+            self.view,
+            #[strong(rename_to = state)]
+            self.state,
+            #[strong(rename_to = tree)]
+            self.tree,
+            #[strong(rename_to = selection)]
+            self.selection,
+            #[upgrade_or]
+            false,
+            move |_, value, x, y| {
+                light(&lit, None);
+                let Ok(object) = value.get::<NodeObject>() else {
+                    return false;
+                };
+                let id = object.node_id();
+                let (_, folder) = drop_spot(&view, x, y);
+                if !can_move(id, folder, |id| state.parent_of(id)) {
+                    return false;
+                }
+                // Selected, so the selection follows it to its new folder
+                // and shows where it went.
+                if let Some(row) = row_for(&state, &tree, id) {
+                    selection.set_selected(row.position());
+                }
+                sender.input(AppMsg::MoveNode { id, parent: folder });
+                true
+            }
+        ));
+        self.view.add_controller(drop);
     }
 
     /// Moves the keyboard focus to the selected row, or to the first one.
@@ -604,19 +796,7 @@ impl Sidebar {
 
     /// The row showing `id`, if its folders are open.
     fn row_for(&self, id: NodeId) -> Option<gtk::TreeListRow> {
-        let mut path = ancestors(id, |id| self.state.parent_of(id));
-        path.reverse();
-        path.push(id);
-        let mut row: Option<gtk::TreeListRow> = None;
-        for step in path {
-            let object = self.state.object(step)?;
-            let index = self.state.store(object.parent_id()).find(&object)?;
-            row = Some(match &row {
-                None => self.tree.child_row(index)?,
-                Some(parent) => parent.child_row(index)?,
-            });
-        }
-        row
+        row_for(&self.state, &self.tree, id)
     }
 
     fn has_focus(&self) -> bool {
@@ -701,6 +881,56 @@ fn menu_for_selection(
     AppMsg::ContextMenu { node, x, y }
 }
 
+/// The row showing `id` in `tree`, if its folders are open.
+fn row_for(state: &State, tree: &gtk::TreeListModel, id: NodeId) -> Option<gtk::TreeListRow> {
+    let mut path = ancestors(id, |id| state.parent_of(id));
+    path.reverse();
+    path.push(id);
+    let mut row: Option<gtk::TreeListRow> = None;
+    for step in path {
+        let object = state.object(step)?;
+        let index = state.store(object.parent_id()).find(&object)?;
+        row = Some(match &row {
+            None => tree.child_row(index)?,
+            Some(parent) => parent.child_row(index)?,
+        });
+    }
+    row
+}
+
+/// Where a drop at a point in the list puts a node, and the row to light
+/// up for it: a folder row takes it in, a leaf's folder takes it beside
+/// the leaf, and the space below the rows is the top level. The top level
+/// lights up the whole list, as does a leaf there.
+fn drop_spot(view: &gtk::ListView, x: f64, y: f64) -> (Option<gtk::TreeListRow>, Option<NodeId>) {
+    let Some(row) = row_at(view, x, y) else {
+        return (None, None);
+    };
+    let Some(object) = row.item().and_downcast::<NodeObject>() else {
+        return (None, None);
+    };
+    if object.folder() {
+        (Some(row), Some(object.node_id()))
+    } else {
+        (row.parent(), object.parent_id())
+    }
+}
+
+/// Moves the drop spot's highlight to `spot`.
+fn light(lit: &RefCell<Option<gtk::Widget>>, spot: Option<gtk::Widget>) {
+    let mut lit = lit.borrow_mut();
+    if *lit == spot {
+        return;
+    }
+    if let Some(old) = lit.take() {
+        old.remove_css_class("drop-target");
+    }
+    if let Some(new) = &spot {
+        new.add_css_class("drop-target");
+    }
+    *lit = spot;
+}
+
 /// The widget drawing `row`, if it is on screen.
 fn row_widget(view: &gtk::ListView, row: &gtk::TreeListRow) -> Option<gtk::Widget> {
     let mut child = view.first_child();
@@ -753,6 +983,7 @@ fn factory(state: &Rc<State>) -> gtk::SignalListItemFactory {
             return;
         };
         let row = Row::new();
+        row.add_drag(&state);
         item.set_child(Some(&row.expander));
         // The row's handlers live in this closure, which the list item
         // calls whenever it is given another row to show.
@@ -800,6 +1031,51 @@ impl Row {
             dot,
             running,
         }
+    }
+
+    /// Lets the row be dragged onto a folder.
+    fn add_drag(&self, state: &Rc<State>) {
+        let drag = gtk::DragSource::new();
+        drag.set_actions(gdk::DragAction::MOVE);
+        // Weak: the drag source belongs to the expander.
+        drag.connect_prepare(glib::clone!(
+            #[weak(rename_to = expander)]
+            self.expander,
+            #[strong]
+            state,
+            #[upgrade_or_default]
+            move |_, _, _| {
+                let object = expander.list_row()?.item().and_downcast::<NodeObject>()?;
+                state.dragged.set(Some(object.node_id()));
+                // The object itself rather than its id as text, so a drop
+                // on a terminal or a text field doesn't type the id.
+                Some(gdk::ContentProvider::for_value(&object.to_value()))
+            }
+        ));
+        drag.connect_drag_begin(glib::clone!(
+            #[weak(rename_to = expander)]
+            self.expander,
+            move |_, drag| {
+                let row = expander.list_row().and_then(|r| r.item());
+                let Some(object) = row.and_downcast::<NodeObject>() else {
+                    return;
+                };
+                let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                content.add_css_class("sidebar-drag");
+                content.append(&gtk::Image::from_icon_name(&object.icon()));
+                content.append(&gtk::Label::new(Some(&object.name())));
+                let icon = gtk::DragIcon::for_drag(drag).downcast::<gtk::DragIcon>();
+                if let Ok(icon) = icon {
+                    icon.set_child(Some(&content));
+                }
+            }
+        ));
+        drag.connect_drag_end(glib::clone!(
+            #[strong]
+            state,
+            move |_, _, _| state.dragged.set(None)
+        ));
+        self.expander.add_controller(drag);
     }
 
     fn bind(&self, state: &Rc<State>, row: gtk::TreeListRow, object: NodeObject) -> Bound {
@@ -952,6 +1228,48 @@ mod tests {
         let (a, b) = (NodeId::new(), NodeId::new());
         let looped = |id| Some(if id == a { b } else { a });
         assert_eq!(ancestors(a, looped), [b]);
+    }
+
+    #[test]
+    fn moves_into_itself_or_nowhere_are_refused() {
+        let work = node("Work", "folder", None);
+        let servers = node("Servers", "folder", Some(work.id));
+        let host = node("web", "ssh-host", Some(servers.id));
+        let other = node("Other", "folder", None);
+        let nodes = map([work.clone(), servers.clone(), host.clone(), other.clone()]);
+        let parent = |id| nodes.get(&id).and_then(|n: &Node| n.parent);
+
+        assert!(can_move(host.id, None, parent));
+        assert!(can_move(host.id, Some(work.id), parent));
+        assert!(can_move(work.id, Some(other.id), parent));
+        // Where it is already.
+        assert!(!can_move(host.id, Some(servers.id), parent));
+        assert!(!can_move(work.id, None, parent));
+        // Into itself or a folder inside it.
+        assert!(!can_move(work.id, Some(work.id), parent));
+        assert!(!can_move(work.id, Some(servers.id), parent));
+    }
+
+    #[test]
+    fn move_choices_leave_out_the_node_and_its_folders() {
+        let work = node("Work", "folder", None);
+        let servers = node("Servers", "folder", Some(work.id));
+        let host = node("web", "ssh-host", Some(servers.id));
+        let archive = node("archive", "folder", None);
+        let nodes = map([work.clone(), servers.clone(), host.clone(), archive.clone()]);
+
+        let labels = |id| -> Vec<String> {
+            move_choices(&nodes, id)
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect()
+        };
+        assert_eq!(
+            labels(host.id),
+            ["Top level", "archive", "Work", "Work / Servers"]
+        );
+        assert_eq!(labels(work.id), ["Top level", "archive"]);
+        assert_eq!(move_choices(&nodes, host.id)[0].0, None);
     }
 
     #[test]
