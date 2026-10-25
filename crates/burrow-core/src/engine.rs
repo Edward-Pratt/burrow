@@ -5,11 +5,12 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::addon::{Host, Manifest, Permission};
 use crate::api::{
-    API_VERSION, Command, Event, Node, NodeId, POSTGRES_KIND, Problem, Response, SSH_HOST_KIND,
-    SSH_TUNNEL_KIND, SecretValue, SessionId, SessionKind, View,
+    API_VERSION, Capability, Command, Event, Grant, Node, NodeId, POSTGRES_KIND, Problem, Response,
+    SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionKind, View,
 };
 use crate::db;
 use crate::error::{Error, Result};
+use crate::grants::Grants;
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
 use crate::ssh::{self, Autostart, Connections, Input, Sessions, Transfers, files};
 use crate::tree::{Entry, Tree};
@@ -89,6 +90,11 @@ struct Inner {
     autostart: Autostart,
     /// The tunnels starting with Burrow, as last announced.
     autostart_nodes: Mutex<Vec<NodeId>>,
+    grants: Grants,
+    /// Where each command the MCP bridge sends is recorded.
+    audit_log: PathBuf,
+    /// The grants, as last announced.
+    grants_shown: Mutex<Vec<Grant>>,
     history: db::History,
     ssh_config: Option<PathBuf>,
 }
@@ -119,11 +125,15 @@ impl Core {
                 transfers: Transfers::default(),
                 autostart: Autostart::load(options.state_dir.join("autostart.toml")),
                 autostart_nodes: Mutex::default(),
+                grants: Grants::load(options.state_dir.join("mcp.toml")),
+                audit_log: options.state_dir.join("mcp-audit.log"),
+                grants_shown: Mutex::default(),
                 history: db::History::new(options.state_dir.join("history")),
                 ssh_config: options.ssh_config,
             }),
         };
         *core.inner.autostart_nodes.lock().unwrap() = core.inner.autostart_enabled();
+        *core.inner.grants_shown.lock().unwrap() = core.inner.grants.list(&core.inner.lookup());
         Ok(core)
     }
 
@@ -223,6 +233,30 @@ impl Core {
                 let (path, entries) = files::list_dir(&sftp, &path).await.map_err(Error::Remote)?;
                 return Ok(Response::Dir { path, entries });
             }
+            Command::ReadFile {
+                session,
+                path,
+                limit,
+            } => {
+                let sftp = sessions.sftp(session)?;
+                let limit = limit.unwrap_or(1 << 20);
+                let (data, size) = files::read_file(&sftp, &path, limit)
+                    .await
+                    .map_err(Error::Remote)?;
+                return Ok(Response::File { data, size });
+            }
+            Command::WriteFile {
+                session,
+                path,
+                data,
+                overwrite,
+            } => {
+                let sftp = sessions.sftp(session)?;
+                files::write_file(&sftp, &path, &data, overwrite)
+                    .await
+                    .map_err(Error::Remote)?;
+                return Ok(Response::Ok);
+            }
             Command::MakeDir { session, path } => {
                 let sftp = sessions.sftp(session)?;
                 files::make_dir(&sftp, &path).await.map_err(Error::Remote)?;
@@ -281,19 +315,7 @@ impl Core {
                 session,
                 sql,
                 limit,
-            } => {
-                let (handle, node) = sessions.database(session)?;
-                let limit = limit.unwrap_or(db::DEFAULT_LIMIT).clamp(1, db::MAX_LIMIT);
-                let result = handle.query(&sql, limit as usize).await;
-                let inner = self.inner.clone();
-                let ok = result.error.is_none();
-                let recorded =
-                    tokio::task::spawn_blocking(move || inner.history.record(node, &sql, ok)).await;
-                if let Ok(Err(e)) = recorded {
-                    tracing::warn!("could not keep the query in the history: {e}");
-                }
-                return Ok(Response::Query { result });
-            }
+            } => return self.run_query(session, sql, limit, false).await,
             Command::CancelQuery { session } => {
                 let (handle, _) = sessions.database(session)?;
                 handle.cancel().await.map_err(Error::Remote)?;
@@ -433,6 +455,60 @@ impl Core {
         Ok(())
     }
 
+    /// Runs SQL on a database session and keeps it in the node's history.
+    /// With `read_only`, the SQL can't write whatever the session allows;
+    /// see [`db::Handle::query_read_only`].
+    pub(crate) async fn run_query(
+        &self,
+        session: SessionId,
+        sql: String,
+        limit: Option<u32>,
+        read_only: bool,
+    ) -> Result<Response> {
+        let (handle, node) = self.inner.sessions.database(session)?;
+        let limit = limit.unwrap_or(db::DEFAULT_LIMIT).clamp(1, db::MAX_LIMIT) as usize;
+        let result = if read_only {
+            handle.query_read_only(&sql, limit).await
+        } else {
+            handle.query(&sql, limit).await
+        };
+        let inner = self.inner.clone();
+        let ok = result.error.is_none();
+        let recorded =
+            tokio::task::spawn_blocking(move || inner.history.record(node, &sql, ok)).await;
+        if let Ok(Err(e)) = recorded {
+            tracing::warn!("could not keep the query in the history: {e}");
+        }
+        Ok(Response::Query { result })
+    }
+
+    /// Appends one line to the MCP bridge's audit log. A failure is only
+    /// logged: the command already ran or was refused.
+    pub(crate) fn audit(&self, entry: &serde_json::Value) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = &self.inner.audit_log;
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let written = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{entry}"));
+        if let Err(e) = written {
+            tracing::warn!("could not write {}: {e}", path.display());
+        }
+    }
+
+    /// Whether the MCP bridge may do `capability` on `node`.
+    pub(crate) fn granted(&self, node: NodeId, capability: Capability) -> bool {
+        self.inner
+            .grants
+            .allows(&self.inner.lookup(), node, capability)
+    }
+
     pub(crate) fn downgrade(&self) -> WeakCore {
         WeakCore(Arc::downgrade(&self.inner))
     }
@@ -518,6 +594,18 @@ impl Inner {
         }
     }
 
+    /// Announces a change in what the MCP bridge may do, such as an edit
+    /// that made a grant stale. Called with the tree unlocked.
+    fn check_grants(&self) {
+        let grants = self.grants.list(&self.lookup());
+        let mut current = self.grants_shown.lock().unwrap();
+        if *current != grants {
+            current.clone_from(&grants);
+            drop(current);
+            self.emit(Event::GrantsChanged { grants });
+        }
+    }
+
     fn execute(&self, command: Command) -> Result<Response> {
         let changes_tree = matches!(
             command,
@@ -526,10 +614,12 @@ impl Inner {
                 | Command::MoveNode { .. }
                 | Command::DeleteNode { .. }
                 | Command::SetAutostart { .. }
+                | Command::SetGrant { .. }
         );
         let response = self.execute_inner(command);
         if changes_tree {
             self.check_autostart();
+            self.check_grants();
         }
         response
     }
@@ -687,6 +777,31 @@ impl Inner {
                 self.autostart.set(&lookup, node, enabled)?;
                 Ok(Response::Ok)
             }
+            Command::ListGrants => Ok(Response::Grants {
+                grants: self.grants_shown.lock().unwrap().clone(),
+            }),
+            Command::SetGrant {
+                node,
+                capabilities,
+                expect,
+            } => {
+                // Read under one lock, as for autostart, so the grant
+                // covers a node and a `via` that existed together.
+                let snapshot: Vec<Node> = {
+                    let tree = self.tree();
+                    let node = tree.get(node)?.node.clone();
+                    let via = node.props.get("via").and_then(|v| v.as_str());
+                    let via = via
+                        .and_then(|via| via.parse().ok())
+                        .and_then(|id| tree.get(NodeId(id)).ok())
+                        .map(|e| e.node.clone());
+                    std::iter::once(node).chain(via).collect()
+                };
+                let lookup = |id| snapshot.iter().find(|n| n.id == id).cloned();
+                self.grants
+                    .set(&lookup, &snapshot[0], capabilities, expect.as_ref())?;
+                Ok(Response::Ok)
+            }
             Command::ListProblems => Ok(Response::Problems {
                 problems: self.problems.lock().unwrap().clone(),
             }),
@@ -716,6 +831,8 @@ impl Inner {
             | Command::OpenFiles { .. }
             | Command::Exec { .. }
             | Command::ListDir { .. }
+            | Command::ReadFile { .. }
+            | Command::WriteFile { .. }
             | Command::MakeDir { .. }
             | Command::RenamePath { .. }
             | Command::RemovePath { .. }
@@ -827,6 +944,7 @@ impl Inner {
             self.emit(event);
         }
         self.check_autostart();
+        self.check_grants();
         if self.addons.rescan() {
             self.emit(Event::AddonsChanged {
                 addons: self.addons.infos(),

@@ -442,6 +442,79 @@ pub struct TunnelShown {
     pub host_props: toml::Table,
 }
 
+/// Something the MCP bridge may do on a node. A write grant covers
+/// reading too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Capability {
+    /// Read-only SQL on a `postgres` node.
+    SqlRead,
+    /// SQL that writes.
+    SqlWrite,
+    /// [`Command::Exec`] on an `ssh-host` node.
+    Exec,
+    /// Listing and reading files on an `ssh-host` node.
+    FilesRead,
+    /// Creating, changing and removing them.
+    FilesWrite,
+    /// Starting and stopping an `ssh-tunnel` node.
+    Tunnel,
+}
+
+impl Capability {
+    pub const ALL: [Capability; 6] = [
+        Capability::SqlRead,
+        Capability::SqlWrite,
+        Capability::Exec,
+        Capability::FilesRead,
+        Capability::FilesWrite,
+        Capability::Tunnel,
+    ];
+}
+
+impl fmt::Display for Capability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Capability::SqlRead => "sql-read",
+            Capability::SqlWrite => "sql-write",
+            Capability::Exec => "exec",
+            Capability::FilesRead => "files-read",
+            Capability::FilesWrite => "files-write",
+            Capability::Tunnel => "tunnel",
+        })
+    }
+}
+
+/// What the MCP bridge may do on one node, as [`Command::ListGrants`]
+/// reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grant {
+    pub node: NodeId,
+    pub capabilities: BTreeSet<Capability>,
+    /// The node, or the one it goes through, changed since it was granted.
+    /// The grant does nothing until it is granted again.
+    pub stale: bool,
+}
+
+/// A node as a client showed it when asking to grant it, for
+/// [`Command::SetGrant`]: its name and props, and those of the node it goes
+/// through (`props.via`), if any.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GrantShown {
+    pub name: String,
+    pub props: toml::Table,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<Box<GrantShown>>,
+}
+
+impl GrantShown {
+    /// What to show of `node`, looking the node it goes through up in
+    /// `nodes`.
+    pub fn of(node: &Node, nodes: &[Node]) -> GrantShown {
+        crate::grants::shown(&|id| nodes.iter().find(|n| n.id == id).cloned(), node)
+    }
+}
+
 /// What a query sent with [`Command::RunQuery`] returned. A query can hold
 /// What a command run with [`Command::Exec`] did. Output is decoded as
 /// UTF-8, with invalid bytes replaced, and each stream is cut at 1 MiB.
@@ -680,6 +753,26 @@ pub enum Command {
     /// is set: then files are replaced and folders merged. Returns
     /// [`Response::Transfer`]; progress arrives as
     /// [`Event::TransferChanged`].
+    /// Reads up to `limit` bytes (1 MiB when missing, at most 16 MiB) from
+    /// the start of a remote file. Returns [`Response::File`]. For clients
+    /// that work with contents rather than local files.
+    ReadFile {
+        session: SessionId,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
+    },
+    /// Writes `data` (base64 in JSON, at most 16 MiB) to a remote file,
+    /// replacing one already there only with `overwrite`. Like an upload, it
+    /// goes through a temporary file and never writes through a symlink.
+    WriteFile {
+        session: SessionId,
+        path: String,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        #[serde(default)]
+        overwrite: bool,
+    },
     Download {
         session: SessionId,
         remote: String,
@@ -722,6 +815,18 @@ pub enum Command {
         enabled: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expect: Option<TunnelShown>,
+    },
+    /// Returns what the MCP bridge may do, as [`Response::Grants`].
+    ListGrants,
+    /// Lets the MCP bridge do `capabilities` on `node`, replacing what it
+    /// could; none takes everything away. Like autostart, this is kept on
+    /// this computer, and granting needs `expect`, what the user was shown.
+    /// The MCP bridge itself may not run this.
+    SetGrant {
+        node: NodeId,
+        capabilities: BTreeSet<Capability>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<GrantShown>,
     },
     /// Connects to a database node. Returns [`Response::Session`] straight
     /// away; progress arrives as [`Event::SessionChanged`], as for a
@@ -839,6 +944,15 @@ pub enum Response {
     Exec {
         result: ExecResult,
     },
+    /// The start of a file, and its whole size.
+    File {
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        size: u64,
+    },
+    Grants {
+        grants: Vec<Grant>,
+    },
     Schema {
         schemas: Vec<DbSchema>,
     },
@@ -907,6 +1021,10 @@ pub enum Event {
         session: SessionId,
         prompt: u32,
     },
+    /// What the MCP bridge may do changed.
+    GrantsChanged {
+        grants: Vec<Grant>,
+    },
     /// An addon was added, removed, approved, revoked, started or stopped.
     AddonsChanged {
         addons: Vec<AddonInfo>,
@@ -916,4 +1034,21 @@ pub enum Event {
         node: NodeId,
         view: View,
     },
+}
+
+/// Bytes as a base64 string in JSON, rather than an array of numbers.
+mod base64_bytes {
+    use data_encoding::BASE64;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&BASE64.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        BASE64
+            .decode(text.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
 }

@@ -234,3 +234,59 @@ pub fn trust(server: &Server) {
     )
     .unwrap();
 }
+
+/// Serves `core` on a socket in `dir`, for as long as the test runs.
+pub fn serve(core: Core, dir: &Path) -> PathBuf {
+    let path = dir.join("burrowd.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    tokio::spawn(burrow_core::ipc::serve(core, listener, None));
+    path
+}
+
+/// Grants `capabilities` on `node` from `client`, as the user would after
+/// seeing it.
+pub async fn grant(
+    client: &burrow_core::ipc::Client,
+    node: &Node,
+    capabilities: &[burrow_core::Capability],
+) {
+    let nodes = match client.execute(Command::ListNodes).await.unwrap() {
+        Response::Nodes { nodes } => nodes,
+        other => panic!("expected nodes, got {other:?}"),
+    };
+    let command = Command::SetGrant {
+        node: node.id,
+        capabilities: capabilities.iter().copied().collect(),
+        expect: Some(burrow_core::GrantShown::of(node, &nodes)),
+    };
+    client.execute(command).await.unwrap();
+}
+
+/// Opens a session from `client` and waits, by listing sessions as the MCP
+/// bridge does, until it is connected.
+pub async fn open_and_wait(client: &burrow_core::ipc::Client, command: Command) -> SessionId {
+    let session = match client.execute(command).await.unwrap() {
+        Response::Session { session } => session,
+        other => panic!("expected a session, got {other:?}"),
+    };
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Response::Sessions { sessions } =
+                client.execute(Command::ListSessions).await.unwrap()
+            {
+                match sessions
+                    .iter()
+                    .find(|s| s.session == session)
+                    .map(|s| &s.state)
+                {
+                    Some(SessionState::Connected) => return session,
+                    Some(SessionState::Connecting { .. }) => {}
+                    other => panic!("session ended: {other:?}"),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for the session")
+}

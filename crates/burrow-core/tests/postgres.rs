@@ -717,3 +717,72 @@ async fn query_error(core: &Core, session: SessionId) -> String {
     };
     core.execute(command).await.unwrap_err().to_string()
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mcp_bridge_cannot_write_without_a_write_grant() {
+    use burrow_core::Capability::{SqlRead, SqlWrite};
+    use burrow_core::ipc::{Client, Role};
+
+    let Some(postgres) = Postgres::start() else {
+        return;
+    };
+    let (dir, core) = core();
+    let props = format!(
+        "socket = \"{}\"\nport = {}\nuser = \"{}\"\ndatabase = \"postgres\"",
+        postgres.socket_dir(),
+        postgres.port,
+        whoami()
+    );
+    let node = database(&core, &props).await;
+    let socket = serve(core, dir.path());
+    let gui = Client::connect(&socket, Role::Gui).await.unwrap();
+    let mcp = Client::connect(&socket, Role::Mcp).await.unwrap();
+    let open = || Command::OpenDatabase { node: node.id };
+    assert!(mcp.execute(open()).await.is_err());
+
+    grant(&gui, &node, &[SqlRead]).await;
+    let session = open_and_wait(&mcp, open()).await;
+    let run = async |sql: &str| match mcp
+        .execute(Command::RunQuery {
+            session,
+            sql: sql.into(),
+            limit: None,
+        })
+        .await
+        .unwrap()
+    {
+        Response::Query { result } => result,
+        other => panic!("expected a result, got {other:?}"),
+    };
+
+    assert_eq!(run("select 1").await.error, None);
+    // Each way out of read-only: plainly, by changing the setting, and by
+    // ending the transaction. The last two are refused as two statements.
+    for sql in [
+        "create table t (n int)",
+        "set default_transaction_read_only = off; create table t (n int)",
+        "commit; create table t (n int)",
+    ] {
+        assert!(run(sql).await.error.is_some(), "{sql} ran");
+    }
+    let error = mcp
+        .execute(Command::SetReadOnly {
+            session,
+            read_only: false,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("sql-write"), "{error}");
+    let missing = run("select to_regclass('t') is null").await;
+    assert_eq!(missing.statements[0].rows, one("t"));
+
+    // With a write grant it may make the session writable.
+    grant(&gui, &node, &[SqlWrite]).await;
+    mcp.execute(Command::SetReadOnly {
+        session,
+        read_only: false,
+    })
+    .await
+    .unwrap();
+    assert_eq!(run("create table t (n int)").await.error, None);
+}

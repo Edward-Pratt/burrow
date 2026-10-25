@@ -2,27 +2,19 @@
 //! window and the CLI drive it. The terminal tests need a throwaway `sshd`
 //! and skip without one.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use burrow_core::ipc::{self, Client, Events, Role};
+use burrow_core::ipc::{Client, Events, Role};
 use burrow_core::{
     Command, Core, CoreOptions, Event, MemoryStore, Response, SessionId, SessionState,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 
 mod common;
 use common::*;
-
-/// Serves `core` on a socket in `dir`, for as long as the test runs.
-fn serve(core: Core, dir: &Path) -> PathBuf {
-    let path = dir.join("burrowd.sock");
-    let listener = UnixListener::bind(&path).unwrap();
-    tokio::spawn(ipc::serve(core, listener, None));
-    path
-}
 
 fn core(dir: &Path) -> Core {
     Core::open(CoreOptions {
@@ -90,12 +82,47 @@ async fn a_client_runs_commands_and_hears_events() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_mcp_bridge_gets_nothing_without_grants() {
+async fn the_mcp_bridge_reads_the_sidebar_but_changes_nothing() {
     let dir = TempDir::new().unwrap();
     let socket = serve(core(dir.path()), dir.path());
-    let client = Client::connect(&socket, Role::Mcp).await.unwrap();
-    let error = client.execute(Command::ListNodes).await.unwrap_err();
-    assert!(error.to_string().contains("permission denied"), "{error}");
+    let gui = Client::connect(&socket, Role::Gui).await.unwrap();
+    let mcp = Client::connect(&socket, Role::Mcp).await.unwrap();
+    let Response::Node { node } = gui.execute(folder("Work")).await.unwrap() else {
+        panic!("expected a node");
+    };
+
+    assert!(mcp.execute(Command::ListNodes).await.is_ok());
+    let refused = [
+        folder("Mine"),
+        Command::DeleteNode {
+            id: node.id,
+            recursive: true,
+        },
+        Command::SetGrant {
+            node: node.id,
+            capabilities: [burrow_core::Capability::Exec].into(),
+            expect: None,
+        },
+        Command::ListAddons,
+    ];
+    for command in refused {
+        let error = mcp.execute(command).await.unwrap_err();
+        assert!(error.to_string().contains("MCP bridge may not"), "{error}");
+    }
+
+    // Every command is in the audit log; a refused one by its type only.
+    let log = std::fs::read_to_string(dir.path().join("state/mcp-audit.log")).unwrap();
+    let lines: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 5);
+    assert_eq!(lines[0]["ok"], true);
+    assert_eq!(
+        lines[1]["command"],
+        serde_json::json!({"type": "create_node"})
+    );
+    assert_eq!(lines[1]["ok"], false);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -269,4 +296,53 @@ async fn a_clients_sessions_close_when_it_goes() {
         next_state(&mut events, session).await,
         SessionState::Closed { .. }
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mcp_bridge_runs_commands_only_where_granted() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let socket = serve(core, server.dir.path());
+    let gui = Client::connect(&socket, Role::Gui).await.unwrap();
+    let mcp = Client::connect(&socket, Role::Mcp).await.unwrap();
+    let exec = || Command::Exec {
+        node: node.id,
+        command: "echo granted".into(),
+        timeout: None,
+    };
+
+    let error = mcp.execute(exec()).await.unwrap_err();
+    assert!(error.to_string().contains("grant"), "{error}");
+
+    grant(&gui, &node, &[burrow_core::Capability::Exec]).await;
+    match mcp.execute(exec()).await.unwrap() {
+        Response::Exec { result } => assert_eq!(result.stdout, "granted\n"),
+        other => panic!("expected an exec result, got {other:?}"),
+    }
+    // Exec doesn't cover files.
+    let error = mcp
+        .execute(Command::OpenFiles { node: node.id })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("files-read"), "{error}");
+
+    // A node file pointed elsewhere keeps its id but loses the grant.
+    let mut props = node.props.clone();
+    props.insert("alias".into(), "elsewhere".into());
+    let patch = burrow_core::NodePatch {
+        props: Some(props),
+        ..Default::default()
+    };
+    gui.execute(Command::UpdateNode { id: node.id, patch })
+        .await
+        .unwrap();
+    assert!(mcp.execute(exec()).await.is_err());
+    match gui.execute(Command::ListGrants).await.unwrap() {
+        Response::Grants { grants } => assert!(grants[0].stale),
+        other => panic!("expected grants, got {other:?}"),
+    }
 }

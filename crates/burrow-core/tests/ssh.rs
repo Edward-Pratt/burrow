@@ -1174,3 +1174,67 @@ async fn exec_cuts_long_output_and_stops_at_the_timeout() {
         .unwrap_err();
     assert!(error.to_string().contains("timeout"), "{error}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_are_read_and_written_by_content() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let mut events = core.subscribe();
+    let session = open_files(&core, &node, &mut events).await;
+    let root = server.path("remote");
+    fs::create_dir(&root).unwrap();
+    let path = remote(&root.join("note.txt"));
+    let write = |data: &str, overwrite| Command::WriteFile {
+        session,
+        path: path.clone(),
+        data: data.as_bytes().to_vec(),
+        overwrite,
+    };
+
+    core.execute(write("first", false)).await.unwrap();
+    assert_eq!(fs::read_to_string(root.join("note.txt")).unwrap(), "first");
+    // New files are private.
+    let mode = fs::metadata(root.join("note.txt"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(core.execute(write("second", false)).await.is_err());
+    core.execute(write("second", true)).await.unwrap();
+
+    let read = Command::ReadFile {
+        session,
+        path: path.clone(),
+        limit: Some(3),
+    };
+    match core.execute(read).await.unwrap() {
+        Response::File { data, size } => {
+            assert_eq!(data, b"sec");
+            assert_eq!(size, 6);
+        }
+        other => panic!("expected a file, got {other:?}"),
+    }
+
+    // Never through a symlink, and nothing left behind.
+    let target = server.path("outside.txt");
+    fs::write(&target, "keep").unwrap();
+    std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+    let through = Command::WriteFile {
+        session,
+        path: remote(&root.join("link")),
+        data: b"owned".to_vec(),
+        overwrite: true,
+    };
+    assert!(core.execute(through).await.is_err());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+    let left: Vec<_> = fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left.len(), 2, "{left:?}");
+}

@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use burrow_core::ipc::{self, Client, Events, Role};
 use burrow_core::{
-    Command, Event, Node, NodeId, Response, SSH_TUNNEL_KIND, SessionId, SessionKind, SessionState,
-    StatementResult,
+    Capability, Command, Event, Grant, GrantShown, Node, NodeId, Response, SSH_TUNNEL_KIND,
+    SessionId, SessionKind, SessionState, StatementResult,
 };
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -81,6 +81,11 @@ enum Cmd {
     },
     /// Print events as JSON lines until interrupted.
     Events,
+    /// What an AI assistant may do through `burrow mcp serve`.
+    Mcp {
+        #[command(subcommand)]
+        action: McpCmd,
+    },
     /// The daemon.
     Daemon {
         #[command(subcommand)]
@@ -96,6 +101,40 @@ enum TunnelCmd {
     Start { node: String },
     /// Stop a running tunnel.
     Stop { node: String },
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// List what has been granted.
+    Ls,
+    /// Let the assistant do more on a node. Shows the node first: the
+    /// grant only holds while it stays as shown.
+    Grant {
+        node: String,
+        /// sql-read, sql-write, exec, files-read, files-write or tunnel.
+        #[arg(required = true, value_parser = capability)]
+        capabilities: Vec<Capability>,
+        /// Don't ask.
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Take some or all of it away.
+    Revoke {
+        node: String,
+        /// What to take away; everything when none are given.
+        #[arg(value_parser = capability)]
+        capabilities: Vec<Capability>,
+    },
+}
+
+fn capability(name: &str) -> std::result::Result<Capability, String> {
+    Capability::ALL
+        .into_iter()
+        .find(|c| c.to_string() == name)
+        .ok_or_else(|| {
+            let names: Vec<String> = Capability::ALL.iter().map(|c| c.to_string()).collect();
+            format!("not one of {}", names.join(", "))
+        })
 }
 
 #[derive(Subcommand)]
@@ -165,6 +204,7 @@ async fn run(command: Cmd) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Events => events(&client).await,
+        Cmd::Mcp { action } => mcp(&client, action).await,
         Cmd::Daemon { .. } => unreachable!("handled above"),
     }
 }
@@ -567,6 +607,121 @@ async fn tunnel(client: &Client, action: TunnelCmd) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+async fn grants(client: &Client) -> Result<Vec<Grant>> {
+    match client.execute(Command::ListGrants).await? {
+        Response::Grants { grants } => Ok(grants),
+        other => Err(unexpected(&other)),
+    }
+}
+
+async fn mcp(client: &Client, action: McpCmd) -> Result<ExitCode> {
+    match action {
+        McpCmd::Ls => {
+            let nodes = nodes(client).await?;
+            for grant in grants(client).await? {
+                let name = nodes
+                    .iter()
+                    .find(|n| n.id == grant.node)
+                    .map(|n| clean(&n.name))
+                    .unwrap_or_default();
+                let capabilities: Vec<String> =
+                    grant.capabilities.iter().map(|c| c.to_string()).collect();
+                let stale = if grant.stale {
+                    "\tstale: changed since granted"
+                } else {
+                    ""
+                };
+                println!("{name}\t{}\t{}{stale}", capabilities.join(","), grant.node);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        McpCmd::Grant {
+            node,
+            capabilities,
+            yes,
+        } => {
+            let nodes = nodes(client).await?;
+            let node = find(client, &node).await?;
+            let shown = GrantShown::of(&node, &nodes);
+            eprint!("{}", describe(&node.kind, &shown));
+            let mut all: std::collections::BTreeSet<Capability> = grants(client)
+                .await?
+                .into_iter()
+                .find(|g| g.node == node.id && !g.stale)
+                .map(|g| g.capabilities)
+                .unwrap_or_default();
+            all.extend(capabilities);
+            let list: Vec<String> = all.iter().map(|c| c.to_string()).collect();
+            if !yes {
+                if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    return Err("not asking without a terminal; pass --yes".into());
+                }
+                eprint!("Let the assistant use {} here? [y/N] ", list.join(", "));
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+            let command = Command::SetGrant {
+                node: node.id,
+                capabilities: all,
+                expect: Some(shown),
+            };
+            client.execute(command).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        McpCmd::Revoke { node, capabilities } => {
+            let node = find(client, &node).await?;
+            let grant = grants(client)
+                .await?
+                .into_iter()
+                .find(|g| g.node == node.id);
+            let Some(grant) = grant else {
+                return Ok(ExitCode::SUCCESS);
+            };
+            let mut left = grant.capabilities;
+            left.retain(|c| !capabilities.is_empty() && !capabilities.contains(c));
+            // What is left gets pinned again, to the node as it is now. A
+            // stale grant changed after the user saw it, so it isn't kept.
+            let expect = match left.is_empty() {
+                true => None,
+                false if grant.stale => {
+                    return Err(format!(
+                        "{} changed since it was granted; revoke it all, then grant it again",
+                        clean(&node.name)
+                    )
+                    .into());
+                }
+                false => Some(GrantShown::of(&node, &nodes(client).await?)),
+            };
+            let command = Command::SetGrant {
+                node: node.id,
+                capabilities: left,
+                expect,
+            };
+            client.execute(command).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// A node's settings, as shown before granting, with anything that came
+/// from a file escaped.
+fn describe(kind: &str, shown: &GrantShown) -> String {
+    let mut text = format!("{} ({kind})\n", clean(&shown.name));
+    for (key, value) in &shown.props {
+        text.push_str(&format!("  {key} = {}\n", clean(&value.to_string())));
+    }
+    if let Some(via) = &shown.via {
+        text.push_str(&format!("  through {}\n", clean(&via.name)));
+        for (key, value) in &via.props {
+            text.push_str(&format!("    {key} = {}\n", clean(&value.to_string())));
+        }
+    }
+    text
 }
 
 async fn events(client: &Client) -> Result<ExitCode> {

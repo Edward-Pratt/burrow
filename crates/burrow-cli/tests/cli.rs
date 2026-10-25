@@ -63,6 +63,29 @@ fn the_cli_starts_a_daemon_and_drives_it() {
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("no node is called \"nowhere\""));
 
+    let host =
+        r#"{"type": "create_node", "kind": "ssh-host", "name": "web", "props": {"alias": "web"}}"#;
+    assert!(burrow(dir, &["call", host]).status.success());
+    let granted = burrow(dir, &["mcp", "grant", "web", "exec", "files-read", "--yes"]);
+    assert!(granted.status.success(), "{:?}", granted);
+    assert!(String::from_utf8_lossy(&granted.stderr).contains("alias = \"web\""));
+    let listed = stdout(&burrow(dir, &["mcp", "ls"]));
+    assert!(listed.starts_with("web\texec,files-read\t"), "{listed}");
+    // Not on a node where it means nothing.
+    assert!(
+        !burrow(dir, &["mcp", "grant", "Work", "exec", "--yes"])
+            .status
+            .success()
+    );
+    assert!(
+        burrow(dir, &["mcp", "revoke", "web", "exec"])
+            .status
+            .success()
+    );
+    assert!(stdout(&burrow(dir, &["mcp", "ls"])).starts_with("web\tfiles-read\t"));
+    assert!(burrow(dir, &["mcp", "revoke", "web"]).status.success());
+    assert_eq!(stdout(&burrow(dir, &["mcp", "ls"])), "");
+
     let status = burrow(dir, &["daemon", "status"]);
     assert!(status.status.success(), "{}", stdout(&status));
     assert!(burrow(dir, &["daemon", "stop"]).status.success());

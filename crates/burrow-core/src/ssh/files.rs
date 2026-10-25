@@ -620,56 +620,137 @@ async fn upload_file(
     progress: &mut Progress,
     partial: &Partial,
 ) -> Result<()> {
-    let (dir, name) = remote.rsplit_once('/').unwrap_or((".", remote));
-    let temp = join(
-        if dir.is_empty() { "/" } else { dir },
-        &format!(".{name}.burrow-{}", progress.transfer),
-    );
     let local_error = |e: std::io::Error| format!("{}: {e}", local.display());
     let mut from = tokio::fs::File::open(local).await.map_err(local_error)?;
     let source = from.metadata().await.ok().map(|m| m.permissions().mode());
+    let tag = progress.transfer.to_string();
+    put(sftp, remote, &tag, source, Some(partial), async |to| {
+        let mut buffer = vec![0; CHUNK];
+        loop {
+            let read = from.read(&mut buffer).await.map_err(local_error)?;
+            if read == 0 {
+                return Ok(());
+            }
+            to.write_all(&buffer[..read]).await.map_err(text)?;
+            progress.add(read as u64);
+        }
+    })
+    .await
+}
+
+/// Writes a remote file through a private temporary file next to it, which
+/// `fill` writes and which then takes the file's place. A file it replaces
+/// keeps its mode; a new one gets `source`'s, made safe by [`copy_mode`].
+/// `tag` keeps temporary names apart.
+async fn put(
+    sftp: &SftpSession,
+    remote: &str,
+    tag: &str,
+    source: Option<u32>,
+    partial: Option<&Partial>,
+    fill: impl AsyncFnOnce(&mut russh_sftp::client::fs::File) -> Result<()>,
+) -> Result<()> {
+    let (dir, name) = remote.rsplit_once('/').unwrap_or((".", remote));
+    let temp = join(
+        if dir.is_empty() { "/" } else { dir },
+        &format!(".{name}.burrow-{tag}"),
+    );
     // EXCLUDE: fail rather than follow anything already at that name.
     let flags = OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE;
     let mut to = sftp
         .open_with_flags_and_attributes(&temp, flags, mode_attributes(TEMP_MODE))
         .await
         .map_err(text)?;
-    partial.set(Some(Target::Remote(temp.clone())));
-    let mut buffer = vec![0; CHUNK];
-    loop {
-        let read = from.read(&mut buffer).await.map_err(local_error)?;
-        if read == 0 {
-            break;
-        }
-        to.write_all(&buffer[..read]).await.map_err(text)?;
-        progress.add(read as u64);
+    if let Some(partial) = partial {
+        partial.set(Some(Target::Remote(temp.clone())));
     }
+    let written = async {
+        fill(&mut to).await?;
+        // SFTP's rename won't replace a file, so the old one goes first.
+        // The mode is set through the open handle, so it can only reach
+        // our file.
+        let existing = sftp.symlink_metadata(remote).await;
+        let replaced = match &existing {
+            Ok(existing) if existing.file_type() == FileType::File => existing.permissions,
+            _ => None,
+        };
+        let mode = copy_mode(replaced, source);
+        to.set_metadata(mode_attributes(mode)).await.map_err(text)?;
+        to.shutdown().await.map_err(text)?;
+        match existing {
+            Ok(existing) if existing.file_type() == FileType::File => {
+                sftp.remove_file(remote).await.map_err(text)?;
+            }
+            Ok(existing) if existing.file_type() == FileType::Symlink => {
+                return Err(format!(
+                    "{remote} is a symlink, which Burrow won't write through"
+                ));
+            }
+            Ok(_) => return Err(format!("{remote} is in the way of a file")),
+            Err(_) => {}
+        }
+        sftp.rename(&temp, remote).await.map_err(text)
+    }
+    .await;
+    match partial {
+        Some(partial) if written.is_ok() => partial.set(None),
+        // A transfer's own clean-up removes it.
+        Some(_) => {}
+        None if written.is_err() => {
+            let _ = sftp.remove_file(&temp).await;
+        }
+        None => {}
+    }
+    written
+}
 
-    // SFTP's rename won't replace a file, so the old one goes first. The
-    // mode is set through the open handle, so it can only reach our file.
-    let existing = sftp.symlink_metadata(remote).await;
-    let replaced = match &existing {
-        Ok(existing) if existing.file_type() == FileType::File => existing.permissions,
-        _ => None,
-    };
-    let mode = copy_mode(replaced, source);
-    to.set_metadata(mode_attributes(mode)).await.map_err(text)?;
-    to.shutdown().await.map_err(text)?;
-    match existing {
-        Ok(existing) if existing.file_type() == FileType::File => {
-            sftp.remove_file(remote).await.map_err(text)?;
-        }
-        Ok(existing) if existing.file_type() == FileType::Symlink => {
-            return Err(format!(
-                "{remote} is a symlink, which Burrow won't write through"
-            ));
-        }
-        Ok(_) => return Err(format!("{remote} is in the way of a file")),
-        Err(_) => {}
+/// The largest file [`read_file`] and [`write_file`] handle.
+pub(crate) const MAX_INLINE: u64 = 16 << 20;
+
+/// Up to `limit` bytes from the start of a remote file, and its size. For
+/// clients that may not be given local paths, such as the MCP bridge.
+pub(crate) async fn read_file(
+    sftp: &SftpSession,
+    path: &str,
+    limit: u64,
+) -> Result<(Vec<u8>, u64)> {
+    let meta = sftp.metadata(path).await.map_err(text)?;
+    if meta.file_type() != FileType::File {
+        return Err(format!("{path} is not a file"));
     }
-    sftp.rename(&temp, remote).await.map_err(text)?;
-    partial.set(None);
-    Ok(())
+    let size = meta.size.unwrap_or(0);
+    let file = sftp.open(path).await.map_err(text)?;
+    let mut data = Vec::new();
+    file.take(limit.min(MAX_INLINE))
+        .read_to_end(&mut data)
+        .await
+        .map_err(text)?;
+    Ok((data, size))
+}
+
+/// Writes `data` to a remote file, as an upload would. An existing file is
+/// only replaced with `overwrite`.
+pub(crate) async fn write_file(
+    sftp: &SftpSession,
+    path: &str,
+    data: &[u8],
+    overwrite: bool,
+) -> Result<()> {
+    if data.len() as u64 > MAX_INLINE {
+        return Err(format!(
+            "{} bytes is over the limit of {MAX_INLINE}",
+            data.len()
+        ));
+    }
+    if !overwrite && sftp.symlink_metadata(path).await.is_ok() {
+        return Err(format!("{path} already exists"));
+    }
+    let tag = format!("w{}", uuid::Uuid::new_v4().simple());
+    // New files are private, as a file written by a program usually is.
+    put(sftp, path, &tag, Some(0o600), None, async |to| {
+        to.write_all(data).await.map_err(text)
+    })
+    .await
 }
 
 /// Attributes that set only the permission bits.

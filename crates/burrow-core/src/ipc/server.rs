@@ -26,7 +26,7 @@ use super::{
     BUILD, INVALID_PARAMS, Initialize, MAX_LINE, METHOD_NOT_FOUND, Role, SERVER_ERROR, ServerInfo,
     read_line,
 };
-use crate::api::{API_VERSION, Command, Event, Response, SessionId};
+use crate::api::{API_VERSION, Capability, Command, Event, NodeId, Response, SessionId};
 use crate::engine::Core;
 use crate::error::{Error, Result};
 
@@ -211,14 +211,17 @@ impl Conn {
         match method {
             "execute" => {
                 let command: Command = parse(params)?;
-                permit(role, &command).map_err(failed)?;
                 let owns = matches!(
                     command,
                     Command::OpenTerminal { .. }
                         | Command::OpenFiles { .. }
                         | Command::OpenDatabase { .. }
                 );
-                let response: Response = self.core.execute(command).await.map_err(failed)?;
+                let response = match role {
+                    Role::Gui | Role::Cli => self.core.execute(command).await,
+                    Role::Mcp => self.execute_mcp(command).await,
+                }
+                .map_err(failed)?;
                 if owns && let Response::Session { session } = response {
                     let running = self.core.sessions().list();
                     let mut owned = self.owned.lock().unwrap();
@@ -309,15 +312,150 @@ impl Conn {
     }
 }
 
-/// What each role may run. The GTK window and the CLI act for the person
-/// at the keyboard and may do anything the API offers.
-fn permit(role: Role, _command: &Command) -> Result<()> {
-    match role {
-        Role::Gui | Role::Cli => Ok(()),
-        Role::Mcp => Err(Error::PermissionDenied(
-            "the MCP bridge has no grants yet".to_string(),
-        )),
+/// What the MCP bridge may do with a command.
+enum Rule {
+    Run,
+    /// A query that must not write, whatever the session allows.
+    ReadOnlyQuery,
+}
+
+impl Conn {
+    /// Runs a command for the MCP bridge if its grants allow it, and
+    /// records it in the audit log either way.
+    async fn execute_mcp(&self, command: Command) -> Result<Response> {
+        let rule = self.mcp_rule(&command);
+        let mut entry = audit_entry(&command, rule.is_ok());
+        let result = match rule {
+            Err(e) => Err(e),
+            Ok(Rule::Run) => self.core.execute(command).await,
+            Ok(Rule::ReadOnlyQuery) => match command {
+                Command::RunQuery {
+                    session,
+                    sql,
+                    limit,
+                } => self.core.run_query(session, sql, limit, true).await,
+                _ => unreachable!("only queries are read-only"),
+            },
+        };
+        entry["ok"] = json!(result.is_ok());
+        if let Err(e) = &result {
+            entry["error"] = json!(e.to_string());
+        }
+        self.core.audit(&entry);
+        result
     }
+
+    /// The table of what the MCP bridge may run. Reading the sidebar is
+    /// free; acting needs a grant on the node, and a session it opened
+    /// itself. Anything not listed, such as changing nodes, secrets,
+    /// prompts, autostart, addons and grants, is refused. So are commands
+    /// that take a local path: the bridge reads and writes contents
+    /// instead, so it can't read or overwrite the user's own files.
+    fn mcp_rule(&self, command: &Command) -> Result<Rule> {
+        use Capability::*;
+        let node = |node: NodeId, capability| self.require(node, capability);
+        let session = |session: SessionId, capability| {
+            let node = self.own_session(session)?;
+            self.require(node, capability)
+        };
+        match command {
+            Command::Version
+            | Command::ListNodes
+            | Command::GetNode { .. }
+            | Command::ListSessions
+            | Command::ListGrants => {}
+            Command::Exec { node: id, .. } => node(*id, Exec)?,
+            Command::OpenFiles { node: id } => node(*id, FilesRead)?,
+            Command::ListDir { session: s, .. } | Command::ReadFile { session: s, .. } => {
+                session(*s, FilesRead)?;
+            }
+            Command::WriteFile { session: s, .. }
+            | Command::MakeDir { session: s, .. }
+            | Command::RenamePath { session: s, .. }
+            | Command::RemovePath { session: s, .. } => session(*s, FilesWrite)?,
+            Command::OpenDatabase { node: id } => node(*id, SqlRead)?,
+            Command::ListSchema { session: s } | Command::CancelQuery { session: s } => {
+                session(*s, SqlRead)?;
+            }
+            Command::RunQuery { session: s, .. } => {
+                session(*s, SqlRead)?;
+                let id = self.own_session(*s)?;
+                if !self.core.granted(id, SqlWrite) {
+                    return Ok(Rule::ReadOnlyQuery);
+                }
+            }
+            Command::SetReadOnly { session: s, .. } => session(*s, SqlWrite)?,
+            Command::StartTunnel { node: id } => node(*id, Tunnel)?,
+            Command::CloseSession { session: s } => {
+                if self.own_session(*s).is_err() {
+                    let tunnel = self
+                        .core
+                        .sessions()
+                        .list()
+                        .into_iter()
+                        .find(|i| i.session == *s && i.kind == crate::api::SessionKind::Tunnel);
+                    match tunnel {
+                        Some(info) => self.require(info.node, Tunnel)?,
+                        None => return Err(denied("close a session it did not open")),
+                    }
+                }
+            }
+            other => return Err(denied(&format!("run {}", command_type(other)))),
+        }
+        Ok(Rule::Run)
+    }
+
+    fn require(&self, node: NodeId, capability: Capability) -> Result<()> {
+        if self.core.granted(node, capability) {
+            return Ok(());
+        }
+        Err(denied(&format!(
+            "use {capability} on node {node}; the user can grant it in Burrow"
+        )))
+    }
+
+    /// The node of a running session this client opened.
+    fn own_session(&self, session: SessionId) -> Result<NodeId> {
+        if !self.owned.lock().unwrap().contains(&session) {
+            return Err(denied("use a session it did not open"));
+        }
+        self.core
+            .sessions()
+            .list()
+            .into_iter()
+            .find(|info| info.session == session)
+            .map(|info| info.node)
+            .ok_or(Error::SessionNotFound(session))
+    }
+}
+
+fn denied(what: &str) -> Error {
+    Error::PermissionDenied(format!("the MCP bridge may not {what}"))
+}
+
+fn command_type(command: &Command) -> String {
+    serde_json::to_value(command)
+        .ok()
+        .and_then(|v| v["type"].as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// What the audit log keeps of a command. A refused one is kept by type
+/// only, since it may carry a secret; file contents are kept by size.
+fn audit_entry(command: &Command, allowed: bool) -> Value {
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let mut logged = if allowed {
+        serde_json::to_value(command).unwrap_or_default()
+    } else {
+        json!({"type": command_type(command)})
+    };
+    if let Command::WriteFile { data, .. } = command {
+        logged["data"] = json!(format!("{} bytes", data.len()));
+    }
+    json!({"time": time, "command": logged})
 }
 
 /// Passes events on as `event` notifications. A client that falls behind
@@ -347,10 +485,18 @@ async fn forward_events(
     }
 }
 
-fn may_see(role: Role, _event: &Event) -> bool {
+/// The MCP bridge hears about the sidebar and its grants. It follows its
+/// own sessions by listing them, and the rest is none of its business.
+fn may_see(role: Role, event: &Event) -> bool {
     match role {
         Role::Gui | Role::Cli => true,
-        Role::Mcp => false,
+        Role::Mcp => matches!(
+            event,
+            Event::NodeCreated { .. }
+                | Event::NodeUpdated { .. }
+                | Event::NodeDeleted { .. }
+                | Event::GrantsChanged { .. }
+        ),
     }
 }
 

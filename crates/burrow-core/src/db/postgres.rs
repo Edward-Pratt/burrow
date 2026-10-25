@@ -395,6 +395,37 @@ impl Handle {
     /// client never reads would otherwise still be sent in full.
     pub async fn query(self: &Arc<Self>, sql: &str, limit: usize) -> QueryResult {
         let _busy = self.busy.lock().await;
+        self.query_locked(sql, limit).await
+    }
+
+    /// Runs `sql` so that it cannot write, whatever the session's setting:
+    /// as one statement, in a read-only transaction that is rolled back.
+    ///
+    /// The setting alone isn't enough for the MCP bridge, since SQL can
+    /// change it (`SET default_transaction_read_only = off; DELETE …`) or
+    /// end the transaction (`COMMIT; DELETE …`). Preparing the SQL first
+    /// makes the server refuse more than one statement, and one statement
+    /// can't both leave the transaction and write.
+    pub async fn query_read_only(self: &Arc<Self>, sql: &str, limit: usize) -> QueryResult {
+        let _busy = self.busy.lock().await;
+        let started = Instant::now();
+        let failed = |error: &tokio_postgres::Error| QueryResult {
+            error: Some(query_error(error)),
+            elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            ..QueryResult::default()
+        };
+        if let Err(e) = self.client.batch_execute("BEGIN READ ONLY").await {
+            return failed(&e);
+        }
+        let result = match self.client.prepare(sql).await {
+            Ok(_) => self.query_locked(sql, limit).await,
+            Err(e) => failed(&e),
+        };
+        let _ = self.client.batch_execute("ROLLBACK").await;
+        result
+    }
+
+    async fn query_locked(self: &Arc<Self>, sql: &str, limit: usize) -> QueryResult {
         let started = Instant::now();
         let mut result = QueryResult::default();
         let mut cancelling: Option<JoinHandle<()>> = None;

@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use burrow_core::ipc::{self, Client, Role};
 use burrow_core::{
-    AddonInfo, Command, Event, FormValue, Node, NodeId, NodePatch, POSTGRES_KIND, Problem, Prompt,
-    Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId, SessionInfo, SessionKind, SessionState,
-    TunnelShown, View,
+    AddonInfo, Capability, Command, Event, FormValue, Grant, GrantShown, Node, NodeId, NodePatch,
+    POSTGRES_KIND, Problem, Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId,
+    SessionInfo, SessionKind, SessionState, TunnelShown, View,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
@@ -151,6 +151,12 @@ pub enum AppMsg {
         msg: database::Msg,
     },
     EditDatabase(NodeId),
+    /// Asks what the MCP bridge may do on a node.
+    EditGrant(NodeId),
+    GrantLoaded {
+        node: NodeId,
+        grant: Option<Grant>,
+    },
     SetAutostart {
         node: NodeId,
         enabled: bool,
@@ -602,6 +608,21 @@ impl Component for App {
                 }
             }
             AppMsg::EditDatabase(node) => self.edit_database(Some(node), None, window, &sender),
+            AppMsg::EditGrant(node) => {
+                let (core, input) = (self.core.clone(), sender.input_sender().clone());
+                runtime().spawn(async move {
+                    let message = match core.execute(Command::ListGrants).await {
+                        Ok(Response::Grants { grants }) => AppMsg::GrantLoaded {
+                            node,
+                            grant: grants.into_iter().find(|g| g.node == node),
+                        },
+                        Ok(_) => return,
+                        Err(e) => AppMsg::Failed(e.to_string()),
+                    };
+                    let _ = input.send(message);
+                });
+            }
+            AppMsg::GrantLoaded { node, grant } => self.edit_grant(node, grant, window, &sender),
             AppMsg::SetAutostart { node, enabled } => {
                 // What the tab shows: it is redrawn on every change.
                 let expect = self
@@ -825,7 +846,10 @@ impl App {
             }
             Event::ProblemsChanged { problems } => self.problems = problems,
             // Handled by `session_event`, which needs the window.
-            Event::SessionChanged { .. } | Event::PromptRequested { .. } => {}
+            // The grant dialog lists grants when it opens.
+            Event::SessionChanged { .. }
+            | Event::PromptRequested { .. }
+            | Event::GrantsChanged { .. } => {}
             Event::PromptClosed { session, prompt } => {
                 if let Some(dialog) = self.prompts.get_mut().remove(&(session, prompt)) {
                     dialog.dismiss();
@@ -1658,6 +1682,9 @@ impl App {
                 if node.kind == POSTGRES_KIND {
                     entries.push(("Edit…".into(), AppMsg::EditDatabase(node.id)));
                 }
+                if !capabilities(&node.kind).is_empty() {
+                    entries.push(("Claude access…".into(), AppMsg::EditGrant(node.id)));
+                }
                 for addon in self.addons.iter().filter(|a| addons::usable(a)) {
                     let actions = addon.actions.iter();
                     for action in actions.filter(|a| a.kinds.contains(&node.kind)) {
@@ -1688,6 +1715,72 @@ impl App {
             glib::idle_add_local_once(move || popover.unparent());
         });
         popover.popup();
+    }
+
+    /// The grant dialog. The grant is pinned to the node as the dialog
+    /// shows it, so a change made meanwhile makes saving fail instead.
+    fn edit_grant(
+        &self,
+        id: NodeId,
+        grant: Option<Grant>,
+        window: &gtk::ApplicationWindow,
+        sender: &ComponentSender<Self>,
+    ) {
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        let nodes: Vec<Node> = self.nodes.values().cloned().collect();
+        let shown = GrantShown::of(node, &nodes);
+        let mut details = format!(
+            "What Claude may do on {} through Burrow's MCP bridge (burrow mcp serve). \
+             It holds only while these settings stay as they are:\n",
+            files::printable(&node.name)
+        );
+        for (key, value) in &shown.props {
+            details.push_str(&format!(
+                "\n{key} = {}",
+                files::printable(&value.to_string())
+            ));
+        }
+        if let Some(via) = &shown.via {
+            details.push_str(&format!("\n\nThrough {}:", files::printable(&via.name)));
+            for (key, value) in &via.props {
+                details.push_str(&format!(
+                    "\n{key} = {}",
+                    files::printable(&value.to_string())
+                ));
+            }
+        }
+        let granted = match &grant {
+            Some(grant) if grant.stale => {
+                details.push_str(
+                    "\n\nThese changed since access was given, so nothing is allowed \
+                     until you save again.",
+                );
+                Default::default()
+            }
+            Some(grant) => grant.capabilities.clone(),
+            None => Default::default(),
+        };
+        let offered = capabilities(&node.kind);
+        let options = offered
+            .iter()
+            .map(|c| (capability_label(*c).to_string(), granted.contains(c)))
+            .collect();
+        let (core, sender) = (self.core.clone(), sender.clone());
+        dialogs::choose(window, "Claude access", &details, options, move |ticked| {
+            let capabilities = offered
+                .iter()
+                .zip(ticked)
+                .filter_map(|(c, on)| on.then_some(*c))
+                .collect();
+            let command = Command::SetGrant {
+                node: id,
+                capabilities,
+                expect: Some(shown),
+            };
+            execute(&core, &sender, command);
+        });
     }
 
     fn show_palette(&self, window: &gtk::ApplicationWindow, sender: &ComponentSender<Self>) {
@@ -1910,6 +2003,31 @@ fn listen(core: &Client, sender: &ComponentSender<App>) {
             }
         }
     });
+}
+
+/// What the MCP bridge may be granted on a node of `kind`.
+fn capabilities(kind: &str) -> Vec<Capability> {
+    match kind {
+        POSTGRES_KIND => vec![Capability::SqlRead, Capability::SqlWrite],
+        SSH_HOST_KIND => vec![
+            Capability::Exec,
+            Capability::FilesRead,
+            Capability::FilesWrite,
+        ],
+        SSH_TUNNEL_KIND => vec![Capability::Tunnel],
+        _ => Vec::new(),
+    }
+}
+
+fn capability_label(capability: Capability) -> &'static str {
+    match capability {
+        Capability::SqlRead => "Run read-only SQL",
+        Capability::SqlWrite => "Run SQL that writes",
+        Capability::Exec => "Run commands",
+        Capability::FilesRead => "List and read files",
+        Capability::FilesWrite => "Create, change and delete files",
+        Capability::Tunnel => "Start and stop the tunnel",
+    }
 }
 
 fn selected(widgets: &Widgets) -> Option<NodeId> {

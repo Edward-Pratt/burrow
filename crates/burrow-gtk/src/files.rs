@@ -962,7 +962,7 @@ fn parent(path: &str) -> Option<String> {
 
 /// A name or error from the server, with control characters replaced so
 /// they can't change what is around them.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { '\u{fffd}' } else { c })
         .collect()
