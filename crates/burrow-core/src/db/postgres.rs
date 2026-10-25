@@ -390,11 +390,13 @@ fn cell(text: &str) -> String {
 }
 
 /// Whether the session's role can act on the server beyond its data,
-/// which a read-only transaction doesn't stop.
-const POWERFUL: &str = "SELECT pg_catalog.current_setting('is_superuser') = 'on' OR EXISTS ( \
-     SELECT 1 FROM pg_catalog.pg_roles r \
-     WHERE r.rolname IN ('pg_execute_server_program', 'pg_write_server_files') \
-     AND pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER'))";
+/// which a read-only transaction doesn't stop. Membership counts as much as
+/// being: a member of a superuser role can `SET ROLE` to it inside a `DO`
+/// block. Both users are checked, so an earlier `SET ROLE` changes nothing.
+const POWERFUL: &str = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r \
+     WHERE (r.rolsuper OR r.rolname IN ('pg_execute_server_program', 'pg_write_server_files')) \
+     AND (pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER') \
+     OR pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER')))";
 
 impl Handle {
     /// Runs `sql`, keeping at most `limit` rows of each statement. A
@@ -416,8 +418,8 @@ impl Handle {
     ///
     /// A read-only transaction still lets `COPY … TO` write files on the
     /// server and `COPY … TO PROGRAM` run commands there, also from inside
-    /// a `DO` block. So a role that may do either, or a superuser, is
-    /// refused: Burrow can't keep it read-only.
+    /// a `DO` block. So a role that may do either, or a superuser, or one
+    /// that can become either, is refused: Burrow can't keep it read-only.
     pub async fn query_read_only(self: &Arc<Self>, sql: &str, limit: usize) -> QueryResult {
         let _busy = self.busy.lock().await;
         let started = Instant::now();

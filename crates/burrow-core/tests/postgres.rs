@@ -737,13 +737,25 @@ async fn the_mcp_bridge_cannot_write_without_a_write_grant() {
     let admin = database(&core, &admin).await;
     let session = connect(&core, &admin, None).await;
     writable(&core, session).await;
-    let setup = "create role reader login password 'secret'; \
-                 grant pg_read_all_data to reader; grant create on schema public to reader";
-    assert_eq!(query(&core, session, setup, None).await.error, None);
+    let setup = format!(
+        "create role reader login password 'secret'; \
+         grant pg_read_all_data to reader; grant create on schema public to reader; \
+         create role climber login password 'secret'; grant \"{}\" to climber",
+        whoami()
+    );
+    assert_eq!(query(&core, session, &setup, None).await.error, None);
     let props = postgres.tcp().replace(&whoami(), "reader");
     let reader = database(&core, &props).await;
     // Its password is saved, so the bridge's sessions ask nothing.
     let session = connect(&core, &reader, Some(PASSWORD)).await;
+    core.execute(Command::CloseSession { session })
+        .await
+        .unwrap();
+
+    // Not a superuser, but it can become one with SET ROLE.
+    let props = postgres.tcp().replace(&whoami(), "climber");
+    let climber = database(&core, &props).await;
+    let session = connect(&core, &climber, Some(PASSWORD)).await;
     core.execute(Command::CloseSession { session })
         .await
         .unwrap();
@@ -770,6 +782,10 @@ async fn the_mcp_bridge_cannot_write_without_a_write_grant() {
     // transaction, so it gets nothing read-only.
     grant(&gui, &admin, &[SqlRead]).await;
     let session = open_and_wait(&mcp, open(&admin)).await;
+    let refused = run(session, "select 1").await.error.unwrap();
+    assert!(refused.message.contains("can't keep this role read-only"));
+    grant(&gui, &climber, &[SqlRead]).await;
+    let session = open_and_wait(&mcp, open(&climber)).await;
     let refused = run(session, "select 1").await.error.unwrap();
     assert!(refused.message.contains("can't keep this role read-only"));
 
