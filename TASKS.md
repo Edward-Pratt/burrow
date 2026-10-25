@@ -21,5 +21,6 @@ Next milestones from `docs/DESIGN.md`, in rough order; pick by what the tester u
 
 ## Done
 
+- [x] ~~`burrow daemon stop` under an open window~~ (2026-10-25, PR #14 merged)
 - [x] ~~M10: hosts added in Burrow~~ (2026-10-25, PR #13 merged)
 - [x] ~~Review after M9, `burrow doctor`, start-up failure dialog, Arch package, review fixes~~ (2026-10-25, PR #10 merged)
