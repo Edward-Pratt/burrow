@@ -115,7 +115,7 @@ enum McpCmd {
     /// grant only holds while it stays as shown.
     Grant {
         node: String,
-        /// sql-read, sql-write, exec, files-read, files-write or tunnel.
+        /// sql-read, sql-write, exec, files-read, files-write, tunnel or monitor-read.
         #[arg(required = true, value_parser = capability)]
         capabilities: Vec<Capability>,
         /// Don't ask.

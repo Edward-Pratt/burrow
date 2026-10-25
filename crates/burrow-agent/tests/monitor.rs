@@ -271,3 +271,67 @@ async fn an_agent_that_stops_says_why() {
     };
     assert!(error.contains("out of cheese"), "{error}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mcp_bridge_monitors_only_with_a_grant_and_never_installs() {
+    use burrow_core::Capability;
+    use burrow_core::ipc::{Client, Role};
+
+    let Some(mut rig) = Rig::start().await else {
+        return;
+    };
+    let socket = common::serve(rig.core.clone(), rig.server.dir.path());
+    let gui = Client::connect(&socket, Role::Gui).await.unwrap();
+    let mcp = Client::connect(&socket, Role::Mcp).await.unwrap();
+    let node = rig.node.id;
+    let open = || Command::OpenMonitor { node };
+
+    let error = mcp.execute(open()).await.unwrap_err();
+    assert!(error.to_string().contains("grant"), "{error}");
+    // Running commands is a different grant.
+    common::grant(&gui, &rig.node, &[Capability::Exec]).await;
+    assert!(mcp.execute(open()).await.is_err());
+
+    // Granted, but nothing is installed yet: the bridge gets an error, and
+    // nobody is asked to install.
+    common::grant(&gui, &rig.node, &[Capability::MonitorRead]).await;
+    let session = match mcp.execute(open()).await.unwrap() {
+        Response::Session { session } => session,
+        other => panic!("expected a session, got {other:?}"),
+    };
+    let error = closed_error(expect_state(&mut rig.events, session).await).unwrap();
+    assert!(error.contains("isn't on"), "{error}");
+    assert!(!rig.remote().exists());
+
+    // Once the user has installed it, the bridge can run it.
+    let installed = rig.open_and_install().await;
+    rig.core
+        .execute(Command::CloseSession { session: installed })
+        .await
+        .unwrap();
+    let session = common::open_and_wait(&mcp, open()).await;
+    let history = tokio::time::timeout(WAIT, async {
+        loop {
+            match mcp
+                .execute(Command::MonitorHistory { session })
+                .await
+                .unwrap()
+            {
+                Response::Monitor { history } if !history.samples.is_empty() => return history,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+            }
+        }
+    })
+    .await
+    .expect("no sample came");
+    assert!(history.samples[0].memory.total > 0);
+
+    // It can't read a monitor it didn't open.
+    let theirs = rig.open().await;
+    expect_state(&mut rig.events, theirs).await;
+    let error = mcp
+        .execute(Command::MonitorHistory { session: theirs })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("did not open"), "{error}");
+}

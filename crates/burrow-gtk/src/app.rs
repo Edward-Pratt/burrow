@@ -2040,6 +2040,7 @@ fn capabilities(kind: &str) -> Vec<Capability> {
             Capability::Exec,
             Capability::FilesRead,
             Capability::FilesWrite,
+            Capability::MonitorRead,
         ],
         SSH_TUNNEL_KIND => vec![Capability::Tunnel],
         _ => Vec::new(),
@@ -2054,6 +2055,7 @@ fn capability_label(capability: Capability) -> &'static str {
         Capability::FilesRead => "List and read files",
         Capability::FilesWrite => "Create, change and delete files",
         Capability::Tunnel => "Start and stop the tunnel",
+        Capability::MonitorRead => "Read system stats and services",
     }
 }
 

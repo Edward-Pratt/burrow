@@ -150,9 +150,10 @@ impl Capability {
     fn fits(self, kind: &str) -> bool {
         match self {
             Capability::SqlRead | Capability::SqlWrite => kind == POSTGRES_KIND,
-            Capability::Exec | Capability::FilesRead | Capability::FilesWrite => {
-                kind == SSH_HOST_KIND
-            }
+            Capability::Exec
+            | Capability::FilesRead
+            | Capability::FilesWrite
+            | Capability::MonitorRead => kind == SSH_HOST_KIND,
             Capability::Tunnel => kind == SSH_TUNNEL_KIND,
         }
     }

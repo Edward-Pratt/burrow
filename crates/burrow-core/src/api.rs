@@ -464,16 +464,20 @@ pub enum Capability {
     FilesWrite,
     /// Starting and stopping an `ssh-tunnel` node.
     Tunnel,
+    /// Monitoring an `ssh-host` node with the burrow-agent the user put
+    /// there.
+    MonitorRead,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 6] = [
+    pub const ALL: [Capability; 7] = [
         Capability::SqlRead,
         Capability::SqlWrite,
         Capability::Exec,
         Capability::FilesRead,
         Capability::FilesWrite,
         Capability::Tunnel,
+        Capability::MonitorRead,
     ];
 }
 
@@ -486,6 +490,7 @@ impl fmt::Display for Capability {
             Capability::FilesRead => "files-read",
             Capability::FilesWrite => "files-write",
             Capability::Tunnel => "tunnel",
+            Capability::MonitorRead => "monitor-read",
         })
     }
 }
