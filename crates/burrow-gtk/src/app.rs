@@ -301,6 +301,7 @@ impl Component for App {
         listen(&core, &sender);
         load(&core, &sender);
 
+        let error = stale_daemon(&core);
         let widgets = build(&window, &sender);
         widgets.sidebar_pane.set_visible(settings.sidebar_visible);
         add_shortcuts(&window, &sender);
@@ -313,7 +314,7 @@ impl Component for App {
             expanded: HashSet::new(),
             problems: Vec::new(),
             addons: Vec::new(),
-            error: None,
+            error,
             notice: None,
             notice_id: 0,
             tabs: HashMap::new(),
@@ -390,7 +391,7 @@ impl Component for App {
             }
             AppMsg::Reconnected(client) => {
                 self.core = client;
-                self.error = None;
+                self.error = stale_daemon(&self.core);
                 // Their sessions are gone, and no answer could reach them.
                 for (_, dialog) in self.prompts.get_mut().drain() {
                     dialog.dismiss();
@@ -1768,7 +1769,9 @@ impl App {
             details.push_str(
                 "\n\nRead-only SQL is refused for a superuser, or a role that may write \
                  files or run programs on the server, since Burrow can't keep those \
-                 read-only. For full safety, connect as a role that can only read.",
+                 read-only. For full safety, connect as a role that can only read. \
+                 Allowing SQL that writes as a superuser also lets Claude run \
+                 programs on the database server.",
             );
         }
         let offered = capabilities(&node.kind);
@@ -2012,6 +2015,19 @@ fn listen(core: &Client, sender: &ComponentSender<App>) {
             }
         }
     });
+}
+
+/// What to say when the daemon is from another build: one that kept
+/// running through an upgrade because tunnels or terminals run in it.
+fn stale_daemon(core: &Client) -> Option<String> {
+    let build = &core.info().build;
+    (*build != ipc::BUILD).then(|| {
+        format!(
+            "Burrow's core ({}) is from before an update. Stop what runs in it, \
+             then run \"burrow daemon stop\".",
+            files::printable(build)
+        )
+    })
 }
 
 /// What the MCP bridge may be granted on a node of `kind`.

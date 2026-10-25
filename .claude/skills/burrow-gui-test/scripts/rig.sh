@@ -23,9 +23,14 @@ stop_pid() {
     rm -f "$1"
 }
 
-# burrowd keeps its pid in its lock file while it runs.
+# burrowd holds its lock file while it runs, with its pid in it. A pid
+# left by a killed daemon may belong to another process now, so only one
+# whose lock is held is stopped.
 stop_daemon() {
-    [ -f "$RUN/burrowd.lock" ] && kill "$(cat "$RUN/burrowd.lock")" 2>/dev/null || true
+    [ -f "$RUN/burrowd.lock" ] || return 0
+    flock -n "$RUN/burrowd.lock" true && return 0
+    kill "$(cat "$RUN/burrowd.lock")" 2>/dev/null || true
+    flock -w 10 "$RUN/burrowd.lock" true || true
 }
 
 case "${1:-}" in

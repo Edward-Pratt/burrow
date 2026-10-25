@@ -14,7 +14,7 @@ mod sidebar;
 mod terminal;
 mod tunnels;
 
-use burrow_core::CoreOptions;
+use burrow_core::Paths;
 use burrow_core::ipc::{self, Role};
 
 use crate::runtime::runtime;
@@ -24,8 +24,8 @@ const APP_ID: &str = "dev.burrow.Burrow";
 fn main() {
     // Before GTK or tokio start any threads: this may be the daemon.
     burrow_core::daemon::run_if_asked();
-    let config_dir = match CoreOptions::from_env() {
-        Ok(options) => options.config_dir,
+    let config_dir = match Paths::from_env() {
+        Ok(paths) => paths.config_dir,
         Err(e) => fail(&e),
     };
     let core = match runtime().block_on(ipc::connect(Role::Gui)) {

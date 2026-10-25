@@ -28,7 +28,7 @@ pub use api::{
     QueryResult, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionInfo,
     SessionKind, SessionState, StatementResult, TransferId, TransferState, TunnelShown, View,
 };
-pub use engine::{Core, CoreOptions};
+pub use engine::{Core, CoreOptions, Paths};
 pub use error::{Error, Result};
 pub use secrets::{KeyringStore, MemoryStore, SecretKey, SecretStore};
 pub use watch::Watcher;

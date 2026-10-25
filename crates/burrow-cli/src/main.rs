@@ -191,6 +191,13 @@ async fn run(command: Cmd) -> Result<ExitCode> {
         return mcp::serve(ipc::connect(Role::Mcp).await?).await;
     }
     let client = ipc::connect(Role::Cli).await?;
+    if client.info().build != ipc::BUILD {
+        eprintln!(
+            "burrow: burrowd {} is still running from before an update; \
+             stop what runs in it, then run `burrow daemon stop`",
+            clean(&client.info().build)
+        );
+    }
     match command {
         Cmd::Ls { json } => ls(&client, json).await,
         Cmd::Ssh { node } => ssh(&client, &node).await,
@@ -778,22 +785,10 @@ async fn daemon(action: &DaemonCmd) -> Result<ExitCode> {
             }
         },
         DaemonCmd::Stop => {
-            let pid = std::fs::read_to_string(dir.join("burrowd.lock")).unwrap_or_default();
-            let Ok(pid) = pid.trim().parse::<libc::pid_t>() else {
+            if !ipc::stop(&dir).await? {
                 println!("burrowd is not running in {}", dir.display());
-                return Ok(ExitCode::SUCCESS);
-            };
-            // SAFETY: kill only sends a signal.
-            if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
             }
-            for _ in 0..100 {
-                if !socket.exists() {
-                    return Ok(ExitCode::SUCCESS);
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err("burrowd did not stop".into())
+            Ok(ExitCode::SUCCESS)
         }
     }
 }

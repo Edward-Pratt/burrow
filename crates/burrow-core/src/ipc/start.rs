@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use super::{Client, Role};
+use super::{BUILD, Client, Role};
+use crate::api::{Command, Response};
 use crate::daemon::DAEMON_ARG;
-use crate::engine::CoreOptions;
+use crate::engine::Paths;
 use crate::error::{Error, Result};
 
 /// The socket's name in the runtime folder.
@@ -86,11 +87,32 @@ pub fn ensure_private_dir(dir: &Path) -> Result<()> {
 }
 
 /// Connects to the daemon, starting one if none is running.
+///
+/// A daemon from another build, still running after an upgrade, is
+/// replaced when nothing runs in it. Otherwise the client gets it anyway,
+/// and can tell from [`Client::info`] that it should say so.
 pub async fn connect(role: Role) -> Result<Client> {
     let dir = runtime_dir()?;
     ensure_private_dir(&dir)?;
     let socket = dir.join(SOCKET);
-    match Client::connect(&socket, role).await {
+    let client = connect_or_start(&socket, role).await?;
+    if client.info().build == BUILD {
+        return Ok(client);
+    }
+    let idle = matches!(
+        client.execute(Command::ListSessions).await,
+        Ok(Response::Sessions { sessions }) if sessions.is_empty()
+    );
+    if !idle {
+        return Ok(client);
+    }
+    drop(client);
+    stop(&dir).await?;
+    connect_or_start(&socket, role).await
+}
+
+async fn connect_or_start(socket: &Path, role: Role) -> Result<Client> {
+    match Client::connect(socket, role).await {
         Err(e) if not_running(&e) => {}
         other => return other,
     }
@@ -98,7 +120,7 @@ pub async fn connect(role: Role) -> Result<Client> {
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        match Client::connect(&socket, role).await {
+        match Client::connect(socket, role).await {
             Err(e) if not_running(&e) => {}
             other => return other,
         }
@@ -114,6 +136,51 @@ pub async fn connect(role: Role) -> Result<Client> {
     }
 }
 
+/// Stops the daemon serving `dir` and waits until it has. `false` when none
+/// was running.
+///
+/// The daemon holds its lock file while it runs, so the lock, not the pid
+/// in it, says whether one does: a daemon that was killed leaves its pid
+/// behind, and that number may belong to another process by now.
+pub async fn stop(dir: &Path) -> Result<bool> {
+    let path = dir.join(LOCK);
+    let lock = match std::fs::File::open(&path) {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(Error::io(&path, e)),
+    };
+    let free = |lock: &std::fs::File| {
+        // Let go at once: a daemon starting now must still get the lock.
+        lock.try_lock_shared().is_ok() && lock.unlock().is_ok()
+    };
+    if free(&lock) {
+        return Ok(false);
+    }
+    let pid = std::fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
+    let pid: libc::pid_t = pid
+        .trim()
+        .parse()
+        .map_err(|_| Error::invalid("lock", "burrowd is starting; try again"))?;
+    // The pid is written just after the lock is taken, so for a moment it
+    // can be a dead daemon's. Only a Burrow program is sent the signal.
+    let command = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    if !String::from_utf8_lossy(&command).contains("burrow") {
+        return Err(Error::invalid("lock", "burrowd is starting; try again"));
+    }
+    // SAFETY: kill only sends a signal.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        return Err(Error::io("burrowd", std::io::Error::last_os_error()));
+    }
+    let deadline = Instant::now() + START_TIMEOUT;
+    while Instant::now() < deadline {
+        if free(&lock) {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(Error::Remote("burrowd did not stop".to_string()))
+}
+
 fn not_running(error: &Error) -> bool {
     use std::io::ErrorKind::{ConnectionRefused, NotFound};
     matches!(error, Error::Io { source, .. } if matches!(source.kind(), NotFound | ConnectionRefused))
@@ -122,7 +189,7 @@ fn not_running(error: &Error) -> bool {
 /// Starts this program again as the daemon, so it is always the same build
 /// as the client. Its output goes to `burrowd.log` in the state folder.
 fn start() -> Result<(tokio::process::Child, PathBuf)> {
-    let state_dir = CoreOptions::from_env()?.state_dir;
+    let state_dir = Paths::from_env()?.state_dir;
     std::fs::create_dir_all(&state_dir).map_err(|e| Error::io(&state_dir, e))?;
     let log = state_dir.join("burrowd.log");
     let file = std::fs::OpenOptions::new()

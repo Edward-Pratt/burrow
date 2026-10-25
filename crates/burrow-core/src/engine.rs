@@ -32,40 +32,43 @@ pub struct CoreOptions {
     pub ssh_config: Option<PathBuf>,
 }
 
-impl CoreOptions {
-    /// The real setup: `$XDG_CONFIG_HOME/burrow` and the desktop keyring.
-    pub fn system() -> Result<Self> {
+/// Where Burrow keeps things, without the secret store: what clients need
+/// to know, since only the daemon opens the keyring.
+pub struct Paths {
+    pub config_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub ssh_config: Option<PathBuf>,
+}
+
+impl Paths {
+    /// `$XDG_CONFIG_HOME/burrow` and `$XDG_STATE_HOME/burrow`, changed by
+    /// the environment: `BURROW_CONFIG_DIR` points Burrow at another config
+    /// folder, `BURROW_STATE_DIR` at another state folder, and
+    /// `BURROW_SSH_CONFIG` at another OpenSSH config (as `ssh -F`), which
+    /// keeps development runs away from your real ones.
+    pub fn from_env() -> Result<Self> {
         let dirs = directories::ProjectDirs::from("", "", "burrow")
             .ok_or_else(|| Error::invalid("config dir", "could not find the home directory"))?;
-        let state_dir = dirs
-            .state_dir()
-            .unwrap_or_else(|| dirs.data_local_dir())
-            .to_path_buf();
-        Ok(CoreOptions {
-            config_dir: dirs.config_dir().to_path_buf(),
-            state_dir,
-            secrets: Arc::new(KeyringStore::new()?),
-            ssh_config: None,
+        let var = |name| std::env::var_os(name).map(PathBuf::from);
+        Ok(Paths {
+            config_dir: var("BURROW_CONFIG_DIR").unwrap_or_else(|| dirs.config_dir().into()),
+            state_dir: var("BURROW_STATE_DIR")
+                .unwrap_or_else(|| dirs.state_dir().unwrap_or(dirs.data_local_dir()).into()),
+            ssh_config: var("BURROW_SSH_CONFIG"),
         })
     }
+}
 
-    /// [`system`](Self::system), changed by the environment:
-    /// `BURROW_CONFIG_DIR` points Burrow at another config folder,
-    /// `BURROW_STATE_DIR` at another state folder, and `BURROW_SSH_CONFIG`
-    /// at another OpenSSH config (as `ssh -F`), which keeps development
-    /// runs away from your real ones.
+impl CoreOptions {
+    /// [`Paths::from_env`] and the desktop keyring.
     pub fn from_env() -> Result<Self> {
-        let mut options = CoreOptions::system()?;
-        if let Some(dir) = std::env::var_os("BURROW_CONFIG_DIR") {
-            options.config_dir = PathBuf::from(dir);
-        }
-        if let Some(dir) = std::env::var_os("BURROW_STATE_DIR") {
-            options.state_dir = PathBuf::from(dir);
-        }
-        if let Some(file) = std::env::var_os("BURROW_SSH_CONFIG") {
-            options.ssh_config = Some(PathBuf::from(file));
-        }
-        Ok(options)
+        let paths = Paths::from_env()?;
+        Ok(CoreOptions {
+            config_dir: paths.config_dir,
+            state_dir: paths.state_dir,
+            secrets: Arc::new(KeyringStore::new()?),
+            ssh_config: paths.ssh_config,
+        })
     }
 }
 

@@ -177,3 +177,29 @@ fn the_mcp_server_speaks_both_eras_and_respects_grants() {
     let listed = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(listed.contains(r#""exec""#), "{listed}");
 }
+
+#[test]
+fn stopping_never_signals_a_pid_a_dead_daemon_left_behind() {
+    let dir = TempDir::new().unwrap();
+    let dir = dir.path();
+    let run = dir.join("run");
+    std::fs::create_dir(&run).unwrap();
+    std::fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    // A killed daemon's lock file, naming a process that took its pid.
+    let mut bystander = Command::new("sleep").arg("30").spawn().unwrap();
+    std::fs::write(run.join("burrowd.lock"), format!("{}\n", bystander.id())).unwrap();
+
+    let stopped = burrow(dir, &["daemon", "stop"]);
+    assert!(stopped.status.success());
+    assert!(
+        stdout(&stopped).contains("not running"),
+        "{}",
+        stdout(&stopped)
+    );
+    assert!(
+        bystander.try_wait().unwrap().is_none(),
+        "the bystander was killed"
+    );
+    bystander.kill().unwrap();
+    bystander.wait().unwrap();
+}
