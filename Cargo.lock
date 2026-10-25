@@ -429,6 +429,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "burrow-agent"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "burrow-cli"
 version = "0.1.0"
 dependencies = [
