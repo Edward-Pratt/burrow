@@ -27,6 +27,10 @@
 
 .statusbar button.warning {
   color: #c88800;
+}
+
+.statusbar button.warning,
+.statusbar button.error {
   padding: 0 6px;
   min-height: 0;
 }

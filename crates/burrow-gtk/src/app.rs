@@ -6,7 +6,7 @@
 //! core, including after edits made outside Burrow.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -47,6 +47,9 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// How long a message from an addon stays in the status bar.
 const NOTICE_TIME: Duration = Duration::from_secs(6);
+
+/// How many errors the status bar's list keeps.
+const MAX_ERRORS: usize = 50;
 
 /// What "New …" creates.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,6 +198,8 @@ pub enum AppMsg {
     /// An addon's reply to `Invoke`, shown in the status bar.
     Notice(String),
     ClearNotice(u32),
+    /// Empties the status bar's list of errors.
+    ClearErrors,
     ManageAddons,
     ReviewAddon(String),
     RevokeAddon(String),
@@ -205,6 +210,52 @@ pub enum AppMsg {
     SetTheme(Theme),
     ReloadConfig,
     OpenConfigFolder,
+}
+
+impl AppMsg {
+    /// Whether the user did this, rather than the core or a timer. A user
+    /// action clears the error in the status bar, which nothing else does
+    /// but a newer error: events arrive every few seconds and would wipe
+    /// it before it could be read. Messages that can come either way, such
+    /// as a panel's own messages, don't count.
+    fn is_user_action(&self) -> bool {
+        matches!(
+            self,
+            AppMsg::RowActivated(_)
+                | AppMsg::ContextMenu { .. }
+                | AppMsg::New { .. }
+                | AppMsg::Open(_)
+                | AppMsg::Rename(_)
+                | AppMsg::Delete(_)
+                | AppMsg::RenameSelected
+                | AppMsg::DeleteSelected
+                | AppMsg::CloseTab(_)
+                | AppMsg::CloseCurrentTab
+                | AppMsg::SwitchTab(_)
+                | AppMsg::NewTerminal(_)
+                | AppMsg::OpenFiles(_)
+                | AppMsg::OpenMonitor(_)
+                | AppMsg::StartTunnel(_)
+                | AppMsg::StopTunnel(_)
+                | AppMsg::RestartTunnel(_)
+                | AppMsg::EditTunnel(_)
+                | AppMsg::EditDatabase(_)
+                | AppMsg::EditGrant(_)
+                | AppMsg::SetAutostart { .. }
+                | AppMsg::Invoke { .. }
+                | AppMsg::ClearErrors
+                | AppMsg::ManageAddons
+                | AppMsg::ReviewAddon(_)
+                | AppMsg::RevokeAddon(_)
+                | AppMsg::OpenAddonsFolder
+                | AppMsg::ShowPalette
+                | AppMsg::ToggleSidebar
+                | AppMsg::ShowSettings
+                | AppMsg::SetTheme(_)
+                | AppMsg::ReloadConfig
+                | AppMsg::OpenConfigFolder
+        )
+    }
 }
 
 /// What a tab shows. Node tabs follow their node; terminal tabs belong to
@@ -242,7 +293,13 @@ pub struct App {
     expanded: HashSet<NodeId>,
     problems: Vec<Problem>,
     addons: Vec<AddonInfo>,
+    /// The error the status bar shows, until the user does something or a
+    /// newer error replaces it.
     error: Option<String>,
+    /// Recent errors, for the list behind the status bar's errors button.
+    errors: ErrorLog,
+    /// The daemon went away and a new connection isn't up yet.
+    reconnecting: bool,
     /// A message from an addon, and a counter so an old timer does not
     /// clear a newer one.
     notice: Option<String>,
@@ -293,6 +350,31 @@ pub struct Widgets {
     status: gtk::Label,
     problems_button: gtk::MenuButton,
     problems_list: gtk::Label,
+    errors_button: gtk::MenuButton,
+    errors_list: gtk::Label,
+}
+
+/// The errors the status bar has shown, oldest first, with the time each
+/// arrived. Only the newest is on the status line, and a burst of them
+/// would otherwise replace one another before they could be read.
+#[derive(Default)]
+struct ErrorLog(VecDeque<(String, String)>);
+
+impl ErrorLog {
+    fn push(&mut self, time: String, message: String) {
+        if self.0.len() == MAX_ERRORS {
+            self.0.pop_front();
+        }
+        self.0.push_back((time, message));
+    }
+
+    /// One line per error, newest first.
+    fn text(&self) -> String {
+        (self.0.iter().rev())
+            .map(|(time, message)| format!("{time}  {message}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 impl Component for App {
@@ -322,12 +404,11 @@ impl Component for App {
         listen(&core, &sender);
         load(&core, &sender);
 
-        let error = stale_daemon(&core);
         let widgets = build(&window, &sender);
         widgets.sidebar_pane.set_visible(settings.sidebar_visible);
         add_shortcuts(&window, &sender);
 
-        let model = App {
+        let mut model = App {
             core,
             config_dir,
             settings,
@@ -335,7 +416,9 @@ impl Component for App {
             expanded: HashSet::new(),
             problems: Vec::new(),
             addons: Vec::new(),
-            error,
+            error: None,
+            errors: ErrorLog::default(),
+            reconnecting: false,
             notice: None,
             notice_id: 0,
             tabs: HashMap::new(),
@@ -356,6 +439,9 @@ impl Component for App {
             prompts: RefCell::default(),
             sidebar_dirty: false,
         };
+        if let Some(error) = stale_daemon(&model.core) {
+            model.fail(error);
+        }
         model.apply_theme();
         model.refresh_status(&widgets);
         ComponentParts { model, widgets }
@@ -368,6 +454,9 @@ impl Component for App {
         sender: ComponentSender<Self>,
         window: &Self::Root,
     ) {
+        if message.is_user_action() {
+            self.error = None;
+        }
         match message {
             AppMsg::Loaded {
                 nodes,
@@ -399,10 +488,12 @@ impl Component for App {
             }
             AppMsg::Resync => load(&self.core, &sender),
             AppMsg::Disconnected => {
-                self.error = Some("Lost the connection to burrowd. Reconnecting…".to_string());
+                self.reconnecting = true;
+                // It would read as why reconnecting fails. The list keeps it.
+                self.error = None;
             }
             AppMsg::Reconnected(client) => self.reconnected(client, window, &sender),
-            AppMsg::Failed(error) => self.error = Some(error),
+            AppMsg::Failed(error) => self.fail(error),
 
             AppMsg::RowActivated(index) => {
                 if let Some(&id) = widgets.row_ids.get(index as usize) {
@@ -582,7 +673,7 @@ impl Component for App {
                 }
             }
             AppMsg::MonitoringFailed(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 self.refresh_monitors();
             }
             AppMsg::StartTunnel(node) => {
@@ -623,13 +714,13 @@ impl Component for App {
             AppMsg::EditGrant(node) => {
                 let (core, input) = (self.core.clone(), sender.input_sender().clone());
                 runtime().spawn(async move {
-                    let message = match core.execute(Command::ListGrants).await {
+                    let message = match run(&core, Command::ListGrants).await {
                         Ok(Response::Grants { grants }) => AppMsg::GrantLoaded {
                             node,
                             grant: grants.into_iter().find(|g| g.node == node),
                         },
                         Ok(_) => return,
-                        Err(e) => AppMsg::Failed(e.to_string()),
+                        Err(error) => AppMsg::Failed(error),
                     };
                     let _ = input.send(message);
                 });
@@ -648,14 +739,13 @@ impl Component for App {
                         enabled,
                         expect,
                     };
-                    if let Err(e) = core.execute(command).await {
-                        let error = e.to_string();
+                    if let Err(error) = run(&core, command).await {
                         let _ = input.send(AppMsg::AutostartFailed { node, error });
                     }
                 });
             }
             AppMsg::AutostartFailed { node, error } => {
-                self.error = Some(error);
+                self.fail(error);
                 self.refresh_tunnel(node, &sender);
             }
             AppMsg::LoadView(id) => self.load_view(id, &sender),
@@ -674,18 +764,17 @@ impl Component for App {
                 };
                 let (core, input) = (self.core.clone(), sender.input_sender().clone());
                 runtime().spawn(async move {
-                    let message = match core.execute(command).await {
+                    let message = match run(&core, command).await {
                         Ok(Response::Invoked {
                             message: Some(message),
                         }) => AppMsg::Notice(message),
                         Ok(_) => return,
-                        Err(e) => AppMsg::Failed(e.to_string()),
+                        Err(error) => AppMsg::Failed(error),
                     };
                     let _ = input.send(message);
                 });
             }
             AppMsg::Notice(message) => {
-                self.error = None;
                 self.notice = Some(message);
                 self.notice_id += 1;
                 let (id, sender) = (self.notice_id, sender.clone());
@@ -697,6 +786,10 @@ impl Component for App {
                 if id == self.notice_id {
                     self.notice = None;
                 }
+            }
+            AppMsg::ClearErrors => {
+                self.errors = ErrorLog::default();
+                widgets.errors_button.popdown();
             }
             AppMsg::ManageAddons => {
                 let review = {
@@ -842,7 +935,12 @@ impl App {
         sender: &ComponentSender<Self>,
     ) {
         self.core = client;
-        self.error = stale_daemon(&self.core);
+        self.reconnecting = false;
+        // Why reconnecting failed is over now; the list still has it.
+        self.error = None;
+        if let Some(error) = stale_daemon(&self.core) {
+            self.fail(error);
+        }
         // Their sessions are gone, and no answer could reach them.
         for (_, dialog) in self.prompts.get_mut().drain() {
             dialog.dismiss();
@@ -909,7 +1007,6 @@ impl App {
     }
 
     fn apply_event(&mut self, event: Event, widgets: &Widgets, sender: &ComponentSender<Self>) {
-        self.error = None;
         match event {
             Event::NodeCreated { node } => {
                 // Show where the new node went.
@@ -1422,7 +1519,7 @@ impl App {
             };
             let (core, input) = (core.clone(), input.clone());
             runtime().spawn(async move {
-                let result = match core.execute(command).await {
+                let result = match run(&core, command).await {
                     // Only the settings saved here: a file that changed
                     // meanwhile makes this fail rather than be approved.
                     Ok(Response::Node { node }) if autostart => {
@@ -1431,12 +1528,12 @@ impl App {
                             enabled: true,
                             expect: saved,
                         };
-                        core.execute(command).await
+                        run(&core, command).await
                     }
                     other => other,
                 };
-                if let Err(e) = result {
-                    let _ = input.send(AppMsg::Failed(e.to_string()));
+                if let Err(error) = result {
+                    let _ = input.send(AppMsg::Failed(error));
                 }
             });
         });
@@ -1653,8 +1750,8 @@ impl App {
         let (core, input) = (self.core.clone(), sender.input_sender().clone());
         let send = move |command: Command| {
             runtime().spawn(async move {
-                if let Err(e) = core.execute(command).await {
-                    let _ = input.send(AppMsg::MonitoringFailed(e.to_string()));
+                if let Err(error) = run(&core, command).await {
+                    let _ = input.send(AppMsg::MonitoringFailed(error));
                 }
             });
         };
@@ -2138,31 +2235,57 @@ impl App {
 
     fn save_settings(&mut self) {
         if let Err(e) = self.settings.save(&self.config_dir) {
-            self.error = Some(format!("Could not save settings: {e}"));
+            self.fail(format!("Could not save settings: {e}"));
         }
     }
 
+    /// Shows `error` in the status bar until the user does something or a
+    /// newer error replaces it, and keeps it in the errors list.
+    fn fail(&mut self, error: String) {
+        let time = glib::DateTime::now_local()
+            .and_then(|now| now.format("%H:%M:%S"))
+            .map(|time| time.to_string())
+            .unwrap_or_default();
+        self.errors.push(time, error.clone());
+        self.error = Some(error);
+    }
+
     fn refresh_status(&self, widgets: &Widgets) {
-        match (&self.error, &self.notice) {
-            (Some(error), _) => {
-                widgets.status.set_label(error);
-                widgets.status.add_css_class("error");
-            }
-            (None, Some(notice)) => {
-                widgets.status.set_label(notice);
-                widgets.status.remove_css_class("error");
-            }
-            (None, None) => {
-                let leaves = self.nodes.values().filter(|n| !n.is_folder()).count();
-                let folders = self.nodes.len() - leaves;
-                widgets.status.set_label(&format!(
-                    "{leaves} {} · {folders} {}",
-                    plural(leaves, "item", "items"),
-                    plural(folders, "folder", "folders"),
-                ));
-                widgets.status.remove_css_class("error");
-            }
+        let (text, is_error) = if self.reconnecting {
+            // Stays up until the new connection is, with why the last try
+            // failed beside it.
+            let lost = "Lost the connection to burrowd. Reconnecting…";
+            let text = match &self.error {
+                Some(error) => format!("{lost} ({error})"),
+                None => lost.to_string(),
+            };
+            (text, true)
+        } else if let Some(error) = &self.error {
+            (error.clone(), true)
+        } else if let Some(notice) = &self.notice {
+            (notice.clone(), false)
+        } else {
+            let leaves = self.nodes.values().filter(|n| !n.is_folder()).count();
+            let folders = self.nodes.len() - leaves;
+            let text = format!(
+                "{leaves} {} · {folders} {}",
+                plural(leaves, "item", "items"),
+                plural(folders, "folder", "folders"),
+            );
+            (text, false)
+        };
+        widgets.status.set_label(&text);
+        if is_error {
+            widgets.status.add_css_class("error");
+        } else {
+            widgets.status.remove_css_class("error");
         }
+        let errors = self.errors.0.len();
+        widgets.errors_button.set_visible(errors > 0);
+        widgets
+            .errors_button
+            .set_label(&format!("{errors} {}", plural(errors, "error", "errors")));
+        widgets.errors_list.set_label(&self.errors.text());
         widgets
             .problems_button
             .set_visible(!self.problems.is_empty());
@@ -2187,10 +2310,47 @@ impl App {
 fn execute(core: &Client, sender: &ComponentSender<App>, command: Command) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
-        if let Err(e) = core.execute(command).await {
-            let _ = input.send(AppMsg::Failed(e.to_string()));
+        if let Err(error) = run(&core, command).await {
+            let _ = input.send(AppMsg::Failed(error));
         }
     });
+}
+
+/// Runs a command, naming it in the error, so that "permission denied"
+/// says what was denied.
+async fn run(core: &Client, command: Command) -> Result<Response, String> {
+    let name = command_name(&command);
+    core.execute(command)
+        .await
+        .map_err(|e| format!("{name}: {e}"))
+}
+
+/// The command's `type` as the API names it, such as `start_tunnel`. It is
+/// read from the start of the command's `Debug` text, and the writer stops
+/// there, so a command carrying a file's bytes isn't formatted whole.
+fn command_name(command: &Command) -> String {
+    use std::fmt::Write;
+
+    /// serde's `snake_case` of the variant name.
+    struct Name(String);
+    impl Write for Name {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            for c in text.chars() {
+                if !c.is_ascii_alphanumeric() {
+                    return Err(std::fmt::Error);
+                }
+                if c.is_ascii_uppercase() && !self.0.is_empty() {
+                    self.0.push('_');
+                }
+                self.0.push(c.to_ascii_lowercase());
+            }
+            Ok(())
+        }
+    }
+    let mut name = Name(String::new());
+    // Fails, on purpose, at the first character after the name.
+    let _ = write!(name, "{command:?}");
+    name.0
 }
 
 /// Loads the full node list, problems, addons, sessions and autostart
@@ -2199,35 +2359,35 @@ fn load(core: &Client, sender: &ComponentSender<App>) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
         let result = async {
-            let nodes = match core.execute(Command::ListNodes).await? {
+            let nodes = match run(&core, Command::ListNodes).await? {
                 Response::Nodes { nodes } => nodes,
                 _ => Vec::new(),
             };
-            let problems = match core.execute(Command::ListProblems).await? {
+            let problems = match run(&core, Command::ListProblems).await? {
                 Response::Problems { problems } => problems,
                 _ => Vec::new(),
             };
-            let addons = match core.execute(Command::ListAddons).await? {
+            let addons = match run(&core, Command::ListAddons).await? {
                 Response::Addons { addons } => addons,
                 _ => Vec::new(),
             };
-            let sessions = match core.execute(Command::ListSessions).await? {
+            let sessions = match run(&core, Command::ListSessions).await? {
                 Response::Sessions { sessions } => sessions,
                 _ => Vec::new(),
             };
-            let autostart = match core.execute(Command::ListAutostart).await? {
+            let autostart = match run(&core, Command::ListAutostart).await? {
                 Response::Autostart { nodes } => nodes,
                 _ => Vec::new(),
             };
-            let monitoring = match core.execute(Command::ListMonitoring).await? {
+            let monitoring = match run(&core, Command::ListMonitoring).await? {
                 Response::Monitoring { nodes } => nodes,
                 _ => Vec::new(),
             };
-            let alerts = match core.execute(Command::ListAlerts).await? {
+            let alerts = match run(&core, Command::ListAlerts).await? {
                 Response::Alerts { alerts } => alerts,
                 _ => Vec::new(),
             };
-            Ok::<_, burrow_core::Error>(AppMsg::Loaded {
+            Ok::<_, String>(AppMsg::Loaded {
                 nodes,
                 problems,
                 addons,
@@ -2238,7 +2398,7 @@ fn load(core: &Client, sender: &ComponentSender<App>) {
             })
         }
         .await;
-        let _ = input.send(result.unwrap_or_else(|e| AppMsg::Failed(e.to_string())));
+        let _ = input.send(result.unwrap_or_else(AppMsg::Failed));
     });
 }
 
@@ -2566,9 +2726,43 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
     problems_button.add_css_class("warning");
     problems_button.set_popover(Some(&problems_popover));
     problems_button.set_visible(false);
+
+    let errors_list = gtk::Label::new(None);
+    errors_list.set_xalign(0.0);
+    errors_list.set_selectable(true);
+    errors_list.set_wrap(true);
+    errors_list.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    errors_list.set_max_width_chars(72);
+    let errors_scroller = gtk::ScrolledWindow::builder()
+        .child(&errors_list)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_width(true)
+        .propagate_natural_height(true)
+        .max_content_height(320)
+        .build();
+    let clear_errors = gtk::Button::with_label("Clear");
+    clear_errors.set_halign(gtk::Align::End);
+    send_on_click(&clear_errors, sender, AppMsg::ClearErrors);
+    let errors_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    errors_content.set_margin_top(8);
+    errors_content.set_margin_bottom(8);
+    errors_content.set_margin_start(8);
+    errors_content.set_margin_end(8);
+    errors_content.append(&errors_scroller);
+    errors_content.append(&clear_errors);
+    let errors_popover = gtk::Popover::new();
+    errors_popover.set_child(Some(&errors_content));
+    let errors_button = gtk::MenuButton::new();
+    errors_button.add_css_class("flat");
+    errors_button.add_css_class("error");
+    errors_button.set_tooltip_text(Some("Recent errors"));
+    errors_button.set_popover(Some(&errors_popover));
+    errors_button.set_visible(false);
+
     let statusbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     statusbar.add_css_class("statusbar");
     statusbar.append(&status);
+    statusbar.append(&errors_button);
     statusbar.append(&problems_button);
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -2586,6 +2780,8 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
         status,
         problems_button,
         problems_list,
+        errors_button,
+        errors_list,
     }
 }
 
@@ -2690,4 +2886,33 @@ fn show_settings(window: &gtk::ApplicationWindow, current: Theme, sender: &Compo
     dialog.set_child(Some(&grid));
     dialogs::close_on_escape(&dialog);
     dialog.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_named_as_the_api_names_them() {
+        assert_eq!(command_name(&Command::ListNodes), "list_nodes");
+        let node = NodeId::new();
+        assert_eq!(command_name(&Command::StartTunnel { node }), "start_tunnel");
+        let close = Command::CloseSession {
+            session: SessionId(7),
+        };
+        assert_eq!(command_name(&close), "close_session");
+    }
+
+    #[test]
+    fn the_error_log_keeps_the_newest() {
+        let mut log = ErrorLog::default();
+        for n in 0..MAX_ERRORS + 10 {
+            log.push(format!("t{n}"), format!("error {n}"));
+        }
+        assert_eq!(log.0.len(), MAX_ERRORS);
+        let text = log.text();
+        let first = text.lines().next().unwrap();
+        assert_eq!(first, format!("t{0}  error {0}", MAX_ERRORS + 9));
+        assert!(!text.contains("error 9\n") && text.ends_with("error 10"));
+    }
 }
