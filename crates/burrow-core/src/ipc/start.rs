@@ -156,11 +156,8 @@ pub async fn stop(dir: &Path) -> Result<bool> {
     if free(&lock) {
         return Ok(false);
     }
-    let pid = std::fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
-    let pid: libc::pid_t = pid
-        .trim()
-        .parse()
-        .map_err(|_| Error::invalid("lock", "burrowd is starting; try again"))?;
+    let pid =
+        holder(&path).ok_or_else(|| Error::invalid("lock", "burrowd is starting; try again"))?;
     // The pid is written just after the lock is taken, so for a moment it
     // can be a dead daemon's. Only a Burrow program is sent the signal.
     let command = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
@@ -173,12 +170,23 @@ pub async fn stop(dir: &Path) -> Result<bool> {
     }
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
-        if free(&lock) {
+        // An open window starts a new daemon as soon as this one goes, and
+        // it can take the lock between two looks. Its pid in the file
+        // means this one stopped. A zombie pid would still pass a check
+        // in /proc, though its lock is already gone.
+        if free(&lock) || holder(&path).is_some_and(|holder| holder != pid) {
             return Ok(true);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err(Error::Remote("burrowd did not stop".to_string()))
+}
+
+/// The pid written in the lock file, or `None` while it is empty: a daemon
+/// empties it just before it lets go, and writes it just after it takes
+/// the lock.
+fn holder(path: &Path) -> Option<libc::pid_t> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Why the daemon the client started isn't answering. One that `stopped`
@@ -296,6 +304,43 @@ mod tests {
         std::fs::write(&log, "").unwrap();
         let silent = did_not_start(&log, true).to_string();
         assert!(silent.starts_with("burrowd did not start; see "));
+    }
+
+    /// An open window starts a new daemon as soon as the old one goes, and
+    /// the new one can take the lock before `stop` sees it free.
+    #[tokio::test]
+    async fn a_daemon_replaced_at_once_has_still_stopped() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join(LOCK);
+        // Locks belong to each opened file, so `stop` opening the file
+        // again finds this one taken even from the same process.
+        let mut lock = std::fs::File::create(&path).unwrap();
+        lock.try_lock().unwrap();
+        let mut old = std::process::Command::new("sleep")
+            .arg0("burrowd-test")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        writeln!(lock, "{}", old.id()).unwrap();
+        // The new daemon's pid replaces the old one's without the lock
+        // ever coming free.
+        let replace = std::thread::spawn(move || {
+            use std::os::unix::fs::FileExt;
+            old.wait().unwrap();
+            lock.set_len(0).unwrap();
+            lock.write_all_at(format!("{}\n", std::process::id()).as_bytes(), 0)
+                .unwrap();
+            lock
+        });
+        let started = Instant::now();
+        assert!(stop(temp.path()).await.unwrap());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let lock = replace.join().unwrap();
+        assert_eq!(holder(&path), Some(std::process::id() as libc::pid_t));
+        lock.set_len(0).unwrap();
+        assert_eq!(holder(&path), None);
     }
 
     #[test]
