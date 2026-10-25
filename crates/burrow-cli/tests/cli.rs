@@ -91,3 +91,89 @@ fn the_cli_starts_a_daemon_and_drives_it() {
     assert!(burrow(dir, &["daemon", "stop"]).status.success());
     assert_eq!(burrow(dir, &["daemon", "status"]).status.code(), Some(3));
 }
+
+/// Sends `requests` to `burrow mcp serve` and returns its replies.
+fn mcp(dir: &Path, requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_burrow"))
+        .args(["mcp", "serve"])
+        .env("BURROW_RUNTIME_DIR", dir.join("run"))
+        .env("BURROW_CONFIG_DIR", dir.join("config"))
+        .env("BURROW_STATE_DIR", dir.join("state"))
+        .env("BURROW_SSH_CONFIG", "/dev/null")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for request in requests {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn the_mcp_server_speaks_both_eras_and_respects_grants() {
+    use serde_json::json;
+    let dir = TempDir::new().unwrap();
+    let dir = dir.path();
+    let _daemon = Daemon(dir);
+    let host =
+        r#"{"type": "create_node", "kind": "ssh-host", "name": "web", "props": {"alias": "web"}}"#;
+    let created = burrow(dir, &["call", host]);
+    if !created.status.success() {
+        let log = std::fs::read_to_string(dir.join("state/burrowd.log")).unwrap_or_default();
+        assert!(log.contains("secret store"), "{log}");
+        eprintln!("skipping: no Secret Service");
+        return;
+    }
+
+    let modern = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"});
+    let replies = mcp(
+        dir,
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": modern}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "list_nodes", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "run_command", "arguments": {"node": "web", "command": "id"}}}),
+            json!({"jsonrpc": "2.0", "id": 6, "method": "ping", "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "1900-01-01"}}}),
+        ],
+    );
+    // The notification gets no reply.
+    assert_eq!(replies.len(), 6, "{replies:#?}");
+    assert!(replies[0]["result"]["supportedVersions"][0] == "2026-07-28");
+    assert_eq!(replies[0]["result"]["resultType"], "complete");
+    assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
+    let tools = replies[2]["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|t| t["name"] == "query"));
+    let listed = replies[3]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(listed.contains(r#""allowed": []"#), "{listed}");
+    // Burrow refuses it, which the assistant sees as a failed tool.
+    assert_eq!(replies[4]["result"]["isError"], true);
+    let refused = replies[4]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(refused.contains("exec"), "{refused}");
+    assert_eq!(replies[5]["error"]["code"], -32022);
+
+    // Granted, list_nodes says so.
+    assert!(
+        burrow(dir, &["mcp", "grant", "web", "exec", "--yes"])
+            .status
+            .success()
+    );
+    let replies = mcp(
+        dir,
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_nodes", "arguments": {}}}),
+        ],
+    );
+    let listed = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(listed.contains(r#""exec""#), "{listed}");
+}

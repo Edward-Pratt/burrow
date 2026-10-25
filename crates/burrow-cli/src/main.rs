@@ -1,6 +1,7 @@
 //! `burrow`: Burrow on the command line. Like the window, it drives the core
 //! in `burrowd`, and starts one when none is running.
 
+mod mcp;
 mod tty;
 
 use std::collections::HashMap;
@@ -18,7 +19,7 @@ use clap::{Parser, Subcommand};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast::error::RecvError;
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 
 #[derive(Parser)]
 #[command(name = "burrow", version, about = "Burrow on the command line")]
@@ -105,6 +106,9 @@ enum TunnelCmd {
 
 #[derive(Subcommand)]
 enum McpCmd {
+    /// Serve MCP on stdin and stdout, for an assistant to start. For Claude
+    /// Code: `claude mcp add burrow -- burrow mcp serve`.
+    Serve,
     /// List what has been granted.
     Ls,
     /// Let the assistant do more on a node. Shows the node first: the
@@ -179,6 +183,12 @@ fn fail(error: &dyn Error) -> ExitCode {
 async fn run(command: Cmd) -> Result<ExitCode> {
     if let Cmd::Daemon { action } = &command {
         return daemon(action).await;
+    }
+    if let Cmd::Mcp {
+        action: McpCmd::Serve,
+    } = &command
+    {
+        return mcp::serve(ipc::connect(Role::Mcp).await?).await;
     }
     let client = ipc::connect(Role::Cli).await?;
     match command {
@@ -618,6 +628,7 @@ async fn grants(client: &Client) -> Result<Vec<Grant>> {
 
 async fn mcp(client: &Client, action: McpCmd) -> Result<ExitCode> {
     match action {
+        McpCmd::Serve => unreachable!("handled in run"),
         McpCmd::Ls => {
             let nodes = nodes(client).await?;
             for grant in grants(client).await? {
