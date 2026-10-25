@@ -140,6 +140,11 @@ pub enum AppMsg {
         cols: u16,
         rows: u16,
     },
+    /// The title the shell on an SSH host set, as it arrived.
+    RemoteTitle {
+        node: NodeId,
+        title: String,
+    },
     /// Opens an SSH host's file panel.
     OpenFiles(NodeId),
     /// Opens an SSH host's monitor.
@@ -639,6 +644,13 @@ impl Component for App {
                     execute(&self.core, &sender, command);
                 }
             }
+            AppMsg::RemoteTitle { node, title } => {
+                if let Some(remote) = self.remotes.get_mut(&node) {
+                    // The server sets it.
+                    remote.title = Some(files::printable(&title));
+                    self.set_remote_tooltip(node);
+                }
+            }
             AppMsg::OpenFiles(id) => self.open_files(id, widgets, &sender),
             AppMsg::Files {
                 node,
@@ -1058,6 +1070,8 @@ impl App {
                     status.stale = true;
                 }
                 self.nodes.insert(id, node);
+                // Setting the tab's title replaced its tooltip.
+                self.set_remote_tooltip(id);
                 self.sidebar_dirty = true;
                 // Tunnel pages name the host they go through.
                 self.refresh_tunnels(sender);
@@ -1256,6 +1270,19 @@ impl App {
                 send_on_click(&button, sender, AppMsg::LoadView(id));
                 addons::render_message(page, &node.name, &error, vec![button]);
             }
+        }
+    }
+
+    /// An SSH host tab's tooltip: the host, and the title its shell set, as
+    /// a local terminal's tab shows its shell's.
+    fn set_remote_tooltip(&self, id: NodeId) {
+        let (Some(tab), Some(node)) = (self.tabs.get(&TabKey::Node(id)), self.nodes.get(&id))
+        else {
+            return;
+        };
+        if let Some(title) = self.remotes.get(&id).and_then(|r| r.title.as_ref()) {
+            let tooltip = format!("{}\n{title}", node.name);
+            tab.title.set_tooltip_text(Some(&tooltip));
         }
     }
 
@@ -1637,7 +1664,10 @@ impl App {
         let (icon, name) = (icon.as_str(), node.name.clone());
         if node.kind == SSH_HOST_KIND {
             let term = terminal::remote(
-                |_| {},
+                {
+                    let sender = sender.clone();
+                    move |title| sender.input(AppMsg::RemoteTitle { node: id, title })
+                },
                 {
                     let sender = sender.clone();
                     move |data| sender.input(AppMsg::RemoteInput { node: id, data })
@@ -1860,6 +1890,15 @@ impl App {
         tab_label.append(&gtk::Image::from_icon_name(icon));
         tab_label.append(&title);
         tab_label.append(&close);
+
+        // Middle-click closes a tab, as in browsers and other terminals.
+        let middle_click = gtk::GestureClick::new();
+        middle_click.set_button(gdk::BUTTON_MIDDLE);
+        middle_click.connect_released({
+            let sender = sender.clone();
+            move |_, _, _, _| sender.input(AppMsg::CloseTab(key))
+        });
+        tab_label.add_controller(middle_click);
 
         let notebook = &widgets.notebook;
         let index = notebook.append_page(&page, Some(&tab_label));
@@ -2552,10 +2591,13 @@ fn close_page(notebook: &gtk::Notebook, page: &gtk::Widget) {
 /// Long titles (a shell's working folder, say) are cut short with "…".
 /// Notebooks give tab labels only their minimum width, and an ellipsized
 /// label's minimum is just the "…", so the minimum is set to fit the text.
+/// A title that is cut short shows in full on hover.
 fn set_tab_title(label: &gtk::Label, title: &str) {
     const MAX_CHARS: usize = 24;
+    let chars = title.chars().count();
     label.set_label(title);
-    label.set_width_chars(title.chars().count().min(MAX_CHARS) as i32);
+    label.set_width_chars(chars.min(MAX_CHARS) as i32);
+    label.set_tooltip_text((chars > MAX_CHARS).then_some(title));
 }
 
 /// A tunnel's settings as the window shows them, for `set_autostart`:
@@ -2885,6 +2927,9 @@ fn add_shortcuts(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>)
         ("<Control>comma", AppMsg::ShowSettings),
         ("<Control>Page_Down", AppMsg::SwitchTab(1)),
         ("<Control>Page_Up", AppMsg::SwitchTab(-1)),
+        ("<Control>Tab", AppMsg::SwitchTab(1)),
+        // GTK matches this to the ISO_Left_Tab that Shift+Tab sends.
+        ("<Control><Shift>Tab", AppMsg::SwitchTab(-1)),
     ];
     for (trigger, message) in shortcuts {
         let sender = sender.clone();

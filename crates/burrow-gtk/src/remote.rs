@@ -26,6 +26,9 @@ pub struct Remote {
     /// and the end of its output arrive on different tasks, so the "closed"
     /// message waits until the last output is shown.
     pub ending: Ending,
+    /// The title the shell on the host set, cleaned for showing, for the
+    /// tab's tooltip.
+    pub title: Option<String>,
 }
 
 #[derive(Default)]
@@ -41,6 +44,7 @@ impl Remote {
             terminal,
             state: State::Starting,
             ending: Ending::default(),
+            title: None,
         }
     }
 
