@@ -11,8 +11,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use burrow_core::{
-    AddonInfo, Command, Core, Event, FormValue, Node, NodeId, NodePatch, Problem, Response,
-    SSH_HOST_KIND, SessionId, SessionState, View, Watcher,
+    AddonInfo, Command, Core, Event, FormValue, Node, NodeId, NodePatch, Problem, Prompt, Response,
+    SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId, SessionInfo, SessionKind, SessionState, TunnelShown,
+    View, Watcher,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
@@ -22,12 +23,14 @@ use vte4::TerminalExt;
 
 use crate::addons;
 use crate::dialogs;
+use crate::files::{self, Files};
 use crate::palette::{self, Item};
 use crate::remote::{self, Remote, Unclaimed};
 use crate::runtime::runtime;
 use crate::settings::{Theme, UiSettings};
 use crate::sidebar;
 use crate::terminal;
+use crate::tunnels;
 
 pub struct Init {
     pub core: Core,
@@ -42,6 +45,7 @@ const NOTICE_TIME: Duration = Duration::from_secs(6);
 pub enum NewKind {
     Folder,
     SshHost,
+    SshTunnel,
     /// A kind owned by an addon.
     Addon(String),
 }
@@ -53,8 +57,12 @@ pub enum AppMsg {
         nodes: Vec<Node>,
         problems: Vec<Problem>,
         addons: Vec<AddonInfo>,
+        sessions: Vec<SessionInfo>,
+        autostart: Vec<NodeId>,
     },
     CoreEvent(Event),
+    /// The core's sessions, looked up to find whose a prompt is.
+    SessionsListed(Vec<SessionInfo>),
     /// We missed events; reload everything.
     Resync,
     Failed(String),
@@ -114,6 +122,27 @@ pub enum AppMsg {
         cols: u16,
         rows: u16,
     },
+    /// Opens an SSH host's file panel.
+    OpenFiles(NodeId),
+    /// For the file panel of an SSH host.
+    Files {
+        node: NodeId,
+        msg: files::Msg,
+    },
+    StartTunnel(NodeId),
+    StopTunnel(NodeId),
+    /// Stops the tunnel and starts it again once it has closed.
+    RestartTunnel(NodeId),
+    EditTunnel(NodeId),
+    SetAutostart {
+        node: NodeId,
+        enabled: bool,
+    },
+    /// `set_autostart` failed, so the tunnel's checkbox is wrong.
+    AutostartFailed {
+        node: NodeId,
+        error: String,
+    },
     /// (Re)loads an addon node's view.
     LoadView(NodeId),
     ViewLoaded {
@@ -147,7 +176,18 @@ pub enum AppMsg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TabKey {
     Node(NodeId),
+    /// An SSH host's file panel. The host's own tab is its terminal.
+    Files(NodeId),
     Terminal(u32),
+}
+
+impl TabKey {
+    fn node(self) -> Option<NodeId> {
+        match self {
+            TabKey::Node(id) | TabKey::Files(id) => Some(id),
+            TabKey::Terminal(_) => None,
+        }
+    }
 }
 
 struct Tab {
@@ -173,9 +213,22 @@ pub struct App {
     next_terminal: u32,
     /// SSH host tabs, by node.
     remotes: HashMap<NodeId, Remote>,
+    /// File panels, by SSH host node.
+    files: HashMap<NodeId, Files>,
     /// Tabs drawn by addons: the box their view goes in, by node.
     views: HashMap<NodeId, gtk::Box>,
     unclaimed: Unclaimed,
+    /// Whether a `list_sessions` to place an unknown session's prompt is
+    /// on its way.
+    looking_up: bool,
+    /// Every tunnel that has run, by node, whether or not its tab is open.
+    tunnels: HashMap<NodeId, tunnels::Status>,
+    /// Tunnel tabs: the box their page is drawn in, by node.
+    tunnel_pages: HashMap<NodeId, gtk::Box>,
+    /// Tunnels to start again once their session has closed.
+    restarting: HashSet<NodeId>,
+    /// Tunnels that start with Burrow.
+    autostart: HashSet<NodeId>,
     /// Watches the config folder while the window is open.
     _watcher: Option<Watcher>,
     sidebar_dirty: bool,
@@ -218,6 +271,10 @@ impl Component for App {
         // missed.
         listen(&core, &sender);
         load(&core, &sender);
+        {
+            let _runtime = runtime().enter();
+            core.autostart();
+        }
         let (watcher, error) = {
             let _runtime = runtime().enter();
             match core.watch() {
@@ -244,8 +301,14 @@ impl Component for App {
             tabs: HashMap::new(),
             next_terminal: 1,
             remotes: HashMap::new(),
+            files: HashMap::new(),
             views: HashMap::new(),
             unclaimed: Unclaimed::default(),
+            looking_up: false,
+            tunnels: HashMap::new(),
+            tunnel_pages: HashMap::new(),
+            restarting: HashSet::new(),
+            autostart: HashSet::new(),
             _watcher: watcher,
             sidebar_dirty: false,
         };
@@ -266,17 +329,27 @@ impl Component for App {
                 nodes,
                 problems,
                 addons,
+                sessions,
+                autostart,
             } => {
                 self.nodes = nodes.into_iter().map(|n| (n.id, n)).collect();
                 self.problems = problems;
+                self.autostart = autostart.into_iter().collect();
                 self.set_addons(addons, widgets, &sender);
+                // Events may have been missed, so a tunnel that isn't
+                // running any more has stopped.
+                for status in self.tunnels.values_mut() {
+                    if let Some(session) = status.running()
+                        && !sessions.iter().any(|s| s.session == session)
+                    {
+                        status.session = Some((session, SessionState::Closed { error: None }));
+                    }
+                }
+                self.take_sessions(sessions, window, &sender);
                 let gone: Vec<TabKey> = self
                     .tabs
                     .keys()
-                    .filter(|key| match key {
-                        TabKey::Node(id) => !self.nodes.contains_key(id),
-                        TabKey::Terminal(_) => false,
-                    })
+                    .filter(|key| key.node().is_some_and(|id| !self.nodes.contains_key(&id)))
                     .copied()
                     .collect();
                 for key in gone {
@@ -288,6 +361,10 @@ impl Component for App {
                 event @ (Event::SessionChanged { .. } | Event::PromptRequested { .. }),
             ) => self.session_event(event, window, &sender),
             AppMsg::CoreEvent(event) => self.apply_event(event, widgets, &sender),
+            AppMsg::SessionsListed(sessions) => {
+                self.looking_up = false;
+                self.take_sessions(sessions, window, &sender);
+            }
             AppMsg::Resync => load(&self.core, &sender),
             AppMsg::Failed(error) => self.error = Some(error),
 
@@ -423,6 +500,64 @@ impl Component for App {
                     execute(&self.core, &sender, command);
                 }
             }
+            AppMsg::OpenFiles(id) => self.open_files(id, widgets, &sender),
+            AppMsg::Files {
+                node,
+                msg: files::Msg::Started(session),
+            } => match self.files.get_mut(&node) {
+                Some(panel) if panel.state == remote::State::Starting => {
+                    panel.state = remote::State::Running(session);
+                    for event in self.unclaimed.claim(session) {
+                        self.session_event(event, window, &sender);
+                    }
+                }
+                // The tab was closed while the session started.
+                _ => execute(&self.core, &sender, Command::CloseSession { session }),
+            },
+            AppMsg::Files { node, msg } => {
+                if let Some(panel) = self.files.get_mut(&node) {
+                    panel.update(msg, &self.core, window, &sender);
+                }
+            }
+            AppMsg::StartTunnel(node) => {
+                execute(&self.core, &sender, Command::StartTunnel { node });
+            }
+            AppMsg::StopTunnel(node) => {
+                self.restarting.remove(&node);
+                if let Some(session) = self.tunnels.get(&node).and_then(|s| s.running()) {
+                    execute(&self.core, &sender, Command::CloseSession { session });
+                }
+            }
+            AppMsg::RestartTunnel(node) => {
+                if let Some(session) = self.tunnels.get(&node).and_then(|s| s.running()) {
+                    self.restarting.insert(node);
+                    execute(&self.core, &sender, Command::CloseSession { session });
+                }
+            }
+            AppMsg::EditTunnel(node) => self.edit_tunnel(Some(node), None, window, &sender),
+            AppMsg::SetAutostart { node, enabled } => {
+                // What the tab shows: it is redrawn on every change.
+                let expect = self
+                    .nodes
+                    .get(&node)
+                    .and_then(|n| shown(&self.nodes, &n.props));
+                let (core, input) = (self.core.clone(), sender.input_sender().clone());
+                runtime().spawn(async move {
+                    let command = Command::SetAutostart {
+                        node,
+                        enabled,
+                        expect,
+                    };
+                    if let Err(e) = core.execute(command).await {
+                        let error = e.to_string();
+                        let _ = input.send(AppMsg::AutostartFailed { node, error });
+                    }
+                });
+            }
+            AppMsg::AutostartFailed { node, error } => {
+                self.error = Some(error);
+                self.refresh_tunnel(node, &sender);
+            }
             AppMsg::LoadView(id) => self.load_view(id, &sender),
             AppMsg::ViewLoaded { node, result } => self.show_view(node, result, &sender),
             AppMsg::Invoke {
@@ -532,8 +667,18 @@ impl Component for App {
             // Rebuilding destroys the focused row; remember whether the
             // sidebar had focus so keyboard use (arrows, Delete) carries on.
             let had_focus = widgets.list.focus_child().is_some();
-            widgets.row_ids =
-                sidebar::rebuild(&widgets.list, &self.nodes, &self.expanded, &self.icons());
+            let running: HashSet<NodeId> = self
+                .tunnels
+                .iter()
+                .filter(|(_, status)| status.is_up())
+                .map(|(id, _)| *id)
+                .collect();
+            let look = sidebar::Look {
+                expanded: &self.expanded,
+                icons: &self.icons(),
+                running: &running,
+            };
+            widgets.row_ids = sidebar::rebuild(&widgets.list, &self.nodes, &look);
             let row = selection
                 .and_then(|id| widgets.row_ids.iter().position(|&r| r == id))
                 .and_then(|index| widgets.list.row_at_index(index as i32));
@@ -569,14 +714,31 @@ impl App {
             }
             Event::NodeUpdated { node } => {
                 let id = node.id;
+                if let Some(tab) = self.tabs.get(&TabKey::Files(id)) {
+                    set_tab_title(&tab.title, &files_title(&node.name));
+                }
                 if let Some(tab) = self.tabs.get(&TabKey::Node(id)) {
                     set_tab_title(&tab.title, &node.name);
-                    if let Some(page) = tab.page.downcast_ref::<gtk::Box>() {
+                    if !self.tunnel_pages.contains_key(&id)
+                        && let Some(page) = tab.page.downcast_ref::<gtk::Box>()
+                    {
                         fill_page(page, &node, &self.nodes);
                     }
                 }
+                // A running tunnel keeps the settings it started with.
+                if let Some(status) = self.tunnels.get_mut(&id)
+                    && status.running().is_some()
+                    && self
+                        .nodes
+                        .get(&id)
+                        .is_some_and(|old| old.props != node.props)
+                {
+                    status.stale = true;
+                }
                 self.nodes.insert(id, node);
                 self.sidebar_dirty = true;
+                // Tunnel pages name the host they go through.
+                self.refresh_tunnels(sender);
                 // The addon draws from the node, so ask it again.
                 if self.views.contains_key(&id) {
                     self.load_view(id, sender);
@@ -586,14 +748,38 @@ impl App {
                 self.nodes.remove(&id);
                 self.views.remove(&id);
                 self.expanded.remove(&id);
+                self.tunnels.remove(&id);
+                self.restarting.remove(&id);
                 self.close_tab(TabKey::Node(id), widgets);
+                self.close_tab(TabKey::Files(id), widgets);
                 self.sidebar_dirty = true;
+                self.refresh_tunnels(sender);
             }
             Event::ProblemsChanged { problems } => self.problems = problems,
             // Handled by `session_event`, which needs the window.
             Event::SessionChanged { .. } | Event::PromptRequested { .. } => {}
             Event::AddonsChanged { addons } => self.set_addons(addons, widgets, sender),
             Event::ViewChanged { node, view } => self.show_view(node, Ok(view), sender),
+            Event::AutostartChanged { nodes } => {
+                self.autostart = nodes.into_iter().collect();
+                self.refresh_tunnels(sender);
+            }
+            Event::TransferChanged {
+                transfer,
+                session,
+                state,
+            } => {
+                // A transfer's last events can come after its session
+                // ended, so the panel showing it comes first.
+                let running = remote::State::Running(session);
+                let panel = self
+                    .files
+                    .values_mut()
+                    .find(|p| p.has_transfer(transfer) || p.state == running);
+                if let Some(panel) = panel {
+                    panel.transfer_changed(transfer, &state, &self.core, sender);
+                }
+            }
         }
     }
 
@@ -643,6 +829,7 @@ impl App {
         let mut kinds = vec![
             ("folder".to_string(), NewKind::Folder),
             ("SSH host".to_string(), NewKind::SshHost),
+            ("SSH tunnel".to_string(), NewKind::SshTunnel),
         ];
         for addon in self.addons.iter().filter(|a| addons::usable(a)) {
             for kind in &addon.kinds {
@@ -732,11 +919,46 @@ impl App {
             }
             _ => return,
         };
+        // A tunnel's events name the tunnel, so they need no claiming.
+        if let Event::SessionChanged { node, state, .. } = &event
+            && self
+                .nodes
+                .get(node)
+                .is_some_and(|n| n.kind == SSH_TUNNEL_KIND)
+        {
+            self.tunnel_changed(*node, session, state.clone(), sender);
+            return;
+        }
+        if let Event::PromptRequested { prompt, .. } = &event
+            && let Some(node) = self.tunnel_of(session)
+        {
+            let prompt = self.for_tunnel(node, prompt);
+            self.ask(session, &prompt, window, sender);
+            return;
+        }
+        let running = remote::State::Running(session);
+        if let Some(panel) = self.files.values_mut().find(|p| p.state == running) {
+            match event {
+                Event::SessionChanged { state, .. } => {
+                    panel.session_changed(&state, &self.core, sender)
+                }
+                Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
+                _ => {}
+            }
+            return;
+        }
         let Some(remote) = self
             .remotes
             .values_mut()
             .find(|r| r.state == remote::State::Running(session))
         else {
+            // A prompt from a session nobody here started, such as a
+            // tunnel that started with Burrow before its first event
+            // arrived. Look up whose it is.
+            if matches!(event, Event::PromptRequested { .. }) && !self.looking_up {
+                self.looking_up = true;
+                list_sessions(&self.core, sender);
+            }
             self.unclaimed.hold(session, event);
             return;
         };
@@ -750,20 +972,206 @@ impl App {
                     remote.terminal.feed(text.as_bytes());
                 }
             }
-            Event::PromptRequested { prompt, .. } => {
-                let (core, sender) = (self.core.clone(), sender.clone());
-                let id = prompt.id;
-                dialogs::answer(window, &prompt, move |answer| {
-                    let command = Command::AnswerPrompt {
-                        session,
-                        prompt: id,
-                        answer,
-                    };
-                    execute(&core, &sender, command);
-                });
-            }
+            Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
             _ => {}
         }
+    }
+
+    fn ask(
+        &self,
+        session: SessionId,
+        prompt: &Prompt,
+        window: &gtk::ApplicationWindow,
+        sender: &ComponentSender<Self>,
+    ) {
+        let (core, sender) = (self.core.clone(), sender.clone());
+        let id = prompt.id;
+        dialogs::answer(window, prompt, move |answer| {
+            let command = Command::AnswerPrompt {
+                session,
+                prompt: id,
+                answer,
+            };
+            execute(&core, &sender, command);
+        });
+    }
+
+    fn tunnel_of(&self, session: SessionId) -> Option<NodeId> {
+        self.tunnels
+            .iter()
+            .find(|(_, status)| status.running() == Some(session))
+            .map(|(id, _)| *id)
+    }
+
+    /// A tunnel can ask while its tab is closed, or when it started with
+    /// Burrow, so its questions say which tunnel is asking.
+    fn for_tunnel(&self, node: NodeId, prompt: &Prompt) -> Prompt {
+        let name = self
+            .nodes
+            .get(&node)
+            .map_or("a tunnel", |n| n.name.as_str());
+        Prompt {
+            message: format!("For the tunnel “{name}”.\n\n{}", prompt.message),
+            ..prompt.clone()
+        }
+    }
+
+    /// Takes the core's list of sessions: tunnels found there are tracked,
+    /// and prompts they asked before we knew them are shown.
+    fn take_sessions(
+        &mut self,
+        sessions: Vec<SessionInfo>,
+        window: &gtk::ApplicationWindow,
+        sender: &ComponentSender<Self>,
+    ) {
+        for info in sessions {
+            if info.kind != SessionKind::Tunnel {
+                continue;
+            }
+            let status = self.tunnels.entry(info.node).or_default();
+            // Events already seen for this session are newer than the list.
+            if status
+                .session
+                .as_ref()
+                .is_none_or(|(s, _)| *s < info.session)
+            {
+                status.session = Some((info.session, info.state));
+                status.stale = false;
+            }
+            for event in self.unclaimed.claim(info.session) {
+                if let Event::PromptRequested { prompt, .. } = event {
+                    let prompt = self.for_tunnel(info.node, &prompt);
+                    self.ask(info.session, &prompt, window, sender);
+                }
+            }
+        }
+        self.sidebar_dirty = true;
+        self.refresh_tunnels(sender);
+    }
+
+    fn tunnel_changed(
+        &mut self,
+        node: NodeId,
+        session: SessionId,
+        state: SessionState,
+        sender: &ComponentSender<Self>,
+    ) {
+        let status = self.tunnels.entry(node).or_default();
+        match &status.session {
+            // A late event from a session that has been replaced.
+            Some((current, _)) if session < *current => return,
+            Some((current, _)) if session == *current => {}
+            _ => status.stale = false,
+        }
+        let closed = matches!(state, SessionState::Closed { .. });
+        status.session = Some((session, state));
+        if closed && self.restarting.remove(&node) {
+            execute(&self.core, sender, Command::StartTunnel { node });
+        }
+        self.sidebar_dirty = true;
+        self.refresh_tunnel(node, sender);
+    }
+
+    fn refresh_tunnels(&self, sender: &ComponentSender<Self>) {
+        for &id in self.tunnel_pages.keys() {
+            self.refresh_tunnel(id, sender);
+        }
+    }
+
+    /// Draws a tunnel's tab again, if it is open.
+    fn refresh_tunnel(&self, id: NodeId, sender: &ComponentSender<Self>) {
+        let (Some(page), Some(node)) = (self.tunnel_pages.get(&id), self.nodes.get(&id)) else {
+            return;
+        };
+        let send = |message: AppMsg| -> Rc<dyn Fn()> {
+            let sender = sender.clone();
+            Rc::new(move || sender.input(message.clone()))
+        };
+        let actions = tunnels::Actions {
+            start: send(AppMsg::StartTunnel(id)),
+            stop: send(AppMsg::StopTunnel(id)),
+            restart: send(AppMsg::RestartTunnel(id)),
+            edit: send(AppMsg::EditTunnel(id)),
+            set_autostart: {
+                let sender = sender.clone();
+                Rc::new(move |enabled| sender.input(AppMsg::SetAutostart { node: id, enabled }))
+            },
+        };
+        let status = self.tunnels.get(&id).cloned().unwrap_or_default();
+        let autostart = self.autostart.contains(&id);
+        tunnels::fill(page, node, &self.nodes, &status, autostart, &actions);
+    }
+
+    /// Creates a tunnel in `parent`, or edits the tunnel `id`.
+    fn edit_tunnel(
+        &self,
+        id: Option<NodeId>,
+        parent: Option<NodeId>,
+        window: &gtk::ApplicationWindow,
+        sender: &ComponentSender<Self>,
+    ) {
+        let node = id.and_then(|id| self.nodes.get(&id));
+        if id.is_some() && node.is_none() {
+            return;
+        }
+        let mut hosts: Vec<(NodeId, String)> = self
+            .nodes
+            .values()
+            .filter(|n| n.kind == SSH_HOST_KIND)
+            .map(|n| (n.id, n.name.clone()))
+            .collect();
+        hosts.sort_by_key(|(id, name)| (name.to_lowercase(), *id));
+        // Starting with Burrow is pinned to the settings, so a change
+        // withdraws it. A change made here is the user's own, so it is
+        // asked for again.
+        let autostart = id.is_some_and(|id| self.autostart.contains(&id));
+        // The hosts as they were when the dialog opened.
+        let host_nodes: HashMap<NodeId, Node> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.kind == SSH_HOST_KIND)
+            .map(|(id, n)| (*id, n.clone()))
+            .collect();
+        let (core, input) = (self.core.clone(), sender.input_sender().clone());
+        tunnels::edit(window, node, hosts, move |name, props| {
+            let saved = shown(&host_nodes, &props);
+            let command = match id {
+                Some(id) => Command::UpdateNode {
+                    id,
+                    patch: NodePatch {
+                        name: Some(name),
+                        props: Some(props),
+                        ..Default::default()
+                    },
+                },
+                None => Command::CreateNode {
+                    parent,
+                    kind: SSH_TUNNEL_KIND.into(),
+                    name,
+                    color: None,
+                    props,
+                },
+            };
+            let (core, input) = (core.clone(), input.clone());
+            runtime().spawn(async move {
+                let result = match core.execute(command).await {
+                    // Only the settings saved here: a file that changed
+                    // meanwhile makes this fail rather than be approved.
+                    Ok(Response::Node { node }) if autostart => {
+                        let command = Command::SetAutostart {
+                            node: node.id,
+                            enabled: true,
+                            expect: saved,
+                        };
+                        core.execute(command).await
+                    }
+                    other => other,
+                };
+                if let Err(e) = result {
+                    let _ = input.send(AppMsg::Failed(e.to_string()));
+                }
+            });
+        });
     }
 
     fn activate(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
@@ -831,6 +1239,14 @@ impl App {
             self.remotes.insert(id, Remote::new(term));
             return;
         }
+        if node.kind == SSH_TUNNEL_KIND {
+            let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            page.add_css_class("tunnel-view");
+            self.add_tab(key, page.clone().upcast(), icon, &name, widgets, sender);
+            self.tunnel_pages.insert(id, page);
+            self.refresh_tunnel(id, sender);
+            return;
+        }
         if addons::owner(&self.addons, &node.kind).is_some() {
             let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
             page.add_css_class("addon-view");
@@ -846,6 +1262,25 @@ impl App {
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
         fill_page(&page, node, &self.nodes);
         self.add_tab(key, page.upcast(), icon, &name, widgets, sender);
+    }
+
+    fn open_files(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
+        let key = TabKey::Files(id);
+        if let Some(tab) = self.tabs.get(&key) {
+            if let Some(index) = widgets.notebook.page_num(&tab.page) {
+                widgets.notebook.set_current_page(Some(index));
+            }
+            return;
+        }
+        let Some(node) = self.nodes.get(&id).filter(|n| n.kind == SSH_HOST_KIND) else {
+            return;
+        };
+        let title = files_title(&node.name);
+        let panel = Files::new(id, sender);
+        let page = panel.page.clone().upcast();
+        self.add_tab(key, page, "folder-remote-symbolic", &title, widgets, sender);
+        files::start(&self.core, id, sender);
+        self.files.insert(id, panel);
     }
 
     fn open_terminal(
@@ -918,14 +1353,16 @@ impl App {
         }
         if let TabKey::Node(id) = key {
             self.views.remove(&id);
+            self.tunnel_pages.remove(&id);
         }
-        // A session still starting is closed when its id arrives.
-        if let TabKey::Node(id) = key
-            && let Some(Remote {
-                state: remote::State::Running(session),
-                ..
-            }) = self.remotes.remove(&id)
-        {
+        // A session still starting is closed when its id arrives. Closing
+        // a file panel's session stops its transfers too.
+        let state = match key {
+            TabKey::Node(id) => self.remotes.remove(&id).map(|r| r.state),
+            TabKey::Files(id) => self.files.remove(&id).map(|f| f.state),
+            TabKey::Terminal(_) => None,
+        };
+        if let Some(remote::State::Running(session)) = state {
             let core = self.core.clone();
             runtime().spawn(async move {
                 let _ = core.execute(Command::CloseSession { session }).await;
@@ -957,6 +1394,7 @@ impl App {
                 "New SSH host".to_string(),
                 "Host alias (as in ~/.ssh/config)",
             ),
+            NewKind::SshTunnel => return self.edit_tunnel(None, parent, window, sender),
             NewKind::Addon(kind) => {
                 let label = self
                     .addons
@@ -977,6 +1415,7 @@ impl App {
                     ("ssh-host", props)
                 }
                 NewKind::Addon(kind) => (kind.as_str(), toml::Table::new()),
+                NewKind::SshTunnel => unreachable!("tunnels have their own dialog"),
             };
             execute(
                 &core,
@@ -1057,6 +1496,17 @@ impl App {
             }
             Some(node) => {
                 entries.push(("Open".into(), AppMsg::Open(node.id)));
+                if node.kind == SSH_HOST_KIND {
+                    entries.push(("Browse files".into(), AppMsg::OpenFiles(node.id)));
+                }
+                if node.kind == SSH_TUNNEL_KIND {
+                    let running = self.tunnels.get(&node.id).and_then(|s| s.running());
+                    entries.push(match running {
+                        Some(_) => ("Stop".into(), AppMsg::StopTunnel(node.id)),
+                        None => ("Start".into(), AppMsg::StartTunnel(node.id)),
+                    });
+                    entries.push(("Edit…".into(), AppMsg::EditTunnel(node.id)));
+                }
                 for addon in self.addons.iter().filter(|a| addons::usable(a)) {
                     let actions = addon.actions.iter();
                     for action in actions.filter(|a| a.kinds.contains(&node.kind)) {
@@ -1127,6 +1577,16 @@ impl App {
         }));
         let mut nodes: Vec<&Node> = self.nodes.values().collect();
         nodes.sort_by_key(|n| (n.is_folder(), n.name.to_lowercase()));
+        items.extend(
+            nodes
+                .iter()
+                .filter(|n| n.kind == SSH_HOST_KIND)
+                .map(|node| Item {
+                    title: format!("Browse files: {}", node.name),
+                    subtitle: sidebar::location(&self.nodes, node),
+                    message: AppMsg::OpenFiles(node.id),
+                }),
+        );
         items.extend(nodes.into_iter().map(|node| {
             Item {
                 title: node.name.clone(),
@@ -1216,7 +1676,8 @@ fn execute(core: &Core, sender: &ComponentSender<App>, command: Command) {
     });
 }
 
-/// Loads the full node list, problems and addons.
+/// Loads the full node list, problems, addons, sessions and autostart
+/// tunnels.
 fn load(core: &Core, sender: &ComponentSender<App>) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
@@ -1233,14 +1694,36 @@ fn load(core: &Core, sender: &ComponentSender<App>) {
                 Response::Addons { addons } => addons,
                 _ => Vec::new(),
             };
+            let sessions = match core.execute(Command::ListSessions).await? {
+                Response::Sessions { sessions } => sessions,
+                _ => Vec::new(),
+            };
+            let autostart = match core.execute(Command::ListAutostart).await? {
+                Response::Autostart { nodes } => nodes,
+                _ => Vec::new(),
+            };
             Ok::<_, burrow_core::Error>(AppMsg::Loaded {
                 nodes,
                 problems,
                 addons,
+                sessions,
+                autostart,
             })
         }
         .await;
         let _ = input.send(result.unwrap_or_else(|e| AppMsg::Failed(e.to_string())));
+    });
+}
+
+/// Looks up every running session, for [`AppMsg::SessionsListed`].
+fn list_sessions(core: &Core, sender: &ComponentSender<App>) {
+    let (core, input) = (core.clone(), sender.input_sender().clone());
+    runtime().spawn(async move {
+        let sessions = match core.execute(Command::ListSessions).await {
+            Ok(Response::Sessions { sessions }) => sessions,
+            _ => Vec::new(),
+        };
+        let _ = input.send(AppMsg::SessionsListed(sessions));
     });
 }
 
@@ -1280,6 +1763,23 @@ fn set_tab_title(label: &gtk::Label, title: &str) {
     const MAX_CHARS: usize = 24;
     label.set_label(title);
     label.set_width_chars(title.chars().count().min(MAX_CHARS) as i32);
+}
+
+/// A tunnel's settings as the window shows them, for `set_autostart`:
+/// `props` and the host they go through, as found in `nodes`.
+fn shown(nodes: &HashMap<NodeId, Node>, props: &toml::Table) -> Option<TunnelShown> {
+    let via = props.get("via")?.as_str()?.parse().ok().map(NodeId)?;
+    let host = nodes.get(&via)?;
+    Some(TunnelShown {
+        props: props.clone(),
+        host_name: host.name.clone(),
+        host_props: host.props.clone(),
+    })
+}
+
+/// The title of an SSH host's file panel tab.
+fn files_title(host: &str) -> String {
+    format!("{host} files")
 }
 
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {

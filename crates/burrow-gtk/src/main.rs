@@ -4,12 +4,14 @@
 mod addons;
 mod app;
 mod dialogs;
+mod files;
 mod palette;
 mod remote;
 mod runtime;
 mod settings;
 mod sidebar;
 mod terminal;
+mod tunnels;
 
 use std::path::PathBuf;
 

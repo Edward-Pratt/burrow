@@ -44,8 +44,23 @@
   background: alpha(currentColor, 0.05);
 }
 
-.addon-view {
+.addon-view,
+.tunnel-view,
+.files-view {
   margin: 24px;
+}
+
+.running,
+.running-badge {
+  color: #26a269;
+}
+
+.running-badge {
+  font-size: smaller;
+}
+
+.error-text {
+  color: #e01b24;
 }
 
 .warning-text {
@@ -92,4 +107,13 @@
 
 popover.menu button {
   padding: 4px 12px;
+}
+
+.file-list row {
+  padding: 2px 6px;
+}
+
+.transfer progressbar trough,
+.transfer progressbar progress {
+  min-height: 6px;
 }

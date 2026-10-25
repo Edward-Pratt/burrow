@@ -49,6 +49,10 @@ pub enum Error {
     #[error("addon {id}: {message}")]
     Addon { id: String, message: String },
 
+    /// A request the SSH or SFTP server refused or failed.
+    #[error("{0}")]
+    Remote(String),
+
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 

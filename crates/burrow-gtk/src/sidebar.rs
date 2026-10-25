@@ -35,51 +35,50 @@ pub fn icon_name<'a>(node: &Node, expanded: bool, icons: &'a HashMap<String, Str
         "folder" if expanded => "folder-open-symbolic",
         "folder" => "folder-symbolic",
         "ssh-host" => "network-server-symbolic",
+        "ssh-tunnel" => "preferences-system-network-proxy-symbolic",
         kind => icons
             .get(kind)
             .map_or("text-x-generic-symbolic", String::as_str),
     }
 }
 
+/// What the rows are drawn from, besides the nodes.
+pub struct Look<'a> {
+    pub expanded: &'a HashSet<NodeId>,
+    /// Addon kinds and the icons their addons chose.
+    pub icons: &'a HashMap<String, String>,
+    /// Nodes marked as running, such as connected tunnels.
+    pub running: &'a HashSet<NodeId>,
+}
+
 /// Clears `list` and fills it with the visible rows. Returns the node id of
 /// each row, in order, so row indexes can be mapped back to nodes.
-pub fn rebuild(
-    list: &gtk::ListBox,
-    nodes: &HashMap<NodeId, Node>,
-    expanded: &HashSet<NodeId>,
-    icons: &HashMap<String, String>,
-) -> Vec<NodeId> {
+pub fn rebuild(list: &gtk::ListBox, nodes: &HashMap<NodeId, Node>, look: &Look) -> Vec<NodeId> {
     list.remove_all();
     let mut ids = Vec::new();
-    add_rows(list, nodes, expanded, icons, None, 0, &mut ids);
+    add_rows(list, nodes, look, None, 0, &mut ids);
     ids
 }
 
 fn add_rows(
     list: &gtk::ListBox,
     nodes: &HashMap<NodeId, Node>,
-    expanded: &HashSet<NodeId>,
-    icons: &HashMap<String, String>,
+    look: &Look,
     parent: Option<NodeId>,
     depth: i32,
     ids: &mut Vec<NodeId>,
 ) {
     for node in children(nodes, parent) {
-        let is_open = expanded.contains(&node.id);
-        list.append(&row(node, depth, is_open, icons));
+        let is_open = look.expanded.contains(&node.id);
+        list.append(&row(node, depth, is_open, look));
         ids.push(node.id);
         if node.is_folder() && is_open {
-            add_rows(list, nodes, expanded, icons, Some(node.id), depth + 1, ids);
+            add_rows(list, nodes, look, Some(node.id), depth + 1, ids);
         }
     }
 }
 
-fn row(
-    node: &Node,
-    depth: i32,
-    expanded: bool,
-    icons: &HashMap<String, String>,
-) -> gtk::ListBoxRow {
+fn row(node: &Node, depth: i32, expanded: bool, look: &Look) -> gtk::ListBoxRow {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     content.set_margin_start(depth * INDENT);
 
@@ -93,7 +92,7 @@ fn row(
     arrow.set_opacity(if node.is_folder() { 0.7 } else { 0.0 });
     content.append(&arrow);
     content.append(&gtk::Image::from_icon_name(icon_name(
-        node, expanded, icons,
+        node, expanded, look.icons,
     )));
 
     let name = gtk::Label::new(Some(&node.name));
@@ -108,6 +107,11 @@ fn row(
         let dot = gtk::Label::new(None);
         dot.set_markup(&format!("<span foreground=\"{color}\">●</span>"));
         content.append(&dot);
+    }
+    if look.running.contains(&node.id) {
+        let running = gtk::Label::new(Some("running"));
+        running.add_css_class("running-badge");
+        content.append(&running);
     }
 
     let row = gtk::ListBoxRow::new();
