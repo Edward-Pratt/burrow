@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use burrow_core::ipc::{self, Client, Role};
 use burrow_core::{
@@ -70,6 +70,23 @@ const BUILT_IN_KINDS: [(&str, &str, NewKind); 4] = [
     (SSH_TUNNEL_KIND, "SSH tunnel", NewKind::SshTunnel),
     (POSTGRES_KIND, "PostgreSQL database", NewKind::Database),
 ];
+
+impl NewKind {
+    /// The kind of node it creates.
+    fn kind(&self) -> &str {
+        match self {
+            NewKind::Folder => FOLDER_KIND,
+            NewKind::SshHost => SSH_HOST_KIND,
+            NewKind::SshTunnel => SSH_TUNNEL_KIND,
+            NewKind::Database => POSTGRES_KIND,
+            NewKind::Addon(kind) => kind,
+        }
+    }
+}
+
+/// How long after "New …" a node of that kind, created in that folder,
+/// counts as the one the user made. Its dialog can stay open a while.
+const NEW_NODE_WAIT: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug)]
 pub enum AppMsg {
@@ -357,6 +374,10 @@ pub struct App {
     /// another client answers first. A `RefCell` because prompts are asked
     /// while a tab's panel is borrowed.
     prompts: RefCell<HashMap<(SessionId, u32), dialogs::Dismiss>>,
+    /// The kind and folder "New …" was last asked for, and when, so the
+    /// node it makes is selected when it arrives. The SSH host dialog sends
+    /// its command itself, so the reply can't be waited for instead.
+    creating: Option<(String, Option<NodeId>, Instant)>,
 }
 
 pub struct Widgets {
@@ -463,6 +484,7 @@ impl Component for App {
             monitoring: HashSet::new(),
             alerts: Vec::new(),
             prompts: RefCell::default(),
+            creating: None,
         };
         if let Some(error) = stale_daemon(&model.core) {
             model.fail(error);
@@ -524,6 +546,7 @@ impl Component for App {
             AppMsg::ContextMenu { node, x, y } => self.context_menu(node, x, y, widgets, &sender),
             AppMsg::New { kind, parent } => {
                 let parent = parent.unwrap_or_else(|| self.selection_folder(widgets));
+                self.creating = Some((kind.kind().to_string(), parent, Instant::now()));
                 self.new_node(kind, parent, window, &sender);
             }
             AppMsg::Open(id) => self.open_tab(id, widgets, &sender),
@@ -1006,6 +1029,18 @@ impl App {
         sender.input(AppMsg::Notice("Connected to burrowd again".to_string()));
     }
 
+    /// Whether `node` is the one "New …" in this window was asked for.
+    fn made_here(&mut self, node: &Node) -> bool {
+        let Some((kind, parent, since)) = &self.creating else {
+            return false;
+        };
+        let made = *kind == node.kind && *parent == node.parent && since.elapsed() < NEW_NODE_WAIT;
+        if made {
+            self.creating = None;
+        }
+        made
+    }
+
     /// The nodes the sidebar marks as running: tunnels that are up.
     fn running(&self) -> HashSet<NodeId> {
         self.tunnels
@@ -1019,8 +1054,11 @@ impl App {
         match event {
             Event::NodeCreated { node } => {
                 widgets.sidebar.insert(&node, &self.icons());
-                // Show where the new node went.
-                if let Some(parent) = node.parent {
+                if self.made_here(&node) {
+                    widgets.sidebar.show_new(node.id);
+                } else if let Some(parent) = node.parent {
+                    // Show where a node made elsewhere went, without taking
+                    // the selection.
                     widgets.sidebar.expand(parent);
                 }
                 self.nodes.insert(node.id, node);

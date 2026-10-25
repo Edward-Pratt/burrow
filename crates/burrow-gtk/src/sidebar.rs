@@ -252,6 +252,8 @@ pub struct Sidebar {
     view: gtk::ListView,
     selection: gtk::SingleSelection,
     tree: gtk::TreeListModel,
+    /// Shown over the list while there are no nodes.
+    placeholder: gtk::Label,
     state: Rc<State>,
 }
 
@@ -291,10 +293,30 @@ impl Sidebar {
             .vexpand(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
+        let placeholder = gtk::Label::new(Some("No hosts yet.\nPress + or right-click here."));
+        placeholder.set_wrap(true);
+        placeholder.set_justify(gtk::Justification::Center);
+        placeholder.set_halign(gtk::Align::Center);
+        placeholder.set_valign(gtk::Align::Center);
+        placeholder.set_margin_start(24);
+        placeholder.set_margin_end(24);
+        placeholder.add_css_class("dim");
+        // Clicks go through to the list, whose menu offers "New …".
+        placeholder.set_can_target(false);
+        // Hidden until the first load, so it doesn't flash before the
+        // nodes arrive.
+        placeholder.set_visible(false);
+        state.store(None).connect_items_changed({
+            let placeholder = placeholder.clone();
+            move |store, _, _, _| placeholder.set_visible(store.n_items() == 0)
+        });
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&scroller));
+        overlay.add_overlay(&placeholder);
         let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
         pane.add_css_class("sidebar");
         pane.set_size_request(240, -1);
-        pane.append(&scroller);
+        pane.append(&overlay);
 
         let right_click = gtk::GestureClick::new();
         right_click.set_button(gdk::BUTTON_SECONDARY);
@@ -327,6 +349,7 @@ impl Sidebar {
             view,
             selection,
             tree,
+            placeholder,
             state,
         };
         sidebar.add_keys(sender);
@@ -426,6 +449,7 @@ impl Sidebar {
             self.state.expanded.borrow_mut().retain(is_folder);
         });
         self.sync_expansion();
+        self.placeholder.set_visible(nodes.is_empty());
     }
 
     /// Adds a node the core created.
@@ -560,9 +584,15 @@ impl Sidebar {
         }
     }
 
+    /// Selects a node the user just created and scrolls to it, opening its
+    /// folders. The focus moves with the selection if the sidebar has it.
+    pub fn show_new(&self, id: NodeId) {
+        self.select(id, self.has_focus());
+    }
+
     /// Selects a node and scrolls to it, opening its folders. `focus` moves
     /// the keyboard focus to its row too.
-    pub fn select(&self, id: NodeId, focus: bool) {
+    fn select(&self, id: NodeId, focus: bool) {
         self.reveal(id);
         let Some(row) = self.row_for(id) else { return };
         let mut flags = gtk::ListScrollFlags::SELECT;
