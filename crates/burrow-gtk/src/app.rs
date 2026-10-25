@@ -18,7 +18,7 @@ use burrow_core::{
     SessionInfo, SessionKind, SessionState, TunnelShown, View,
 };
 use relm4::gtk::prelude::*;
-use relm4::gtk::{gdk, gio, glib};
+use relm4::gtk::{gdk, gio, glib, graphene};
 use relm4::{Component, ComponentParts, ComponentSender, gtk};
 use tokio::sync::broadcast::error::RecvError;
 use vte4::TerminalExt;
@@ -1948,10 +1948,21 @@ impl App {
             entries.push(("Delete…".into(), AppMsg::Delete(node.id)));
         }
         let popover = menu_popover(entries, sender);
-        popover.set_parent(&widgets.list);
-        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        // Parented to the pane, not the list: the list is rebuilt wholesale
+        // on every change, and `ListBox::remove_all` never returns while a
+        // child that isn't a row is parented to it. A rebuild can land while
+        // the menu is open ("Open" reveals the node's folders, and events
+        // arrive at any time), and the window would hang.
+        let point = graphene::Point::new(x as f32, y as f32);
+        let point = widgets
+            .list
+            .compute_point(&widgets.sidebar_pane, &point)
+            .unwrap_or(point);
+        popover.set_parent(&widgets.sidebar_pane);
+        let (x, y) = (point.x() as i32, point.y() as i32);
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x, y, 1, 1)));
         popover.connect_closed(|popover| {
-            // Unparent after the close animation's signal returns.
+            // Unparented once the signal has returned, not inside it.
             let popover = popover.clone();
             glib::idle_add_local_once(move || popover.unparent());
         });
