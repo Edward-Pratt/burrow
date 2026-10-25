@@ -23,6 +23,7 @@ use vte4::TerminalExt;
 
 use crate::addons;
 use crate::dialogs;
+use crate::files::{self, Files};
 use crate::palette::{self, Item};
 use crate::remote::{self, Remote, Unclaimed};
 use crate::runtime::runtime;
@@ -121,6 +122,13 @@ pub enum AppMsg {
         cols: u16,
         rows: u16,
     },
+    /// Opens an SSH host's file panel.
+    OpenFiles(NodeId),
+    /// For the file panel of an SSH host.
+    Files {
+        node: NodeId,
+        msg: files::Msg,
+    },
     StartTunnel(NodeId),
     StopTunnel(NodeId),
     /// Stops the tunnel and starts it again once it has closed.
@@ -163,7 +171,18 @@ pub enum AppMsg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TabKey {
     Node(NodeId),
+    /// An SSH host's file panel. The host's own tab is its terminal.
+    Files(NodeId),
     Terminal(u32),
+}
+
+impl TabKey {
+    fn node(self) -> Option<NodeId> {
+        match self {
+            TabKey::Node(id) | TabKey::Files(id) => Some(id),
+            TabKey::Terminal(_) => None,
+        }
+    }
 }
 
 struct Tab {
@@ -189,6 +208,8 @@ pub struct App {
     next_terminal: u32,
     /// SSH host tabs, by node.
     remotes: HashMap<NodeId, Remote>,
+    /// File panels, by SSH host node.
+    files: HashMap<NodeId, Files>,
     /// Tabs drawn by addons: the box their view goes in, by node.
     views: HashMap<NodeId, gtk::Box>,
     unclaimed: Unclaimed,
@@ -275,6 +296,7 @@ impl Component for App {
             tabs: HashMap::new(),
             next_terminal: 1,
             remotes: HashMap::new(),
+            files: HashMap::new(),
             views: HashMap::new(),
             unclaimed: Unclaimed::default(),
             looking_up: false,
@@ -322,10 +344,7 @@ impl Component for App {
                 let gone: Vec<TabKey> = self
                     .tabs
                     .keys()
-                    .filter(|key| match key {
-                        TabKey::Node(id) => !self.nodes.contains_key(id),
-                        TabKey::Terminal(_) => false,
-                    })
+                    .filter(|key| key.node().is_some_and(|id| !self.nodes.contains_key(&id)))
                     .copied()
                     .collect();
                 for key in gone {
@@ -474,6 +493,25 @@ impl Component for App {
                         rows,
                     };
                     execute(&self.core, &sender, command);
+                }
+            }
+            AppMsg::OpenFiles(id) => self.open_files(id, widgets, &sender),
+            AppMsg::Files {
+                node,
+                msg: files::Msg::Started(session),
+            } => match self.files.get_mut(&node) {
+                Some(panel) if panel.state == remote::State::Starting => {
+                    panel.state = remote::State::Running(session);
+                    for event in self.unclaimed.claim(session) {
+                        self.session_event(event, window, &sender);
+                    }
+                }
+                // The tab was closed while the session started.
+                _ => execute(&self.core, &sender, Command::CloseSession { session }),
+            },
+            AppMsg::Files { node, msg } => {
+                if let Some(panel) = self.files.get_mut(&node) {
+                    panel.update(msg, &self.core, window, &sender);
                 }
             }
             AppMsg::StartTunnel(node) => {
@@ -651,6 +689,9 @@ impl App {
             }
             Event::NodeUpdated { node } => {
                 let id = node.id;
+                if let Some(tab) = self.tabs.get(&TabKey::Files(id)) {
+                    set_tab_title(&tab.title, &files_title(&node.name));
+                }
                 if let Some(tab) = self.tabs.get(&TabKey::Node(id)) {
                     set_tab_title(&tab.title, &node.name);
                     if !self.tunnel_pages.contains_key(&id)
@@ -685,6 +726,7 @@ impl App {
                 self.tunnels.remove(&id);
                 self.restarting.remove(&id);
                 self.close_tab(TabKey::Node(id), widgets);
+                self.close_tab(TabKey::Files(id), widgets);
                 self.sidebar_dirty = true;
                 self.refresh_tunnels(sender);
             }
@@ -697,7 +739,16 @@ impl App {
                 self.autostart = nodes.into_iter().collect();
                 self.refresh_tunnels(sender);
             }
-            Event::TransferChanged { .. } => {}
+            Event::TransferChanged {
+                transfer,
+                session,
+                state,
+            } => {
+                let running = remote::State::Running(session);
+                if let Some(panel) = self.files.values_mut().find(|p| p.state == running) {
+                    panel.transfer_changed(transfer, &state, &self.core, sender);
+                }
+            }
         }
     }
 
@@ -852,6 +903,17 @@ impl App {
         {
             let prompt = self.for_tunnel(node, prompt);
             self.ask(session, &prompt, window, sender);
+            return;
+        }
+        let running = remote::State::Running(session);
+        if let Some(panel) = self.files.values_mut().find(|p| p.state == running) {
+            match event {
+                Event::SessionChanged { state, .. } => {
+                    panel.session_changed(&state, &self.core, sender)
+                }
+                Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
+                _ => {}
+            }
             return;
         }
         let Some(remote) = self
@@ -1141,6 +1203,25 @@ impl App {
         self.add_tab(key, page.upcast(), icon, &name, widgets, sender);
     }
 
+    fn open_files(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
+        let key = TabKey::Files(id);
+        if let Some(tab) = self.tabs.get(&key) {
+            if let Some(index) = widgets.notebook.page_num(&tab.page) {
+                widgets.notebook.set_current_page(Some(index));
+            }
+            return;
+        }
+        let Some(node) = self.nodes.get(&id).filter(|n| n.kind == SSH_HOST_KIND) else {
+            return;
+        };
+        let title = files_title(&node.name);
+        let panel = Files::new(id, sender);
+        let page = panel.page.clone().upcast();
+        self.add_tab(key, page, "folder-remote-symbolic", &title, widgets, sender);
+        files::start(&self.core, id, sender);
+        self.files.insert(id, panel);
+    }
+
     fn open_terminal(
         &mut self,
         shell: Option<String>,
@@ -1213,13 +1294,14 @@ impl App {
             self.views.remove(&id);
             self.tunnel_pages.remove(&id);
         }
-        // A session still starting is closed when its id arrives.
-        if let TabKey::Node(id) = key
-            && let Some(Remote {
-                state: remote::State::Running(session),
-                ..
-            }) = self.remotes.remove(&id)
-        {
+        // A session still starting is closed when its id arrives. Closing
+        // a file panel's session stops its transfers too.
+        let state = match key {
+            TabKey::Node(id) => self.remotes.remove(&id).map(|r| r.state),
+            TabKey::Files(id) => self.files.remove(&id).map(|f| f.state),
+            TabKey::Terminal(_) => None,
+        };
+        if let Some(remote::State::Running(session)) = state {
             let core = self.core.clone();
             runtime().spawn(async move {
                 let _ = core.execute(Command::CloseSession { session }).await;
@@ -1353,6 +1435,9 @@ impl App {
             }
             Some(node) => {
                 entries.push(("Open".into(), AppMsg::Open(node.id)));
+                if node.kind == SSH_HOST_KIND {
+                    entries.push(("Browse files".into(), AppMsg::OpenFiles(node.id)));
+                }
                 if node.kind == SSH_TUNNEL_KIND {
                     let running = self.tunnels.get(&node.id).and_then(|s| s.running());
                     entries.push(match running {
@@ -1431,6 +1516,16 @@ impl App {
         }));
         let mut nodes: Vec<&Node> = self.nodes.values().collect();
         nodes.sort_by_key(|n| (n.is_folder(), n.name.to_lowercase()));
+        items.extend(
+            nodes
+                .iter()
+                .filter(|n| n.kind == SSH_HOST_KIND)
+                .map(|node| Item {
+                    title: format!("Browse files: {}", node.name),
+                    subtitle: sidebar::location(&self.nodes, node),
+                    message: AppMsg::OpenFiles(node.id),
+                }),
+        );
         items.extend(nodes.into_iter().map(|node| {
             Item {
                 title: node.name.clone(),
@@ -1607,6 +1702,11 @@ fn set_tab_title(label: &gtk::Label, title: &str) {
     const MAX_CHARS: usize = 24;
     label.set_label(title);
     label.set_width_chars(title.chars().count().min(MAX_CHARS) as i32);
+}
+
+/// The title of an SSH host's file panel tab.
+fn files_title(host: &str) -> String {
+    format!("{host} files")
 }
 
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {

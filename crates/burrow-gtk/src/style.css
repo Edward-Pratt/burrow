@@ -45,7 +45,8 @@
 }
 
 .addon-view,
-.tunnel-view {
+.tunnel-view,
+.files-view {
   margin: 24px;
 }
 
@@ -106,4 +107,13 @@
 
 popover.menu button {
   padding: 4px 12px;
+}
+
+.file-list row {
+  padding: 2px 6px;
+}
+
+.transfer progressbar trough,
+.transfer progressbar progress {
+  min-height: 6px;
 }

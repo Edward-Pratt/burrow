@@ -4,6 +4,7 @@
 mod addons;
 mod app;
 mod dialogs;
+mod files;
 mod palette;
 mod remote;
 mod runtime;
