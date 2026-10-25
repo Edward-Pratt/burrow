@@ -89,6 +89,10 @@ async fn serve(activated: Option<std::os::unix::net::UnixListener>) -> Result<()
     lock.set_len(0)
         .and_then(|()| writeln!(lock, "{}", std::process::id()))
         .map_err(|e| Error::io(&lock_path, e))?;
+    // The core opens before the socket is bound, so a daemon that can't
+    // start (no Secret Service, say) leaves no socket for clients to find
+    // and connect to in vain.
+    let core = Core::open(CoreOptions::from_env()?)?;
     // A socket left behind is removed only by the daemon holding the lock,
     // so it never takes the place of a live one.
     let (listener, bound) = match activated {
@@ -113,7 +117,6 @@ async fn serve(activated: Option<std::os::unix::net::UnixListener>) -> Result<()
         }
     };
 
-    let core = Core::open(CoreOptions::from_env()?)?;
     core.autostart();
     let _watcher = core
         .watch()

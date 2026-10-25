@@ -982,7 +982,7 @@ fn mode(bits: u32) -> String {
 }
 
 /// "1.5 MiB".
-fn size(bytes: u64) -> String {
+pub(crate) fn size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
     if bytes < 1024 {
         return format!("{bytes} B");

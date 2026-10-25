@@ -57,6 +57,8 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `download` | `session`, `remote`, `local`, `overwrite?` | `transfer { transfer }` |
 | `upload` | `session`, `local`, `remote`, `overwrite?` | `transfer { transfer }` |
 | `cancel_transfer` | `transfer` | `ok` |
+| `open_monitor` | `node` | `session { session }` |
+| `monitor_history` | `session` | `monitor { history }` |
 | `open_database` | `node` | `session { session }` |
 | `run_query` | `session`, `sql`, `limit?` | `query { result }` |
 | `cancel_query` | `session` | `ok` |
@@ -95,10 +97,12 @@ Every subscriber receives events. They are sent for changes made through command
 | `node_updated` | `node` | A node changed, including a move to another folder. |
 | `node_deleted` | `id` | A node was removed. Children are announced before their parents. |
 | `problems_changed` | `problems` | The set of config files that fail to load changed. |
-| `session_changed` | `session`, `node`, `state` | A session moved on: `connecting { step }`, `connected`, or `closed { error }` (`error` is null when the shell ended normally). `node` is the SSH host of a terminal or file session, the tunnel node of a tunnel, and the database node of a database session. |
+| `session_changed` | `session`, `node`, `state` | A session moved on: `connecting { step }`, `connected`, or `closed { error }` (`error` is null when the shell ended normally). `node` is the SSH host of a terminal, file, command or monitor session, the tunnel node of a tunnel, and the database node of a database session. |
 | `transfer_changed` | `transfer`, `session`, `state` | A download or upload moved on: `running { done, total }` (at most a few times a second), `finished`, `failed { error }` or `cancelled`. |
+| `monitor_sample` | `session`, `node`, `sample` | A monitor's server sent new stats, every 2 s. |
+| `monitor_units` | `session`, `node`, `units` | A monitor's server listed its services, and they differ from the last list. |
 | `autostart_changed` | `nodes` | The tunnels that start with Burrow changed. |
-| `prompt_requested` | `session`, `prompt { id, kind, title, message }` | A session waits for `answer_prompt`. |
+| `prompt_requested` | `session`, `prompt { id, kind, title, message, action? }` | A session waits for `answer_prompt`. |
 | `prompt_closed` | `session`, `prompt` (the id) | A prompt stopped waiting: a client answered it, or its session ended. A client still showing it should close it. |
 | `grants_changed` | `grants` | What the MCP bridge may do changed, including a grant going stale because its node changed. |
 | `addons_changed` | `addons` | An addon was added, removed, changed, approved, revoked, started or stopped. |
@@ -110,7 +114,7 @@ A subscriber that falls more than 256 events behind gets a "lagged" error and sh
 
 `open_terminal` on an `ssh-host` node replies at once with a session id. The session then connects in the background and reports each step as `session_changed`.
 
-Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files`, `database` or `exec`) and `state`.
+Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files`, `database`, `exec` or `monitor`) and `state`.
 
 - **Host settings** come from `ssh -G <alias>`, so `Include`, `Match`, `Host` patterns and defaults apply exactly as for `ssh <alias>`. `props.alias` is the alias (the node's name when missing). An alias that is empty, starts with `-`, or has spaces or control characters is refused, because node files can come from a shared folder.
 - **Host keys** are checked against the `UserKnownHostsFile` and `GlobalKnownHostsFile` files, following `StrictHostKeyChecking`. A changed or `@revoked` key is always refused. A new key is asked about (`ask`) or added (`accept-new`/`no`), except when the host has known keys of another type, which is always asked about. New keys go into the first user file, hashed if `HashKnownHosts` is on.
@@ -136,7 +140,7 @@ Terminals, tunnels and file sessions on the same host share one SSH connection, 
 
 | `type` | Answer with |
 |---|---|
-| `confirm` | `{"type": "confirm"}` or `{"type": "cancel"}` |
+| `confirm` | `{"type": "confirm"}` or `{"type": "cancel"}`. `prompt.action`, when there, is what confirming does, as a button would say it ("Install"). |
 | `secret` (`can_save`) | `{"type": "text", "value": "…", "save": false}`, or `cancel` |
 | `text` | `{"type": "text", "value": "…"}`, or `cancel` |
 
@@ -175,6 +179,28 @@ target_port = 5432           # "local" only
 - **Transfers don't trust names.** A name inside a folder that holds `/`, or is `.` or `..`, fails the transfer rather than writing outside the folder that was picked. Symlinks inside a folder are skipped on both sides, and Burrow won't write through a symlink at the target.
 - **Modes:** a copy that replaces a file keeps that file's mode, so a private file stays private. A new copy takes its source's mode without group or other write and without set-id bits. Hidden files are created `0600` until then.
 - **No half-written files:** each file is written to a hidden file next to the target and moved into place when complete. A failed or cancelled transfer removes its partial file. Closing the session cancels its transfers. An upload cut off by a lost connection can't clean up, so its hidden `.<name>.burrow-<n>` file stays on the server.
+
+## Monitors
+
+`open_monitor` on an `ssh-host` node runs `burrow-agent` on the server and reports what it sees. Once the session is `connected`, `monitor_sample` arrives every 2 seconds, and `monitor_units` whenever the server's systemd services change. `monitor_history` returns what the session has kept:
+
+```json
+{"type": "monitor", "history": {"systemd": true, "units": [{"name": "nginx.service", "load": "loaded", "active": "failed", "sub": "failed", "description": "nginx"}], "samples": [{
+  "time": 1792948331514, "uptime": 26309.4, "load": [1.15, 0.75, 0.86],
+  "cpu": {"percent": 3.1, "cores": 16},
+  "memory": {"total": 32489811968, "available": 19298463744, "swap_total": 0, "swap_free": 0},
+  "disks": [{"mount": "/", "fs": "ext4", "total": 982292447232, "available": 46499487744}],
+  "net": [{"name": "eth0", "rx": 1520.5, "tx": 380.0}]
+}]}}
+```
+
+- **Units:** sizes are bytes, `rx` and `tx` are bytes a second over the last interval, `cpu.percent` is busy time across all cores (0 to 100), and `time` is Unix milliseconds by the server's clock. `units` is null until the first list, and stays null when `systemd` is false.
+- **Live only:** a monitor runs while its session is open, and the client that opened it closing its connection closes it. Each session keeps its own samples for about an hour, in memory.
+- **The agent:** `burrow-agent` is a static program, built for x86_64 and aarch64 Linux servers, that only reads. It never listens on the network, and it stops when Burrow closes the session. Burrow puts it at `~/.local/share/burrow/burrow-agent-<version>` over SFTP on the host's shared connection, and removes other versions it finds there.
+- **Asked once per host:** before the first upload, the session asks a `confirm` prompt naming the host, the path and the program's SHA-256. The answer is kept in `$XDG_STATE_HOME/burrow/agent.toml`, pinned to the host node like a grant, so a node file can't approve it. Uploads after that, such as a new version, don't ask.
+- **Checked every time:** each `open_monitor` reads the file back and compares its hash with Burrow's copy, and replaces it if they differ. A symlink at the path, or on the way to it, fails the session: Burrow won't run or write through one.
+- **The server is not trusted:** a line from the agent over 1 MiB, or one that doesn't parse, ends the session, and so does an agent that doesn't say hello first or speaks another protocol version. Names lose control characters and are cut at 256 characters. Lists are cut (256 disks and interfaces, 4096 units), and numbers that no stat can have become 0. A sample still over 16 KiB as JSON ends the session too, so an hour of history stays under 30 MiB and fits one reply.
+- **Where Burrow finds the agent:** the builds are named `burrow-agent-<arch>` and read from `$BURROW_AGENT_DIR`, then `/usr/lib/burrow/`, then the cargo target folder Burrow was built in (`target/<arch>-unknown-linux-musl/agent/`). Build them with `cargo build -p burrow-agent --profile agent --target x86_64-unknown-linux-musl` (or `aarch64-unknown-linux-musl`).
 
 ## Databases
 
@@ -366,10 +392,12 @@ The daemon sends:
 | `files-read` | `ssh-host` | `open_files`, `list_dir`, `read_file` |
 | `files-write` | `ssh-host` | the above, `write_file`, `make_dir`, `rename_path`, `remove_path` |
 | `tunnel` | `ssh-tunnel` | `start_tunnel`, and `close_session` on that tunnel |
+| `monitor-read` | `ssh-host` | `open_monitor` and `monitor_history`, running only an agent the user already put there |
 
 - **Always allowed:** `version`, `list_nodes`, `get_node`, `list_sessions` and `list_grants`. Nodes hold no secrets.
 - **Never allowed:** changing nodes, secrets, prompts, autostart, addons, grants, terminals and history. `download`, `upload` and `export_query` are refused because they take a local path. The bridge works with contents instead (`read_file`, `write_file`), so it can't read or overwrite the user's own files.
 - **Its own sessions:** session commands only work on sessions the bridge opened itself. Those sessions close when it disconnects.
+- **Monitors never install:** a monitor the bridge opens runs only the `burrow-agent` that is already on the server and matches Burrow's copy. Otherwise it fails without asking, so the user installs the agent by opening a monitor in Burrow. The bridge's `monitor` tool returns the latest sample, a summary of the history and the failed services, rather than every sample.
 - **Read-only SQL:** without `sql-write`, every query runs as one statement inside `BEGIN READ ONLY` … `ROLLBACK`. Postgres refuses to prepare more than one statement, so SQL can't change the setting or end the transaction and then write.
   - A read-only transaction still allows `COPY … TO` a file and `COPY … TO PROGRAM`, which runs a command on the database server, also from inside a `DO` block. So read-only SQL is refused when the role is, or is a member of, a superuser role, `pg_write_server_files` or `pg_execute_server_program`, since a member can `SET ROLE` into them from a `DO` block.
   - Some functions still have effects, such as `pg_terminate_backend` for a role allowed to use it. For full safety, give the node a database role that can only read, such as one granted `pg_read_all_data`.

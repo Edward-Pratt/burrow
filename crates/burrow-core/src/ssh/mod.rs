@@ -10,15 +10,18 @@
 //!
 //! Sessions on the same host share one connection ([`Connections`]).
 
+mod agent;
 mod config;
 mod connection;
 pub(crate) mod exec;
 pub(crate) mod files;
 mod known_hosts;
+mod monitor;
 mod session;
 mod socks;
 mod tunnel;
 
+pub(crate) use agent::Agents;
 pub(crate) use connection::{Connection, Connections, alias};
 pub(crate) use files::Transfers;
 pub(crate) use tunnel::Autostart;
@@ -75,6 +78,7 @@ struct Entry {
 pub(crate) enum Attached {
     Sftp(Arc<SftpSession>),
     Database(Arc<db::Handle>),
+    Monitor(Arc<monitor::Monitor>),
 }
 
 /// Prompts waiting for an answer, by prompt id.
@@ -149,6 +153,7 @@ impl Sessions {
                 SessionKind::Terminal => "a terminal",
                 SessionKind::Tunnel => "a tunnel",
                 SessionKind::Exec => "a command",
+                SessionKind::Monitor => "a monitor",
             };
             return Err(Error::invalid("session", format!("{id} is not {what}")));
         }
@@ -172,6 +177,14 @@ impl Sessions {
         match self.attached(id, SessionKind::Database)? {
             (Attached::Database(handle), node) => Ok((handle, node)),
             _ => unreachable!("database sessions attach a database"),
+        }
+    }
+
+    /// What a connected monitor session has seen.
+    pub fn monitor(&self, id: SessionId) -> Result<Arc<monitor::Monitor>> {
+        match self.attached(id, SessionKind::Monitor)? {
+            (Attached::Monitor(monitor), _) => Ok(monitor),
+            _ => unreachable!("monitor sessions attach a monitor"),
         }
     }
 
@@ -274,6 +287,21 @@ pub(crate) fn open_files(core: &Core, node: Node) -> SessionId {
     )
 }
 
+/// Starts burrow-agent on an SSH host node. Without `install` it only runs
+/// an agent that is already there. It runs until a client closes it, the
+/// agent stops, or the connection fails.
+pub(crate) fn open_monitor(core: &Core, node: Node, install: bool) -> SessionId {
+    spawn(
+        core,
+        node,
+        SessionKind::Monitor,
+        None,
+        move |core, node, input, prompter| async move {
+            monitor::run(&core, &node, input, &prompter, install).await
+        },
+    )
+}
+
 /// Registers a session and runs `body` as its task. Whatever `body`
 /// returns becomes the session's [`SessionState::Closed`].
 pub(crate) fn spawn<F, Fut>(
@@ -344,6 +372,23 @@ impl Prompter {
 
     /// [`PromptAnswer::Cancel`] if the session closes first.
     pub async fn ask(&self, kind: PromptKind, title: &str, message: &str) -> PromptAnswer {
+        self.ask_with(kind, title, message, None).await
+    }
+
+    /// A yes-or-no question whose "yes" does `action`.
+    pub async fn confirm(&self, title: &str, message: &str, action: &str) -> PromptAnswer {
+        let action = Some(action.to_string());
+        self.ask_with(PromptKind::Confirm, title, message, action)
+            .await
+    }
+
+    async fn ask_with(
+        &self,
+        kind: PromptKind,
+        title: &str,
+        message: &str,
+        action: Option<String>,
+    ) -> PromptAnswer {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -354,6 +399,7 @@ impl Prompter {
                 kind,
                 title: title.to_string(),
                 message: message.to_string(),
+                action,
             },
         });
         // Announced however the wait ends, even if this future is dropped.

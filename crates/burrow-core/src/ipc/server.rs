@@ -216,6 +216,7 @@ impl Conn {
                     Command::OpenTerminal { .. }
                         | Command::OpenFiles { .. }
                         | Command::OpenDatabase { .. }
+                        | Command::OpenMonitor { .. }
                 );
                 let response = match role {
                     Role::Gui | Role::Cli => self.core.execute(command).await,
@@ -317,6 +318,8 @@ enum Rule {
     Run,
     /// A query that must not write, whatever the session allows.
     ReadOnlyQuery,
+    /// A monitor that runs only the agent the user put on the server.
+    MonitorWithoutInstall,
 }
 
 impl Conn {
@@ -335,6 +338,13 @@ impl Conn {
                     limit,
                 } => self.core.run_query(session, sql, limit, true).await,
                 _ => unreachable!("only queries are read-only"),
+            },
+            Ok(Rule::MonitorWithoutInstall) => match command {
+                Command::OpenMonitor { node } => self
+                    .core
+                    .open_monitor(node, false)
+                    .map(|session| Response::Session { session }),
+                _ => unreachable!("only monitors install"),
             },
         };
         entry["ok"] = json!(result.is_ok());
@@ -386,6 +396,11 @@ impl Conn {
             }
             Command::SetReadOnly { session: s, .. } => session(*s, SqlWrite)?,
             Command::StartTunnel { node: id } => node(*id, Tunnel)?,
+            Command::OpenMonitor { node: id } => {
+                node(*id, MonitorRead)?;
+                return Ok(Rule::MonitorWithoutInstall);
+            }
+            Command::MonitorHistory { session: s } => session(*s, MonitorRead)?,
             Command::CloseSession { session: s } => {
                 if self.own_session(*s).is_err() {
                     let tunnel = self

@@ -1,0 +1,23 @@
+[package]
+name = "burrow-agent"
+description = "A small program Burrow runs on servers to report their state over SSH"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Few dependencies, so the static binary stays small. The library is only
+# the wire format, which `burrow-core` parses.
+[dependencies]
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+# The monitor tests drive burrow-core against a throwaway sshd, and live
+# here so they can run this crate's binary.
+[dev-dependencies]
+burrow-core = { version = "0.1.0", path = "../burrow-core" }
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "net"] }
+toml = "1.1.8"

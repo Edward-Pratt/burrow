@@ -1,0 +1,5 @@
+# burrow-agent is built for servers as a static musl binary. rustc ships
+# the musl C runtime and rust-lld, so the aarch64 build needs no cross
+# toolchain.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

@@ -160,7 +160,7 @@ pub fn answer(
             .modal(true)
             .message(&prompt.title)
             .detail(&prompt.message)
-            .buttons(["Cancel", "Trust and connect"])
+            .buttons(["Cancel", prompt.action.as_deref().unwrap_or("Continue")])
             .cancel_button(0)
             .default_button(0)
             .build();

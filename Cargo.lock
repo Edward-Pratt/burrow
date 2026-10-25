@@ -429,6 +429,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "burrow-agent"
+version = "0.1.0"
+dependencies = [
+ "burrow-core",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "burrow-cli"
 version = "0.1.0"
 dependencies = [
@@ -446,6 +459,7 @@ dependencies = [
 name = "burrow-core"
 version = "0.1.0"
 dependencies = [
+ "burrow-agent",
  "data-encoding",
  "directories",
  "futures-util",
