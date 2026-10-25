@@ -617,6 +617,21 @@ async fn verify_full_checks_the_certificate_against_the_root_given() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_server_without_tls_says_how_to_reach_it() {
+    let Some(postgres) = Postgres::start() else {
+        return;
+    };
+    let (_dir, core) = core();
+    // Over the network, TLS is on unless the props turn it off.
+    let props = postgres.tcp().replace("sslmode = \"disable\"\n", "");
+    let node = database(&core, &props).await;
+    let mut events = core.subscribe();
+    let session = open_database(&core, &node).await;
+    let error = closed_error(expect_state(&mut events, session).await).unwrap();
+    assert!(error.contains("Turn TLS off"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn reaches_the_server_through_an_ssh_host_by_port_and_by_socket() {
     let Some(postgres) = Postgres::start() else {
         return;

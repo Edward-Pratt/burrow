@@ -277,7 +277,7 @@ pub(crate) async fn connect(
             Err(error) => error,
         };
         if !wants_password(&error) || asked == ATTEMPTS {
-            return Err(describe(&error));
+            return Err(refused(&error, tls.is_some()));
         }
         let message = match (&saved, &password) {
             (_, Some(_)) => format!("That didn't work. Password for {target}"),
@@ -318,6 +318,19 @@ where
         }
     });
     Ok((client, task))
+}
+
+/// Why connecting failed. TLS is on by default over the network, so a
+/// server without it, such as a fresh local one, is the likeliest first
+/// failure, and the user needs to know what to change.
+fn refused(error: &tokio_postgres::Error, tls: bool) -> String {
+    let text = describe(error);
+    if tls && text.contains("server does not support TLS") {
+        return format!(
+            "{text}. Turn TLS off for this database only if the network to it is private."
+        );
+    }
+    text
 }
 
 /// Whether signing in failed for want of the right password. tokio-postgres
