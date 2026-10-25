@@ -79,7 +79,7 @@ All non-secret state lives as TOML files in `$XDG_CONFIG_HOME/burrow/` (default 
 
 - **Owned by the core, like Postgres:** the core uploads the agent, runs it and parses its output, and the monitor tab is built in. An addon process would need the SSH connection, which only the core holds.
 - **Install:** Burrow asks once per host, then uploads it to `~/.local/share/burrow/` on the server, and checks its hash against its own copy every time a monitor starts. The consent lives in the state folder, pinned to the host node, because a node file must never put a program on a server. The MCP bridge can read monitors with a grant, but never installs.
-- **Live only, for now:** a monitor runs while a client has it open, and keeps an hour of samples in memory. Background sampling, alerts and history on disk are later.
+- **Live, or in the background:** a monitor runs while a client has it open, and keeps an hour of samples in memory. A host the user chooses to monitor in the background gets one monitor the daemon runs from when it starts, with or without a window, reconnecting when it drops. That choice lives in the state folder, pinned to the host like the install consent, so a node file can't turn it on. Background monitors keep a week of one-minute averages on disk, by this computer's clock, and raise alerts from fixed rules (a failed service, a disk over 90%, memory under 10%, a host not answering for a minute). Thresholds per host are later.
 - **Fallback (later):** servers without the agent will fall back to plain shell commands with parsed output.
 - **No exposed ports:** the agent never listens on the network. It only talks over SSH.
 
@@ -91,7 +91,7 @@ All non-secret state lives as TOML files in `$XDG_CONFIG_HOME/burrow/` (default 
 | Local terminal | VTE starts and runs the shell itself; read the shell list from `$SHELL` and `/etc/shells`. `portable-pty` only if the core ever needs a PTY without the UI. |
 | SSH | `russh`; host settings from `ssh -G <alias>` (OpenSSH resolves `Include`/`Match`/patterns itself); agent auth through `IdentityAgent` / `SSH_AUTH_SOCK`; own `known_hosts` reader and writer (russh's skips markers and wildcards) |
 | Paths | XDG base directories (`directories` crate) |
-| Notifications | `GNotification` (freedesktop D-Bus, works with mako and swaync) |
+| Notifications | `burrowd` calls `org.freedesktop.Notifications` over D-Bus itself (zbus, already there for the keyring), so alerts show with no window open; works with mako, swaync and GNOME. Not `GNotification`, which needs the window. |
 | Packaging | AUR PKGBUILD as the main channel, with no self-updater. Not Flatpak: its sandbox blocks host shells, the SSH agent and `~/.ssh`. |
 | RDP | IronRDP or FreeRDP, as a late addon |
 
@@ -146,3 +146,5 @@ Built-in features use the same addon API as third-party ones.
 7. Postgres client in the core, since addons never see secrets (GtkSourceView editor, GtkColumnView grid), then the rest
 8. `burrowd` + `burrow-cli` + MCP bridge, with per-node grants for what an assistant may do
 9. `burrow-agent` + monitoring addon
+10. Hosts added in Burrow: a dialog that writes `~/.ssh/config.d/burrow.conf`
+11. Monitoring v2: background monitors, history on disk, alerts and desktop notifications
