@@ -10,6 +10,7 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use burrow_core::doctor::Check;
 use burrow_core::ipc::{self, Client, Events, Role};
 use burrow_core::{
     Capability, Command, Event, Grant, GrantShown, Node, NodeId, Response, SSH_TUNNEL_KIND,
@@ -92,6 +93,9 @@ enum Cmd {
         #[command(subcommand)]
         action: DaemonCmd,
     },
+    /// Check that this machine has what Burrow needs, and say what is
+    /// missing and how to get it.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -184,6 +188,9 @@ async fn run(command: Cmd) -> Result<ExitCode> {
     if let Cmd::Daemon { action } = &command {
         return daemon(action).await;
     }
+    if let Cmd::Doctor = &command {
+        return doctor().await;
+    }
     if let Cmd::Mcp {
         action: McpCmd::Serve,
     } = &command
@@ -222,7 +229,7 @@ async fn run(command: Cmd) -> Result<ExitCode> {
         }
         Cmd::Events => events(&client).await,
         Cmd::Mcp { action } => mcp(&client, action).await,
-        Cmd::Daemon { .. } => unreachable!("handled above"),
+        Cmd::Daemon { .. } | Cmd::Doctor => unreachable!("handled above"),
     }
 }
 
@@ -791,6 +798,35 @@ async fn daemon(action: &DaemonCmd) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// One line per check, and a second with the fix where one failed. Fails
+/// when Burrow can't run as things are; a missing optional piece doesn't.
+async fn doctor() -> Result<ExitCode> {
+    let checks = burrow_core::doctor::run().await;
+    let width = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
+    let mut out = std::io::stdout().lock();
+    for check in &checks {
+        let status = match (check.ok(), check.optional) {
+            (true, _) => "ok  ",
+            (false, true) => "warn",
+            (false, false) => "FAIL",
+        };
+        writeln!(
+            out,
+            "{status}  {:width$}  {}",
+            check.name,
+            clean(&check.found)
+        )?;
+        if let Some(fix) = &check.fix {
+            writeln!(out, "      {:width$}  fix: {}", "", clean(fix))?;
+        }
+    }
+    Ok(if checks.iter().any(Check::blocks) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn unexpected(response: &Response) -> Box<dyn Error> {

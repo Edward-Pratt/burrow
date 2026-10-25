@@ -30,6 +30,40 @@ impl Drop for Daemon<'_> {
     }
 }
 
+/// The doctor says what it found for each check, and fails only when a
+/// required one did. Which pass depends on the machine, so the test holds
+/// the report to its own verdict.
+#[test]
+fn the_doctor_reports_every_check_and_fails_only_on_a_blocker() {
+    let dir = TempDir::new().unwrap();
+    let dir = dir.path();
+    let _daemon = Daemon(dir);
+
+    let output = burrow(dir, &["doctor"]);
+    let report = stdout(&output);
+    for name in [
+        "Folders",
+        "Socket folder",
+        "OpenSSH",
+        "Secret Service",
+        "SSH agent",
+        "burrow-agent (x86_64)",
+        "burrowd",
+    ] {
+        assert!(report.contains(name), "{name} missing from:\n{report}");
+    }
+    assert!(report.contains(&format!("config in {}", dir.join("config").display())));
+    let failed = report.lines().any(|line| line.starts_with("FAIL"));
+    assert_eq!(output.status.success(), !failed, "{report}");
+    // A fix follows what failed, and nothing else.
+    let fixes = report.matches("fix: ").count();
+    let problems = report
+        .lines()
+        .filter(|line| line.starts_with("FAIL") || line.starts_with("warn"))
+        .count();
+    assert_eq!(fixes, problems, "{report}");
+}
+
 #[test]
 fn the_cli_starts_a_daemon_and_drives_it() {
     let dir = TempDir::new().unwrap();

@@ -7,14 +7,14 @@
 //! once nothing has been connected or running for [`IDLE`].
 
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::os::fd::FromRawFd;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 
+use crate::doctor;
 use crate::engine::{Core, CoreOptions};
 use crate::error::{Error, Result};
 use crate::ipc::{self, LOCK, SOCKET};
@@ -56,6 +56,8 @@ fn run() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
+        // Started by a client, stderr is the log file.
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
     // Both change the environment, which is only safe before there are
     // other threads.
@@ -166,11 +168,7 @@ fn find_agent() {
     if std::env::var_os("SSH_AUTH_SOCK").is_some() {
         return;
     }
-    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
-        return;
-    };
-    let agent = PathBuf::from(runtime).join("ssh-agent.socket");
-    if agent.exists() {
+    if let Some(agent) = doctor::ssh_agent_socket(|name| std::env::var_os(name)) {
         tracing::info!("SSH_AUTH_SOCK is not set; using {}", agent.display());
         // SAFETY: no other threads exist yet (see `run`).
         unsafe { std::env::set_var("SSH_AUTH_SOCK", agent) };

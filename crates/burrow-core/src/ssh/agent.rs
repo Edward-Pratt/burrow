@@ -34,6 +34,9 @@ use crate::tree::write_atomic;
 /// Where packages install the agent builds, as `burrow-agent-<arch>`.
 const INSTALLED: &str = "/usr/lib/burrow";
 
+/// The servers the agent is built for, by their Rust target's name.
+pub(crate) const ARCHES: [&str; 2] = ["x86_64", "aarch64"];
+
 /// How long the checks before an upload may take.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -112,34 +115,50 @@ impl Agents {
         *self.remote_dir.lock().unwrap() = Some(remote);
     }
 
-    /// The agent built for `arch`, from the first place that has one:
-    /// `$BURROW_AGENT_DIR`, then where packages install it, then the cargo
-    /// target folder Burrow itself was built in.
+    /// The agent built for `arch`, read from the first place that has one.
     async fn local_binary(&self, arch: &str) -> std::result::Result<Vec<u8>, String> {
-        let name = format!("burrow-agent-{arch}");
-        let mut candidates = Vec::new();
         let dir = self.local_dir.lock().unwrap().clone();
-        if let Some(dir) = dir.or_else(|| std::env::var_os("BURROW_AGENT_DIR").map(PathBuf::from)) {
-            candidates.push(dir.join(&name));
-        }
-        candidates.push(Path::new(INSTALLED).join(&name));
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(target) = exe.parent().and_then(Path::parent)
-        {
-            candidates.push(target.join(format!("{arch}-unknown-linux-musl/agent/burrow-agent")));
-        }
-        for candidate in candidates {
-            match tokio::fs::read(&candidate).await {
-                Ok(binary) => return Ok(binary),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("{}: {e}", candidate.display())),
-            }
-        }
-        Err(format!(
-            "this Burrow has no burrow-agent for {arch} servers. Build one with \
-             `cargo build -p burrow-agent --profile agent --target {arch}-unknown-linux-musl`"
-        ))
+        let path = find_build(arch, dir).await?;
+        tokio::fs::read(&path)
+            .await
+            .map_err(|e| format!("{}: {e}", path.display()))
     }
+}
+
+/// Where the agent built for `arch` may be, first choice first: `dir` or
+/// `$BURROW_AGENT_DIR`, then where packages install it, then the cargo
+/// target folder Burrow itself was built in.
+pub(crate) fn candidates(arch: &str, dir: Option<PathBuf>) -> Vec<PathBuf> {
+    let name = format!("burrow-agent-{arch}");
+    let mut candidates = Vec::new();
+    if let Some(dir) = dir.or_else(|| std::env::var_os("BURROW_AGENT_DIR").map(PathBuf::from)) {
+        candidates.push(dir.join(&name));
+    }
+    candidates.push(Path::new(INSTALLED).join(&name));
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(target) = exe.parent().and_then(Path::parent)
+    {
+        candidates.push(target.join(format!("{arch}-unknown-linux-musl/agent/burrow-agent")));
+    }
+    candidates
+}
+
+/// The first of [`candidates`] that exists.
+pub(crate) async fn find_build(
+    arch: &str,
+    dir: Option<PathBuf>,
+) -> std::result::Result<PathBuf, String> {
+    for candidate in candidates(arch, dir) {
+        match tokio::fs::try_exists(&candidate).await {
+            Ok(true) => return Ok(candidate),
+            Ok(false) => {}
+            Err(e) => return Err(format!("{}: {e}", candidate.display())),
+        }
+    }
+    Err(format!(
+        "this Burrow has no burrow-agent for {arch} servers. Build one with \
+         `cargo build -p burrow-agent --profile agent --target {arch}-unknown-linux-musl`"
+    ))
 }
 
 fn save(path: &Path, consents: &Consents) -> Result<()> {

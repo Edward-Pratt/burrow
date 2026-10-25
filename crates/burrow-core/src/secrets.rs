@@ -86,7 +86,14 @@ pub struct KeyringStore {
 
 impl KeyringStore {
     pub fn new() -> Result<Self> {
-        let store = zbus_secret_service_keyring_store::Store::new().map_err(keyring_error)?;
+        // The usual reason is that no keyring daemon is installed or
+        // running, so say what is being looked for.
+        let store = zbus_secret_service_keyring_store::Store::new().map_err(|e| {
+            Error::Secrets(format!(
+                "could not reach the Secret Service (gnome-keyring, KWallet or KeePassXC) on \
+                 the session bus: {e}"
+            ))
+        })?;
         Ok(KeyringStore { store })
     }
 

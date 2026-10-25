@@ -1,0 +1,65 @@
+# Maintainer: Edward Pratt
+#
+# Burrow from its main branch. `makepkg -si` in this folder builds the
+# window, the daemon, the command line and the server agent, and pulls in
+# what they need. Build it from a checkout with
+# `source=("git+file://$PWD/../..")` to package local changes.
+
+pkgname=burrow-git
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc="A desktop home base for servers and databases: terminals, SSH, PostgreSQL and tunnels in one window"
+arch=(x86_64)
+url="https://github.com/Edward-Pratt/burrow"
+license=(GPL-3.0-or-later)
+# gtk4 4.20 or newer: the window follows gtk-interface-color-scheme.
+depends=(gtk4 vte4 gtksourceview5 openssh)
+# The musl targets build burrow-agent, which Burrow uploads to servers.
+makedepends=(git cargo rust-musl rust-aarch64-musl)
+optdepends=(
+  'gnome-keyring: a Secret Service, which Burrow keeps passwords in (or KWallet, or KeePassXC)'
+)
+provides=(burrow)
+conflicts=(burrow)
+source=("git+$url.git")
+sha256sums=(SKIP)
+
+pkgver() {
+  cd burrow
+  printf '%s.r%s.g%s' \
+    "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd burrow
+  cargo fetch --locked
+}
+
+build() {
+  cd burrow
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p burrow-gtk -p burrowd -p burrow-cli
+  for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+    cargo build --frozen --profile agent -p burrow-agent --target "$target"
+  done
+}
+
+# No check(): the tests start sshd and a PostgreSQL server of their own,
+# which a build machine may not have. CI runs them on every change.
+
+package() {
+  cd burrow
+  install -Dm755 target/release/burrow-gtk target/release/burrowd target/release/burrow \
+    -t "$pkgdir/usr/bin"
+  # Where the core looks for agent builds (ssh/agent.rs, INSTALLED).
+  install -Dm755 target/x86_64-unknown-linux-musl/agent/burrow-agent \
+    "$pkgdir/usr/lib/burrow/burrow-agent-x86_64"
+  install -Dm755 target/aarch64-unknown-linux-musl/agent/burrow-agent \
+    "$pkgdir/usr/lib/burrow/burrow-agent-aarch64"
+  install -Dm644 dist/systemd/burrowd.service dist/systemd/burrowd.socket \
+    -t "$pkgdir/usr/lib/systemd/user"
+  install -Dm644 dist/dev.burrow.Burrow.desktop -t "$pkgdir/usr/share/applications"
+  install -Dm644 README.md docs/DESIGN.md docs/API.md -t "$pkgdir/usr/share/doc/$pkgname"
+}

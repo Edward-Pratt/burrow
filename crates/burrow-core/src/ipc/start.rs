@@ -128,10 +128,10 @@ async fn connect_or_start(socket: &Path, role: Role) -> Result<Client> {
         // an exit is only a failure once the deadline passes.
         let exited = child.try_wait().ok().flatten();
         if Instant::now() > deadline || exited.is_some_and(|status| !status.success()) {
-            return Err(Error::Remote(format!(
-                "burrowd did not start; see {}",
-                log.display()
-            )));
+            return Err(Error::Remote(match last_line(&log) {
+                Some(line) => format!("burrowd did not start: {line} (see {})", log.display()),
+                None => format!("burrowd did not start; see {}", log.display()),
+            }));
         }
     }
 }
@@ -179,6 +179,19 @@ pub async fn stop(dir: &Path) -> Result<bool> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err(Error::Remote("burrowd did not stop".to_string()))
+}
+
+/// The last thing the daemon said before it stopped: its own error line,
+/// without the program name it prefixes.
+fn last_line(log: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(log).ok()?;
+    let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    Some(
+        line.trim()
+            .strip_prefix("burrowd: ")
+            .unwrap_or(line.trim())
+            .to_string(),
+    )
 }
 
 fn not_running(error: &Error) -> bool {

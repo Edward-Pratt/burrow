@@ -9,6 +9,7 @@ mod addon;
 mod api;
 pub mod daemon;
 mod db;
+pub mod doctor;
 mod engine;
 mod error;
 mod grants;
