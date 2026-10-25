@@ -153,20 +153,27 @@ fn audit_log(dir: &Path) -> Vec<serde_json::Value> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_mcp_audit_log_keeps_one_old_file() {
+async fn the_mcp_audit_log_keeps_five_old_files() {
     let dir = TempDir::new().unwrap();
     let socket = serve(core(dir.path()), dir.path());
     let log = dir.path().join("state/mcp-audit.log");
+    let old = |n: u32| log.with_extension(format!("log.{n}"));
     std::fs::create_dir_all(log.parent().unwrap()).unwrap();
     // Full, at the size docs/API.md gives.
     std::fs::write(&log, vec![b'\n'; 8 << 20]).unwrap();
-    std::fs::write(log.with_extension("log.1"), "older\n").unwrap();
+    for n in 1..=5 {
+        std::fs::write(old(n), format!("{n}\n")).unwrap();
+    }
 
     let mcp = Client::connect(&socket, Role::Mcp).await.unwrap();
     mcp.execute(Command::ListNodes).await.unwrap();
-    let old = std::fs::metadata(log.with_extension("log.1")).unwrap();
-    assert_eq!(old.len(), 8 << 20);
     assert_eq!(audit_log(dir.path()).len(), 1);
+    assert_eq!(std::fs::metadata(old(1)).unwrap().len(), 8 << 20);
+    for n in 2..=5 {
+        let moved = std::fs::read_to_string(old(n)).unwrap();
+        assert_eq!(moved, format!("{}\n", n - 1));
+    }
+    assert!(!old(6).exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -43,6 +43,10 @@ const IDLE_CHECK: Duration = Duration::from_secs(5);
 /// Connections so far, which numbers each one.
 static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// The longest string the audit log keeps of a command or an error, so
+/// a few lines can't fill the log and push out what came before.
+const AUDIT_FIELD: usize = 4 << 10;
+
 /// Serves clients on `listener`. With `idle`, it returns once no client
 /// has been connected and no session running for that long; otherwise it
 /// runs until the task is dropped.
@@ -386,6 +390,7 @@ impl Conn {
             Ok(_) => {}
             Err(e) => entry["error"] = json!(e.to_string()),
         }
+        cap_strings(&mut entry);
         self.core.audit(&entry);
         result
     }
@@ -486,6 +491,23 @@ fn audit_entry(command: &Command, rule: Option<&Rule>, connection: u64) -> Value
     entry
 }
 
+/// Cuts every string in `value` that is longer than [`AUDIT_FIELD`], and
+/// says how long it was.
+fn cap_strings(value: &mut Value) {
+    match value {
+        Value::String(text) if text.len() > AUDIT_FIELD => {
+            let mut end = AUDIT_FIELD;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            *text = format!("{}… ({} bytes)", &text[..end], text.len());
+        }
+        Value::Array(items) => items.iter_mut().for_each(cap_strings),
+        Value::Object(fields) => fields.values_mut().for_each(cap_strings),
+        _ => {}
+    }
+}
+
 /// Passes events on as `event` notifications. A client that falls behind
 /// is sent `resync` and should list everything again.
 async fn forward_events(
@@ -555,4 +577,35 @@ fn parse<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, Failure> {
 
 fn failed(error: Error) -> Failure {
     (SERVER_ERROR, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_audit_line_keeps_only_the_start_of_long_strings() {
+        let command = Command::RunQuery {
+            session: SessionId(1),
+            sql: format!("select '{}'", "é".repeat(1 << 20)),
+            limit: None,
+        };
+        let mut entry = audit_entry(&command, Some(&Rule::ReadOnlyQuery), 1);
+        entry["error"] = json!("x".repeat(AUDIT_FIELD + 1));
+        cap_strings(&mut entry);
+        assert!(entry.to_string().len() < 3 * AUDIT_FIELD);
+        let sql = entry["command"]["sql"].as_str().unwrap();
+        assert!(sql.starts_with("select 'éé"));
+        assert!(
+            sql.ends_with(&format!("… ({} bytes)", 9 + (2 << 20))),
+            "{sql}"
+        );
+        assert!(entry["error"].as_str().unwrap().ends_with("… (4097 bytes)"));
+
+        // Short ones, and everything else, are left as they were.
+        let mut entry = audit_entry(&Command::ListNodes, Some(&Rule::Run), 2);
+        let before = entry.clone();
+        cap_strings(&mut entry);
+        assert_eq!(entry, before);
+    }
 }

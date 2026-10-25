@@ -600,21 +600,38 @@ impl Core {
     pub(crate) fn audit(&self, entry: &serde_json::Value) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        /// Past this size the log moves to `mcp-audit.log.1`, replacing
-        /// the one there, so the two never pass twice this.
+        use std::time::Instant;
+        /// Past this size the log moves to `mcp-audit.log.1`, and the older
+        /// ones along to at most `.5`. A bridge flooding the log to push
+        /// out what it did earlier has to write five times this.
         const MAX: u64 = 8 << 20;
+        const KEPT: u32 = 5;
+        /// Filling the log twice within this is unusual enough to say so.
+        const BURST: Duration = Duration::from_secs(600);
         // Requests run on tasks of their own. Two that both found the log
-        // full would both move it, and the second would put a log of one
-        // line in place of the old one.
-        static WRITING: Mutex<()> = Mutex::new(());
-        let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        // full would both move it, and the second would push a log of one
+        // line along in place of a full one. Holds when the log last moved.
+        static WRITING: Mutex<Option<Instant>> = Mutex::new(None);
+        let mut moved = WRITING.lock().unwrap_or_else(|e| e.into_inner());
         let path = &self.inner.audit_log;
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         if std::fs::metadata(path).is_ok_and(|meta| meta.len() >= MAX) {
-            let old = path.with_extension("log.1");
-            if let Err(e) = std::fs::rename(path, &old) {
+            if moved.is_some_and(|at| at.elapsed() < BURST) {
+                tracing::warn!(
+                    "the MCP audit log filled up twice within {} minutes; its oldest \
+                     lines are being dropped",
+                    BURST.as_secs() / 60
+                );
+            }
+            *moved = Some(Instant::now());
+            let old = |n: u32| path.with_extension(format!("log.{n}"));
+            for n in (1..KEPT).rev() {
+                // Most are missing until the log has filled that often.
+                let _ = std::fs::rename(old(n), old(n + 1));
+            }
+            if let Err(e) = std::fs::rename(path, old(1)) {
                 tracing::warn!("could not move {} aside: {e}", path.display());
             }
         }
