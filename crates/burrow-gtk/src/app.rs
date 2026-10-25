@@ -113,6 +113,8 @@ pub enum AppMsg {
     Delete(NodeId),
     RenameSelected,
     DeleteSelected,
+    /// Moves the keyboard focus to the sidebar, showing it if it's hidden.
+    FocusSidebar,
     CloseTab(TabKey),
     CloseCurrentTab,
     /// Moves to the next (`1`) or previous (`-1`) tab, wrapping around.
@@ -247,6 +249,7 @@ impl AppMsg {
                 | AppMsg::Delete(_)
                 | AppMsg::RenameSelected
                 | AppMsg::DeleteSelected
+                | AppMsg::FocusSidebar
                 | AppMsg::CloseTab(_)
                 | AppMsg::CloseCurrentTab
                 | AppMsg::SwitchTab(_)
@@ -535,6 +538,14 @@ impl Component for App {
                 if let Some(id) = selected(widgets) {
                     self.delete(id, window, &sender);
                 }
+            }
+            AppMsg::FocusSidebar => {
+                if !self.settings.sidebar_visible {
+                    self.settings.sidebar_visible = true;
+                    widgets.sidebar_pane.set_visible(true);
+                    self.save_settings();
+                }
+                widgets.sidebar.focus();
             }
             AppMsg::CloseTab(key) => self.close_tab(key, widgets),
             AppMsg::CloseCurrentTab => {
@@ -2841,6 +2852,7 @@ fn welcome() -> gtk::Box {
         ("Ctrl+Shift+T", "New terminal"),
         ("Ctrl+Shift+P", "Command palette"),
         ("Ctrl+Shift+B", "Toggle sidebar"),
+        ("Ctrl+Shift+S", "Focus sidebar"),
         ("Ctrl+Shift+W", "Close tab"),
         ("F2", "Rename the selected item"),
         // Not keys, but the two things the window doesn't show by itself.
@@ -2878,6 +2890,8 @@ fn add_shortcuts(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>)
         ("<Control><Shift>t", AppMsg::NewTerminal(None)),
         ("<Control><Shift>p", AppMsg::ShowPalette),
         ("<Control><Shift>b", AppMsg::ToggleSidebar),
+        // A terminal keeps Tab for itself, so this is the way back.
+        ("<Control><Shift>s", AppMsg::FocusSidebar),
         ("<Control><Shift>w", AppMsg::CloseCurrentTab),
         ("<Control><Shift>r", AppMsg::ReloadConfig),
         ("<Control>comma", AppMsg::ShowSettings),

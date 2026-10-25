@@ -322,30 +322,61 @@ impl Sidebar {
         ));
         view.add_controller(right_click);
 
-        // Delete and F2 only apply while the sidebar has focus, so they never
-        // eat a keypress meant for a text field or a terminal.
-        let keys = gtk::EventControllerKey::new();
-        keys.connect_key_pressed({
-            let sender = sender.clone();
-            move |_, key, _, _| {
-                let message = match key {
-                    gdk::Key::Delete => AppMsg::DeleteSelected,
-                    gdk::Key::F2 => AppMsg::RenameSelected,
-                    _ => return glib::Propagation::Proceed,
-                };
-                sender.input(message);
-                glib::Propagation::Stop
-            }
-        });
-        view.add_controller(keys);
-
-        Sidebar {
+        let sidebar = Sidebar {
             pane,
             view,
             selection,
             tree,
             state,
+        };
+        sidebar.add_keys(sender);
+        sidebar
+    }
+
+    /// Delete, F2 and the menu keys only apply while the sidebar has focus,
+    /// so they never eat a keypress meant for a text field or a terminal.
+    fn add_keys(&self, sender: &ComponentSender<App>) {
+        let keys = gtk::EventControllerKey::new();
+        // Weak: the controller belongs to the view, which is inside the pane.
+        let sender = sender.clone();
+        keys.connect_key_pressed(glib::clone!(
+            #[weak(rename_to = view)]
+            self.view,
+            #[weak(rename_to = pane)]
+            self.pane,
+            #[strong(rename_to = selection)]
+            self.selection,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, modifiers| {
+                let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+                let message = match key {
+                    gdk::Key::Delete => AppMsg::DeleteSelected,
+                    gdk::Key::F2 => AppMsg::RenameSelected,
+                    gdk::Key::Menu => menu_for_selection(&view, &selection, &pane),
+                    gdk::Key::F10 if shift => menu_for_selection(&view, &selection, &pane),
+                    _ => return glib::Propagation::Proceed,
+                };
+                sender.input(message);
+                glib::Propagation::Stop
+            }
+        ));
+        self.view.add_controller(keys);
+    }
+
+    /// Moves the keyboard focus to the selected row, or to the first one.
+    pub fn focus(&self) {
+        let selected = self.selection.selected();
+        if selected != gtk::INVALID_LIST_POSITION {
+            self.view
+                .scroll_to(selected, gtk::ListScrollFlags::FOCUS, None);
+        } else if self.selection.n_items() > 0 {
+            let flags = gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT;
+            self.view.scroll_to(0, flags, None);
         }
+        // `scroll_to` only moves the focus if the list has it already, and
+        // otherwise just remembers the row, which this then focuses.
+        self.view.grab_focus();
     }
 
     /// The selected node.
@@ -619,6 +650,38 @@ fn row_at(view: &gtk::ListView, x: f64, y: f64) -> Option<gtk::TreeListRow> {
         }
         widget = widget.parent()?;
     }
+}
+
+/// The context menu for the selected row, opened from the keyboard. It
+/// points just below the row, or at the top of the list when no row is
+/// selected.
+fn menu_for_selection(
+    view: &gtk::ListView,
+    selection: &gtk::SingleSelection,
+    pane: &gtk::Box,
+) -> AppMsg {
+    let row = selection.selected_item().and_downcast::<gtk::TreeListRow>();
+    let node = row.as_ref().and_then(node_of);
+    let widget = row.and_then(|row| row_widget(view, &row));
+    let bounds = widget.and_then(|w| w.compute_bounds(pane));
+    let (x, y) = match bounds {
+        Some(b) => (f64::from(b.x()) + 24.0, f64::from(b.y() + b.height())),
+        None => to_pane(view, pane, 24.0, 0.0),
+    };
+    AppMsg::ContextMenu { node, x, y }
+}
+
+/// The widget drawing `row`, if it is on screen.
+fn row_widget(view: &gtk::ListView, row: &gtk::TreeListRow) -> Option<gtk::Widget> {
+    let mut child = view.first_child();
+    while let Some(widget) = child {
+        let expander = widget.first_child().and_downcast::<gtk::TreeExpander>();
+        if widget.is_mapped() && expander.and_then(|e| e.list_row()).as_ref() == Some(row) {
+            return Some(widget);
+        }
+        child = widget.next_sibling();
+    }
+    None
 }
 
 fn to_pane(widget: &impl IsA<gtk::Widget>, pane: &gtk::Box, x: f64, y: f64) -> (f64, f64) {
