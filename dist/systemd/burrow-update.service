@@ -1,0 +1,9 @@
+[Unit]
+Description=Update Burrow from source
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/burrow-update
+# A build takes minutes; keep it out of the way of the desktop.
+Nice=10
+IOSchedulingClass=idle

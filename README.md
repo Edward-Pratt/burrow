@@ -34,6 +34,15 @@ git clone https://github.com/Edward-Pratt/burrow
 cd burrow/dist && makepkg -si
 ```
 
+To install it for yourself only, in `~/.local`, and keep it up to date with main, run the install script. It needs no root, and adds the same pieces plus a systemd user timer. Once a day the timer fetches main, and when it has moved, builds and installs it in the background, then says so in a desktop notification. Restart Burrow to use the new build.
+
+```sh
+git clone https://github.com/Edward-Pratt/burrow
+burrow/dist/install.sh
+```
+
+The script keeps its own clone in `~/.local/share/burrow/src`. Run `burrow-update` to update now, `burrow-update --branch NAME` to follow another branch, and `journalctl --user -u burrow-update` to see how the last update went. It builds and installs whatever lands on the branch without asking, so anyone who can push there can run code on your computer. To remove it, run `systemctl --user disable --now burrow-update.timer`, then delete `~/.local/bin/{burrow,burrowd,burrow-gtk,burrow-update}`, `~/.local/lib/burrow`, `~/.local/share/burrow/src`, `~/.local/share/icons/hicolor/scalable/apps/dev.burrow.Burrow.svg` and the `burrow*` units in `~/.local/share/systemd/user`.
+
 Anywhere else, build it from the checkout. If a library is missing, `cargo build` names it.
 
 ```sh
@@ -54,7 +63,7 @@ cargo build -p burrow-agent --profile agent --target x86_64-unknown-linux-musl
 
 To add a server, pick **New** and then **SSH host**. Burrow saves the host name, user, port and key in `~/.ssh/config.d/burrow.conf`, so `ssh <alias>` in a terminal connects the same way. The first time, it asks before adding the line that reads that file to the top of `~/.ssh/config`. A host already in `~/.ssh/config` can be added by its alias instead.
 
-Burrow finds it in the workspace it runs from, in `/usr/lib/burrow/` or in `$BURROW_AGENT_DIR`. When something goes wrong, `burrowd.log` in `~/.local/state/burrow/` has the daemon's side of it.
+Burrow finds it in the workspace it runs from, in `lib/burrow/` beside the folder it runs from (`~/.local/lib/burrow/` for the install script), in `/usr/lib/burrow/` or in `$BURROW_AGENT_DIR`. When something goes wrong, `burrowd.log` in `~/.local/state/burrow/` has the daemon's side of it.
 
 ## Running it
 

@@ -233,7 +233,7 @@ target_port = 5432           # "local" only
 - **Asked once per host:** before the first upload, the session asks a `confirm` prompt naming the host, the path and the program's SHA-256. The answer is kept in `$XDG_STATE_HOME/burrow/agent.toml`, pinned to the host node like a grant, so a node file can't approve it. Uploads after that, such as a new version, don't ask.
 - **Checked every time:** each `open_monitor` reads the file back and compares its hash with Burrow's copy, and replaces it if they differ. A symlink at the path, or on the way to it, fails the session: Burrow won't run or write through one.
 - **The server is not trusted:** a line from the agent over 1 MiB, or one that doesn't parse, ends the session, and so does an agent that doesn't say hello first or speaks another protocol version. Names lose control characters and are cut at 256 characters. Lists are cut (256 disks and interfaces, 4096 units), and numbers that no stat can have become 0. A sample still over 16 KiB as JSON ends the session too, so an hour of history stays under 30 MiB and fits one reply.
-- **Where Burrow finds the agent:** the builds are named `burrow-agent-<arch>` and read from `$BURROW_AGENT_DIR`, then `/usr/lib/burrow/`, then the cargo target folder Burrow was built in (`target/<arch>-unknown-linux-musl/agent/`). Build them with `cargo build -p burrow-agent --profile agent --target x86_64-unknown-linux-musl` (or `aarch64-unknown-linux-musl`).
+- **Where Burrow finds the agent:** the builds are named `burrow-agent-<arch>` and read from `$BURROW_AGENT_DIR`, then `lib/burrow/` beside the folder Burrow runs from (`~/.local/lib/burrow/` beside `~/.local/bin/`), then `/usr/lib/burrow/`, then the cargo target folder Burrow was built in (`target/<arch>-unknown-linux-musl/agent/`). Build them with `cargo build -p burrow-agent --profile agent --target x86_64-unknown-linux-musl` (or `aarch64-unknown-linux-musl`).
 
 ## Databases
 
@@ -408,7 +408,7 @@ The daemon sends:
 | `output` (notification) | `{ session, data }` | Terminal output, `data` in base64. |
 | `output_ended` (notification) | `{ session }` | The terminal has no more output. It always comes after the last `output`. |
 
-- **`initialize` first:** anything else before it is refused. `api` must be the daemon's `API_VERSION`. `build` is the client's version; the daemon's comes back, so a client can tell it is talking to a daemon from before an upgrade.
+- **`initialize` first:** anything else before it is refused. `api` must be the daemon's `API_VERSION`. `build` is the client's version, naming the commit in installed builds; the daemon's comes back, so a client can tell it is talking to a daemon from before an upgrade.
 - **Roles:** `role` is `gui` (the GTK window), `cli` or `mcp` (the MCP bridge). `gui` and `cli` may run every command. `mcp` may only do what the user granted; see [MCP bridge](#mcp-bridge).
 - **Sessions belong to their client:** terminals, file sessions and database sessions close when the client that opened them disconnects. Tunnels belong to the daemon and keep running.
 - **Output and events:** replies and events are sent before terminal output, so a busy terminal does not hold them up. Terminal output that the client reads slowly slows the session down rather than being dropped.

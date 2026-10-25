@@ -1,0 +1,11 @@
+[Unit]
+Description=Update Burrow from source every day
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+# Catches up after a day the computer was off.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

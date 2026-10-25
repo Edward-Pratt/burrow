@@ -92,7 +92,7 @@ All non-secret state lives as TOML files in `$XDG_CONFIG_HOME/burrow/` (default 
 | SSH | `russh`; host settings from `ssh -G <alias>` (OpenSSH resolves `Include`/`Match`/patterns itself); agent auth through `IdentityAgent` / `SSH_AUTH_SOCK`; own `known_hosts` reader and writer (russh's skips markers and wildcards) |
 | Paths | XDG base directories (`directories` crate) |
 | Notifications | `burrowd` calls `org.freedesktop.Notifications` over D-Bus itself (zbus, already there for the keyring), so alerts show with no window open; works with mako, swaync and GNOME. Not `GNotification`, which needs the window. |
-| Packaging | AUR PKGBUILD as the main channel, with no self-updater. Not Flatpak: its sandbox blocks host shells, the SSH agent and `~/.ssh`. |
+| Packaging | A PKGBUILD for pacman, or `dist/install.sh` for one user in `~/.local`, which a daily systemd user timer runs again to build and install the newest main. No updater inside the app. Not Flatpak: its sandbox blocks host shells, the SSH agent and `~/.ssh`. |
 | RDP | IronRDP or FreeRDP, as a late addon |
 
 ## Addons

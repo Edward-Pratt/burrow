@@ -92,18 +92,26 @@ impl Agents {
 }
 
 /// Where the agent built for `arch` may be, first choice first: `dir` or
-/// `$BURROW_AGENT_DIR`, then where packages install it, then the cargo
-/// target folder Burrow itself was built in.
+/// `$BURROW_AGENT_DIR`, then `lib/burrow` beside the folder Burrow runs
+/// from (so `~/.local/bin/burrowd` finds `~/.local/lib/burrow`), then where
+/// packages install it, then the cargo target folder Burrow was built in.
 pub(crate) fn candidates(arch: &str, dir: Option<PathBuf>) -> Vec<PathBuf> {
     let name = format!("burrow-agent-{arch}");
     let mut candidates = Vec::new();
     if let Some(dir) = dir.or_else(|| std::env::var_os("BURROW_AGENT_DIR").map(PathBuf::from)) {
         candidates.push(dir.join(&name));
     }
-    candidates.push(Path::new(INSTALLED).join(&name));
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(target) = exe.parent().and_then(Path::parent)
-    {
+    let prefix = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.to_path_buf()));
+    if let Some(prefix) = &prefix {
+        candidates.push(prefix.join("lib/burrow").join(&name));
+    }
+    let installed = Path::new(INSTALLED).join(&name);
+    if !candidates.contains(&installed) {
+        candidates.push(installed);
+    }
+    if let Some(target) = &prefix {
         candidates.push(target.join(format!("{arch}-unknown-linux-musl/agent/burrow-agent")));
     }
     candidates
@@ -344,7 +352,10 @@ mod tests {
         let own = Some(dir.path().to_path_buf());
         let looked = candidates("riscv64", own.clone());
         assert_eq!(looked[0], dir.path().join("burrow-agent-riscv64"));
-        assert_eq!(looked[1], Path::new(INSTALLED).join("burrow-agent-riscv64"));
+        let exe = std::env::current_exe().unwrap();
+        let prefix = exe.parent().unwrap().parent().unwrap();
+        assert_eq!(looked[1], prefix.join("lib/burrow/burrow-agent-riscv64"));
+        assert_eq!(looked[2], Path::new(INSTALLED).join("burrow-agent-riscv64"));
         let error = find_build("riscv64", own.clone()).await.unwrap_err();
         assert!(
             error.contains("--target riscv64-unknown-linux-musl"),
