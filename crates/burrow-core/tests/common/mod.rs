@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use burrow_core::{
@@ -41,12 +41,29 @@ pub fn keygen(path: &Path) {
     assert!(status.success());
 }
 
+/// The ports tests listen on. They sit below the range the kernel gives
+/// to outgoing connections (32768 and up, by default), since a connection
+/// a test makes could otherwise take a port between it being picked and
+/// the test's own bind. Each goes out once per test binary, as tests run
+/// side by side.
+const FIRST_PORT: u16 = 20000;
+const LAST_PORT: u16 = 32767;
+
+/// A port nothing listens on.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static NEXT: Mutex<u16> = Mutex::new(FIRST_PORT);
+    let mut next = NEXT.lock().unwrap();
+    loop {
+        let port = *next;
+        assert!(port <= LAST_PORT, "the tests have used every port");
+        *next += 1;
+        // Something else may listen there; a connection closed earlier in
+        // TIME_WAIT doesn't count, since std sets SO_REUSEADDR as sshd,
+        // postgres and the core do.
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 impl Server {
