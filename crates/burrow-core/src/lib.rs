@@ -29,7 +29,7 @@ pub use api::{
     MonitorHistory, Node, NodeId, NodePatch, POSTGRES_KIND, Problem, Prompt, PromptAnswer,
     PromptKind, QueryError, QueryResult, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue,
     SessionId, SessionInfo, SessionKind, SessionState, StatementResult, TransferId, TransferState,
-    TunnelShown, View, monitor,
+    TrendRange, TunnelShown, View, monitor,
 };
 pub use engine::{Core, CoreOptions, Paths};
 pub use error::{Error, Result};

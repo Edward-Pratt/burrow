@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use burrow_core::{
     Command, Core, Event, GrantShown, MonitorHistory, Node, NodePatch, PromptAnswer, PromptKind,
-    Response, SessionId, SessionState,
+    Response, SessionId, SessionState, TrendRange,
 };
 use common::{Server, WAIT, answer, closed_error, expect_prompt, expect_state, host, trust};
 use tokio::sync::broadcast;
@@ -287,8 +287,14 @@ async fn the_mcp_bridge_monitors_only_with_a_grant_and_never_installs() {
     let node = rig.node.id;
     let open = || Command::OpenMonitor { node };
 
+    let trend = || Command::MonitorTrend {
+        node,
+        range: TrendRange::Day,
+    };
+
     let error = mcp.execute(open()).await.unwrap_err();
     assert!(error.to_string().contains("grant"), "{error}");
+    assert!(mcp.execute(trend()).await.is_err());
     // Running commands is a different grant.
     common::grant(&gui, &rig.node, &[Capability::Exec]).await;
     assert!(mcp.execute(open()).await.is_err());
@@ -296,6 +302,10 @@ async fn the_mcp_bridge_monitors_only_with_a_grant_and_never_installs() {
     // Granted, but nothing is installed yet: the bridge gets an error, and
     // nobody is asked to install.
     common::grant(&gui, &rig.node, &[Capability::MonitorRead]).await;
+    assert!(matches!(
+        mcp.execute(trend()).await.unwrap(),
+        Response::Trend { points } if points.is_empty()
+    ));
     let session = match mcp.execute(open()).await.unwrap() {
         Response::Session { session } => session,
         other => panic!("expected a session, got {other:?}"),

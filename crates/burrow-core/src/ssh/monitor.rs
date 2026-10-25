@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::agent::{self, printable, quote};
+use super::trend::{self, Rollup};
 use super::{Attached, Input, Prompter};
 use crate::api::{Event, MonitorHistory, Node, SessionState};
 use crate::engine::Core;
@@ -60,6 +61,9 @@ pub(crate) struct Monitor {
     /// Set when the agent says hello, so a background monitor knows a
     /// failure came after it had connected.
     connected: AtomicBool,
+    /// For a background monitor, the minute being averaged for its
+    /// history on disk.
+    minute: Option<Mutex<Rollup>>,
 }
 
 #[derive(Default)]
@@ -70,6 +74,14 @@ struct History {
 }
 
 impl Monitor {
+    /// A monitor that writes a point a minute to its host's history.
+    fn recording() -> Monitor {
+        Monitor {
+            minute: Some(Mutex::new(Rollup::new(trend::MINUTE))),
+            ..Monitor::default()
+        }
+    }
+
     pub fn history(&self) -> MonitorHistory {
         let history = self.history.lock().unwrap();
         MonitorHistory {
@@ -157,6 +169,14 @@ pub(super) async fn run(
                                 }
                                 history.samples.push_back(sample.clone());
                                 drop(history);
+                                let point = monitor.minute.as_ref().and_then(|minute| {
+                                    minute.lock().unwrap().push(trend::now(), &sample)
+                                });
+                                if let Some(point) = point
+                                    && let Err(e) = core.trends().append(node.id, &point)
+                                {
+                                    tracing::warn!("could not keep {}'s history: {e}", node.name);
+                                }
                                 core.emit(Event::MonitorSample {
                                     session: prompter.session,
                                     node: node.id,
@@ -218,7 +238,7 @@ pub(super) async fn run_background(
     mut input: mpsc::UnboundedReceiver<Input>,
     prompter: &Prompter,
 ) -> Result<(), String> {
-    let monitor = Arc::new(Monitor::default());
+    let monitor = Arc::new(Monitor::recording());
     let mut wait = RETRY_FIRST;
     loop {
         let error = match run(core, node, &mut input, prompter, true, &monitor).await {

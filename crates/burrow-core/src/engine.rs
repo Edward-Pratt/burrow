@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::grants::{self, Grants};
 use crate::pins::Pins;
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
+use crate::ssh::trend::{self, Trends};
 use crate::ssh::{self, Agents, Autostart, Connections, Input, Sessions, Transfers, files, hosts};
 use crate::tree::{Entry, Tree};
 
@@ -100,6 +101,8 @@ struct Inner {
     monitoring: Pins,
     /// Those hosts, as last announced.
     monitoring_nodes: Mutex<Vec<NodeId>>,
+    /// Their history on disk.
+    trends: Trends,
     grants: Grants,
     /// Where each command the MCP bridge sends is recorded.
     audit_log: PathBuf,
@@ -141,6 +144,7 @@ impl Core {
                 autostart_nodes: Mutex::default(),
                 monitoring: Pins::load(options.state_dir.join("monitoring.toml")),
                 monitoring_nodes: Mutex::default(),
+                trends: Trends::new(options.state_dir.join("monitor")),
                 grants: Grants::load(options.state_dir.join("mcp.toml")),
                 audit_log: options.state_dir.join("mcp-audit.log"),
                 grants_shown: Mutex::default(),
@@ -638,6 +642,10 @@ impl Core {
         &self.inner.agents
     }
 
+    pub(crate) fn trends(&self) -> &Trends {
+        &self.inner.trends
+    }
+
     pub(crate) fn connections(&self) -> &Connections {
         &self.inner.connections
     }
@@ -838,6 +846,7 @@ impl Inner {
                 self.autostart.forget(&ids);
                 self.agents.forget(&ids);
                 self.monitoring.forget(&ids);
+                self.trends.forget(&ids);
                 self.history.forget(&ids);
                 Ok(Response::Ok)
             }
@@ -944,6 +953,18 @@ impl Inner {
                 let lookup = |id| snapshot.iter().find(|n| n.id == id).cloned();
                 self.autostart.set(&lookup, node, enabled)?;
                 Ok(Response::Ok)
+            }
+            Command::MonitorTrend { node, range } => {
+                let node = self.tree().get(node)?.node.clone();
+                if node.kind != SSH_HOST_KIND {
+                    return Err(Error::invalid(
+                        "node",
+                        format!("{} is a {}, not an SSH host", node.name, node.kind),
+                    ));
+                }
+                Ok(Response::Trend {
+                    points: self.trends.points(node.id, range, trend::now()),
+                })
             }
             Command::ListMonitoring => Ok(Response::Monitoring {
                 nodes: self.monitoring_nodes.lock().unwrap().clone(),

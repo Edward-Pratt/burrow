@@ -534,6 +534,15 @@ impl GrantShown {
     }
 }
 
+/// How far back [`Command::MonitorTrend`] looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrendRange {
+    Hour,
+    Day,
+    Week,
+}
+
 /// What a monitor has seen, for [`Command::MonitorHistory`].
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MonitorHistory {
@@ -872,6 +881,13 @@ pub enum Command {
     MonitorHistory {
         session: SessionId,
     },
+    /// A background monitor's history on disk over `range`, as
+    /// [`Response::Trend`]. It reads by host, so it works while no monitor
+    /// runs.
+    MonitorTrend {
+        node: NodeId,
+        range: TrendRange,
+    },
     /// Returns the SSH hosts monitored in the background, as
     /// [`Response::Monitoring`].
     ListMonitoring,
@@ -1016,6 +1032,11 @@ pub enum Response {
     /// SSH hosts monitored in the background.
     Monitoring {
         nodes: Vec<NodeId>,
+    },
+    /// Points averaged from a host's samples, oldest first: one a minute,
+    /// or one every 5 minutes over a week.
+    Trend {
+        points: Vec<monitor::Sample>,
     },
     /// A remote folder: its absolute `path` and its entries, sorted by name.
     Dir {

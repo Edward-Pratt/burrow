@@ -401,6 +401,7 @@ impl Conn {
                 return Ok(Rule::MonitorWithoutInstall);
             }
             Command::MonitorHistory { session: s } => session(*s, MonitorRead)?,
+            Command::MonitorTrend { node: id, .. } => node(*id, MonitorRead)?,
             Command::CloseSession { session: s } => {
                 if self.own_session(*s).is_err() {
                     let tunnel = self

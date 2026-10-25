@@ -20,6 +20,7 @@ mod known_hosts;
 mod monitor;
 mod session;
 mod socks;
+pub(crate) mod trend;
 mod tunnel;
 
 pub(crate) use agent::Agents;
