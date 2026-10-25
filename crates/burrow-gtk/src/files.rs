@@ -75,6 +75,8 @@ pub enum Msg {
     },
     TransferStarted {
         transfer: TransferId,
+        /// The session it runs on.
+        session: SessionId,
         label: String,
     },
     /// A transfer's button: cancel while it runs, dismiss once it failed.
@@ -118,6 +120,16 @@ struct Transfer {
 }
 
 impl Transfer {
+    /// Shows that the transfer stopped without finishing, and turns its
+    /// button into "Dismiss".
+    fn stop(&mut self, status: &str) {
+        self.ended = true;
+        self.status = status.to_string();
+        self.label.add_css_class("error-text");
+        self.button.set_label("Dismiss");
+        self.button.set_visible(true);
+    }
+
     fn redraw(&self) {
         let what = self.what.as_deref().unwrap_or("Copying");
         self.label.set_label(&format!("{what}: {}", self.status));
@@ -298,6 +310,12 @@ impl Files {
             SessionState::Connected => self.list_dir(self.path.clone(), core, sender),
             SessionState::Closed { error } => {
                 self.state = State::Closed;
+                // The core cancels them, but their last events can arrive
+                // after this, or not at all.
+                for row in self.transfers.values_mut().filter(|row| !row.ended) {
+                    row.stop("stopped: the connection ended");
+                    row.redraw();
+                }
                 let text = match error {
                     Some(error) => format!("The connection ended: {}", printable(error)),
                     None => "The connection ended.".into(),
@@ -580,9 +598,19 @@ impl Files {
                 };
                 self.transfer(label, command, core, sender);
             }
-            Msg::TransferStarted { transfer, label } => {
+            Msg::TransferStarted {
+                transfer,
+                session,
+                label,
+            } => {
+                let gone = self.state != State::Running(session);
                 let row = self.transfer_row(transfer, sender);
                 row.what = Some(label);
+                // Its session ended before the reply came, so no more
+                // events will arrive for it.
+                if gone && !row.ended {
+                    row.stop("stopped: the connection ended");
+                }
                 row.redraw();
             }
             Msg::TransferButton(transfer) => match self.transfers.get(&transfer) {
@@ -611,6 +639,11 @@ impl Files {
         }
     }
 
+    /// Whether the transfer is shown here.
+    pub fn has_transfer(&self, transfer: TransferId) -> bool {
+        self.transfers.contains_key(&transfer)
+    }
+
     /// A transfer of this panel's session moved on.
     pub fn transfer_changed(
         &mut self,
@@ -621,6 +654,11 @@ impl Files {
     ) {
         let node = self.node;
         let row = self.transfer_row(transfer, sender);
+        // A row ends once. Events that come later, after its session
+        // ended, say less than the row does.
+        if row.ended {
+            return;
+        }
         row.ended = !matches!(state, TransferState::Running { .. });
         let dismiss_later = || {
             let sender = sender.clone();
@@ -647,11 +685,7 @@ impl Files {
                 row.button.set_visible(false);
                 dismiss_later();
             }
-            TransferState::Failed { error } => {
-                row.status = printable(error);
-                row.label.add_css_class("error-text");
-                row.button.set_label("Dismiss");
-            }
+            TransferState::Failed { error } => row.stop(&printable(error)),
         }
         row.redraw();
         if *state == TransferState::Finished {
@@ -759,7 +793,11 @@ impl Files {
         let (core, input, node) = (core.clone(), sender.input_sender().clone(), self.node);
         runtime().spawn(async move {
             let msg = match core.execute(command).await {
-                Ok(Response::Transfer { transfer }) => Msg::TransferStarted { transfer, label },
+                Ok(Response::Transfer { transfer }) => Msg::TransferStarted {
+                    transfer,
+                    session,
+                    label,
+                },
                 Ok(other) => Msg::Failed(format!("unexpected reply {other:?}")),
                 Err(e) => Msg::Failed(e.to_string()),
             };

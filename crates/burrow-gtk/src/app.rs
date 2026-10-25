@@ -138,6 +138,11 @@ pub enum AppMsg {
         node: NodeId,
         enabled: bool,
     },
+    /// `set_autostart` failed, so the tunnel's checkbox is wrong.
+    AutostartFailed {
+        node: NodeId,
+        error: String,
+    },
     /// (Re)loads an addon node's view.
     LoadView(NodeId),
     ViewLoaded {
@@ -531,7 +536,18 @@ impl Component for App {
             }
             AppMsg::EditTunnel(node) => self.edit_tunnel(Some(node), None, window, &sender),
             AppMsg::SetAutostart { node, enabled } => {
-                execute(&self.core, &sender, Command::SetAutostart { node, enabled });
+                let (core, input) = (self.core.clone(), sender.input_sender().clone());
+                runtime().spawn(async move {
+                    let command = Command::SetAutostart { node, enabled };
+                    if let Err(e) = core.execute(command).await {
+                        let error = e.to_string();
+                        let _ = input.send(AppMsg::AutostartFailed { node, error });
+                    }
+                });
+            }
+            AppMsg::AutostartFailed { node, error } => {
+                self.error = Some(error);
+                self.refresh_tunnel(node, &sender);
             }
             AppMsg::LoadView(id) => self.load_view(id, &sender),
             AppMsg::ViewLoaded { node, result } => self.show_view(node, result, &sender),
@@ -744,8 +760,14 @@ impl App {
                 session,
                 state,
             } => {
+                // A transfer's last events can come after its session
+                // ended, so the panel showing it comes first.
                 let running = remote::State::Running(session);
-                if let Some(panel) = self.files.values_mut().find(|p| p.state == running) {
+                let panel = self
+                    .files
+                    .values_mut()
+                    .find(|p| p.has_transfer(transfer) || p.state == running);
+                if let Some(panel) = panel {
                     panel.transfer_changed(transfer, &state, &self.core, sender);
                 }
             }
@@ -1090,7 +1112,11 @@ impl App {
             .map(|n| (n.id, n.name.clone()))
             .collect();
         hosts.sort_by_key(|(id, name)| (name.to_lowercase(), *id));
-        let (core, sender) = (self.core.clone(), sender.clone());
+        // Starting with Burrow is pinned to the settings, so a change
+        // withdraws it. A change made here is the user's own, so it is
+        // asked for again.
+        let autostart = id.is_some_and(|id| self.autostart.contains(&id));
+        let (core, input) = (self.core.clone(), sender.input_sender().clone());
         tunnels::edit(window, node, hosts, move |name, props| {
             let command = match id {
                 Some(id) => Command::UpdateNode {
@@ -1109,7 +1135,22 @@ impl App {
                     props,
                 },
             };
-            execute(&core, &sender, command);
+            let (core, input) = (core.clone(), input.clone());
+            runtime().spawn(async move {
+                let result = match core.execute(command).await {
+                    Ok(Response::Node { node }) if autostart => {
+                        let command = Command::SetAutostart {
+                            node: node.id,
+                            enabled: true,
+                        };
+                        core.execute(command).await
+                    }
+                    other => other,
+                };
+                if let Err(e) = result {
+                    let _ = input.send(AppMsg::Failed(e.to_string()));
+                }
+            });
         });
     }
 
