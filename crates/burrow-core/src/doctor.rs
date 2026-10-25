@@ -236,10 +236,18 @@ async fn agent_build(arch: &str) -> Check {
                 name,
                 format!("none in {}", looked.join(", ")),
                 format!(
-                    "Monitors on {arch} servers need it. Run `rustup target add \
-                     {arch}-unknown-linux-musl`, then `cargo build -p burrow-agent --profile agent \
-                     --target {arch}-unknown-linux-musl`, and run Burrow from that workspace, or \
-                     put the build in one of the folders above"
+                    "Monitors on {arch} servers need it. If Burrow was installed with \
+                     dist/install.sh, run `burrow-update` in a terminal, which sets up the \
+                     {arch}-unknown-linux-musl target and builds it. Otherwise add that target \
+                     (`rustup target add {arch}-unknown-linux-musl`, or {package} with pacman's \
+                     rust), then `cargo build -p burrow-agent --profile agent --target \
+                     {arch}-unknown-linux-musl`, and run Burrow from that workspace, or put the \
+                     build in one of the folders above",
+                    package = if arch == "x86_64" {
+                        "rust-musl"
+                    } else {
+                        "rust-aarch64-musl"
+                    }
                 ),
             )
         }
