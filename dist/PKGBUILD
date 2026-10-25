@@ -45,6 +45,9 @@ prepare() {
 build() {
   cd burrow
   export CARGO_TARGET_DIR=target
+  # Names the commit, so a daemon left running from before an upgrade
+  # looks out of date to the new window.
+  export BURROW_BUILD=$pkgver
   cargo build --frozen --release -p burrow-gtk -p burrowd -p burrow-cli
   for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     [ -d "$(rustc --print target-libdir --target "$target")" ] || continue
