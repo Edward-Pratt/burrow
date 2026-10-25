@@ -22,6 +22,7 @@ use sourceview5::prelude::*;
 
 use crate::app::{App, AppMsg};
 use crate::dialogs;
+use crate::files::printable;
 use crate::remote::State;
 use crate::runtime::runtime;
 
@@ -1141,14 +1142,6 @@ fn ago(seconds: u64) -> String {
 /// name.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// Text from the server, with control characters replaced so they can't
-/// change what is around them.
-fn printable(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-        .collect()
 }
 
 /// What the database dialog edits. Other props, such as `sslrootcert` when
