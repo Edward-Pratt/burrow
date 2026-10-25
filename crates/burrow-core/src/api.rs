@@ -239,6 +239,11 @@ pub struct SessionInfo {
     pub kind: SessionKind,
     #[serde(flatten)]
     pub state: SessionState,
+    /// A monitor the core runs for [`Command::SetMonitoring`] rather than
+    /// for a client. It reconnects by itself, and only turning monitoring
+    /// off stops it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
 }
 
 /// A question a session needs answered before it can go on, such as
@@ -527,6 +532,48 @@ impl GrantShown {
     pub fn of(node: &Node, nodes: &[Node]) -> GrantShown {
         crate::grants::shown(&|id| nodes.iter().find(|n| n.id == id).cloned(), node)
     }
+}
+
+/// Identifies an alert. Unique for as long as the core runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AlertId(pub u64);
+
+/// Something wrong on an SSH host monitored in the background. It is
+/// raised once, and cleared once the condition ends.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Alert {
+    pub id: AlertId,
+    pub node: NodeId,
+    #[serde(flatten)]
+    pub kind: AlertKind,
+    /// When it was raised, in Unix milliseconds by this computer's clock.
+    pub since: u64,
+}
+
+/// What an [`Alert`] is about. Names come from the server, cleaned.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AlertKind {
+    /// A systemd service failed.
+    UnitFailed { unit: String },
+    /// A disk is over 90% full, by a minute's average. It clears below 85%.
+    DiskFull { mount: String, percent: f64 },
+    /// Under 10% of memory is available, by a minute's average. It clears
+    /// above 15%.
+    MemoryLow { percent: f64 },
+    /// The host or its agent stopped answering for a minute, after the
+    /// monitor had connected.
+    Unreachable { error: String },
+}
+
+/// How far back [`Command::MonitorTrend`] looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrendRange {
+    Hour,
+    Day,
+    Week,
 }
 
 /// What a monitor has seen, for [`Command::MonitorHistory`].
@@ -858,13 +905,37 @@ pub enum Command {
     },
     /// Starts burrow-agent on an SSH host node, putting it there first if
     /// needed, and reports what it sees as [`Event::MonitorSample`] and
-    /// [`Event::MonitorUnits`]. Returns [`Response::Session`].
+    /// [`Event::MonitorUnits`]. Returns [`Response::Session`]: the host's
+    /// background monitor if it has one, otherwise a new session.
     OpenMonitor {
         node: NodeId,
     },
     /// What a monitor session has seen so far, as [`Response::Monitor`].
     MonitorHistory {
         session: SessionId,
+    },
+    /// A background monitor's history on disk over `range`, as
+    /// [`Response::Trend`]. It reads by host, so it works while no monitor
+    /// runs.
+    MonitorTrend {
+        node: NodeId,
+        range: TrendRange,
+    },
+    /// Returns the SSH hosts monitored in the background, as
+    /// [`Response::Monitoring`].
+    ListMonitoring,
+    /// Returns the alerts that hold now, oldest first, as
+    /// [`Response::Alerts`].
+    ListAlerts,
+    /// Monitors an SSH host in the background, from when Burrow starts, or
+    /// stops doing so. Like autostart, the choice is kept on this computer
+    /// and only holds while the host's settings stay as they were, and
+    /// turning it on needs `expect`, the host as the user was shown it.
+    SetMonitoring {
+        node: NodeId,
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<GrantShown>,
     },
     /// Returns the tunnels that start with Burrow, as [`Response::Autostart`].
     ListAutostart,
@@ -994,6 +1065,18 @@ pub enum Response {
     Autostart {
         nodes: Vec<NodeId>,
     },
+    /// SSH hosts monitored in the background.
+    Monitoring {
+        nodes: Vec<NodeId>,
+    },
+    Alerts {
+        alerts: Vec<Alert>,
+    },
+    /// Points averaged from a host's samples, oldest first: one a minute,
+    /// or one every 5 minutes over a week.
+    Trend {
+        points: Vec<monitor::Sample>,
+    },
     /// A remote folder: its absolute `path` and its entries, sorted by name.
     Dir {
         path: String,
@@ -1096,6 +1179,18 @@ pub enum Event {
     /// The tunnels that start with Burrow changed.
     AutostartChanged {
         nodes: Vec<NodeId>,
+    },
+    /// The SSH hosts monitored in the background changed.
+    MonitoringChanged {
+        nodes: Vec<NodeId>,
+    },
+    /// Something went wrong on a host monitored in the background.
+    AlertRaised {
+        alert: Alert,
+    },
+    /// An alert's condition ended, or its host stopped being monitored.
+    AlertCleared {
+        alert: Alert,
     },
     /// The session waits for [`Command::AnswerPrompt`].
     PromptRequested {

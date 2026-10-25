@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use burrow_core::ipc::{self, Client, Role};
 use burrow_core::{
-    AddonInfo, Capability, Command, Event, FormValue, Grant, GrantShown, Node, NodeId, NodePatch,
-    POSTGRES_KIND, Problem, Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId,
+    AddonInfo, Alert, Capability, Command, Event, FormValue, Grant, GrantShown, Node, NodeId,
+    NodePatch, POSTGRES_KIND, Problem, Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId,
     SessionInfo, SessionKind, SessionState, TunnelShown, View,
 };
 use relm4::gtk::prelude::*;
@@ -68,6 +68,8 @@ pub enum AppMsg {
         addons: Vec<AddonInfo>,
         sessions: Vec<SessionInfo>,
         autostart: Vec<NodeId>,
+        monitoring: Vec<NodeId>,
+        alerts: Vec<Alert>,
     },
     CoreEvent(Event),
     /// The core's sessions, looked up to find whose a prompt is.
@@ -170,6 +172,8 @@ pub enum AppMsg {
         node: NodeId,
         enabled: bool,
     },
+    /// `set_monitoring` failed, so a monitor's checkbox is wrong.
+    MonitoringFailed(String),
     /// `set_autostart` failed, so the tunnel's checkbox is wrong.
     AutostartFailed {
         node: NodeId,
@@ -267,6 +271,10 @@ pub struct App {
     restarting: HashSet<NodeId>,
     /// Tunnels that start with Burrow.
     autostart: HashSet<NodeId>,
+    /// SSH hosts monitored in the background.
+    monitoring: HashSet<NodeId>,
+    /// Their alerts that hold now.
+    alerts: Vec<Alert>,
     /// Prompt dialogs on screen, by session and prompt id, to close when
     /// another client answers first. A `RefCell` because prompts are asked
     /// while a tab's panel is borrowed.
@@ -343,6 +351,8 @@ impl Component for App {
             tunnel_pages: HashMap::new(),
             restarting: HashSet::new(),
             autostart: HashSet::new(),
+            monitoring: HashSet::new(),
+            alerts: Vec::new(),
             prompts: RefCell::default(),
             sidebar_dirty: false,
         };
@@ -365,6 +375,8 @@ impl Component for App {
                 addons,
                 sessions,
                 autostart,
+                monitoring,
+                alerts,
             } => {
                 let loaded = Loaded {
                     nodes,
@@ -372,6 +384,8 @@ impl Component for App {
                     addons,
                     sessions,
                     autostart,
+                    monitoring,
+                    alerts,
                 };
                 self.loaded(loaded, widgets, window, &sender);
             }
@@ -548,6 +562,9 @@ impl Component for App {
             } => match self.monitors.get_mut(&node) {
                 Some(panel) if panel.state == remote::State::Starting => {
                     panel.state = remote::State::Running(session);
+                    // A background monitor may have connected long ago,
+                    // so no "connected" event is coming.
+                    panel.fetch_history(&self.core, &sender);
                     for event in self.unclaimed.claim(session) {
                         self.session_event(event, window, &sender);
                     }
@@ -555,10 +572,18 @@ impl Component for App {
                 // The tab was closed while the session started.
                 _ => execute(&self.core, &sender, Command::CloseSession { session }),
             },
+            AppMsg::Monitor {
+                node,
+                msg: monitor::Msg::SetBackground(on),
+            } => self.set_monitoring(node, on, window, &sender),
             AppMsg::Monitor { node, msg } => {
                 if let Some(panel) = self.monitors.get_mut(&node) {
                     panel.update(msg, &self.core, &sender);
                 }
+            }
+            AppMsg::MonitoringFailed(error) => {
+                self.error = Some(error);
+                self.refresh_monitors();
             }
             AppMsg::StartTunnel(node) => {
                 execute(&self.core, &sender, Command::StartTunnel { node });
@@ -756,6 +781,8 @@ struct Loaded {
     addons: Vec<AddonInfo>,
     sessions: Vec<SessionInfo>,
     autostart: Vec<NodeId>,
+    monitoring: Vec<NodeId>,
+    alerts: Vec<Alert>,
 }
 
 impl App {
@@ -774,10 +801,15 @@ impl App {
             addons,
             sessions,
             autostart,
+            monitoring,
+            alerts,
         } = loaded;
         self.nodes = nodes.into_iter().map(|n| (n.id, n)).collect();
         self.problems = problems;
         self.autostart = autostart.into_iter().collect();
+        self.monitoring = monitoring.into_iter().collect();
+        self.alerts = alerts;
+        self.refresh_monitors();
         self.set_addons(addons, widgets, sender);
         // Events may have been missed, so a tunnel that isn't running any
         // more has stopped.
@@ -941,6 +973,18 @@ impl App {
             Event::SessionChanged { .. }
             | Event::PromptRequested { .. }
             | Event::GrantsChanged { .. } => {}
+            Event::MonitoringChanged { nodes } => {
+                self.monitoring = nodes.into_iter().collect();
+                self.refresh_monitors();
+            }
+            Event::AlertRaised { alert } => {
+                self.alerts.push(alert);
+                self.refresh_monitors();
+            }
+            Event::AlertCleared { alert } => {
+                self.alerts.retain(|a| a.id != alert.id);
+                self.refresh_monitors();
+            }
             Event::PromptClosed { session, prompt } => {
                 if let Some(dialog) = self.prompts.get_mut().remove(&(session, prompt)) {
                     dialog.dismiss();
@@ -953,7 +997,7 @@ impl App {
             } => {
                 let running = remote::State::Running(session);
                 if let Some(panel) = self.monitors.values_mut().find(|p| p.state == running) {
-                    panel.sample(&sample);
+                    panel.sample(&sample, &self.core, sender);
                 }
             }
             Event::MonitorUnits { session, units, .. } => {
@@ -1581,6 +1625,74 @@ impl App {
         self.add_tab(key, page, icon, &title, widgets, sender);
         monitor::start(&self.core, id, sender);
         self.monitors.insert(id, panel);
+        self.refresh_monitors();
+    }
+
+    /// Shows each monitor tab whether its host is monitored in the
+    /// background, and its alerts.
+    fn refresh_monitors(&mut self) {
+        for (node, panel) in &mut self.monitors {
+            panel.set_background(self.monitoring.contains(node));
+            let alerts: Vec<&Alert> = self.alerts.iter().filter(|a| a.node == *node).collect();
+            panel.set_alerts(&alerts);
+        }
+    }
+
+    /// Turns background monitoring of `id` on, after saying what that
+    /// means, or off.
+    fn set_monitoring(
+        &mut self,
+        id: NodeId,
+        on: bool,
+        window: &gtk::ApplicationWindow,
+        sender: &ComponentSender<Self>,
+    ) {
+        let Some(node) = self.nodes.get(&id).cloned() else {
+            return;
+        };
+        let (core, input) = (self.core.clone(), sender.input_sender().clone());
+        let send = move |command: Command| {
+            runtime().spawn(async move {
+                if let Err(e) = core.execute(command).await {
+                    let _ = input.send(AppMsg::MonitoringFailed(e.to_string()));
+                }
+            });
+        };
+        if !on {
+            send(Command::SetMonitoring {
+                node: id,
+                enabled: false,
+                expect: None,
+            });
+            return;
+        }
+        // The checkbox follows the core, so it stays off until the core
+        // says otherwise.
+        self.refresh_monitors();
+        let nodes: Vec<Node> = self.nodes.values().cloned().collect();
+        let expect = Some(GrantShown::of(&node, &nodes));
+        let name = files::printable(&node.name);
+        let detail = format!(
+            "While Burrow runs, it keeps a monitor open on {name}, even with no window open, \
+             keeps a week of its history on this computer, and shows a notification when a \
+             service fails, a disk is nearly full, memory runs low, or {name} stops answering.\n\n\
+             It installs burrow-agent there if needed, as an open monitor does. It holds only \
+             while {name}'s settings stay as they are. To monitor from login, enable \
+             burrowd.service (systemctl --user enable burrowd.service)."
+        );
+        dialogs::confirm(
+            window,
+            &format!("Monitor {name} in the background?"),
+            &detail,
+            "Monitor",
+            move || {
+                send(Command::SetMonitoring {
+                    node: id,
+                    enabled: true,
+                    expect,
+                })
+            },
+        );
     }
 
     fn open_terminal(
@@ -2096,12 +2208,22 @@ fn load(core: &Client, sender: &ComponentSender<App>) {
                 Response::Autostart { nodes } => nodes,
                 _ => Vec::new(),
             };
+            let monitoring = match core.execute(Command::ListMonitoring).await? {
+                Response::Monitoring { nodes } => nodes,
+                _ => Vec::new(),
+            };
+            let alerts = match core.execute(Command::ListAlerts).await? {
+                Response::Alerts { alerts } => alerts,
+                _ => Vec::new(),
+            };
             Ok::<_, burrow_core::Error>(AppMsg::Loaded {
                 nodes,
                 problems,
                 addons,
                 sessions,
                 autostart,
+                monitoring,
+                alerts,
             })
         }
         .await;

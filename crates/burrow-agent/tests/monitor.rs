@@ -10,8 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use burrow_core::{
-    Command, Core, Event, MonitorHistory, Node, PromptAnswer, PromptKind, Response, SessionId,
-    SessionState,
+    AlertKind, Command, Core, Event, GrantShown, MonitorHistory, Node, NodePatch, PromptAnswer,
+    PromptKind, Response, SessionId, SessionState, TrendRange,
 };
 use common::{Server, WAIT, answer, closed_error, expect_prompt, expect_state, host, trust};
 use tokio::sync::broadcast;
@@ -287,8 +287,19 @@ async fn the_mcp_bridge_monitors_only_with_a_grant_and_never_installs() {
     let node = rig.node.id;
     let open = || Command::OpenMonitor { node };
 
+    let trend = || Command::MonitorTrend {
+        node,
+        range: TrendRange::Day,
+    };
+
     let error = mcp.execute(open()).await.unwrap_err();
     assert!(error.to_string().contains("grant"), "{error}");
+    assert!(mcp.execute(trend()).await.is_err());
+    // Alerts are listed, but only those of hosts it may monitor.
+    assert!(matches!(
+        mcp.execute(Command::ListAlerts).await.unwrap(),
+        Response::Alerts { alerts } if alerts.is_empty()
+    ));
     // Running commands is a different grant.
     common::grant(&gui, &rig.node, &[Capability::Exec]).await;
     assert!(mcp.execute(open()).await.is_err());
@@ -296,6 +307,10 @@ async fn the_mcp_bridge_monitors_only_with_a_grant_and_never_installs() {
     // Granted, but nothing is installed yet: the bridge gets an error, and
     // nobody is asked to install.
     common::grant(&gui, &rig.node, &[Capability::MonitorRead]).await;
+    assert!(matches!(
+        mcp.execute(trend()).await.unwrap(),
+        Response::Trend { points } if points.is_empty()
+    ));
     let session = match mcp.execute(open()).await.unwrap() {
         Response::Session { session } => session,
         other => panic!("expected a session, got {other:?}"),
@@ -371,4 +386,193 @@ async fn changing_the_host_asks_again() {
     let second = rig.open().await;
     let prompt = expect_prompt(&mut rig.events, second).await;
     assert_eq!(prompt.title, "Install burrow-agent?");
+}
+
+/// Turns background monitoring on for the rig's host, as the user would
+/// after seeing it, and returns the session the core started for it.
+async fn monitor_in_background(rig: &mut Rig) -> SessionId {
+    let command = Command::SetMonitoring {
+        node: rig.node.id,
+        enabled: true,
+        expect: Some(GrantShown::of(&rig.node, std::slice::from_ref(&rig.node))),
+    };
+    rig.core.execute(command).await.unwrap();
+    match rig.core.execute(Command::ListSessions).await.unwrap() {
+        Response::Sessions { sessions } => {
+            sessions
+                .into_iter()
+                .find(|s| s.node == rig.node.id && s.background)
+                .expect("no background monitor started")
+                .session
+        }
+        other => panic!("expected sessions, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_background_monitor_is_shared_and_only_stops_when_turned_off() {
+    let Some(mut rig) = Rig::start().await else {
+        return;
+    };
+    let unseen = Command::SetMonitoring {
+        node: rig.node.id,
+        enabled: true,
+        expect: None,
+    };
+    assert!(rig.core.execute(unseen).await.is_err());
+
+    let session = monitor_in_background(&mut rig).await;
+    assert!(
+        fs::read_to_string(rig.server.path("state/monitoring.toml"))
+            .unwrap()
+            .contains(&rig.node.id.to_string())
+    );
+    // The agent's own consent still decides the first upload.
+    let prompt = expect_prompt(&mut rig.events, session).await;
+    assert_eq!(prompt.title, "Install burrow-agent?");
+    answer(&rig.core, session, &prompt, PromptAnswer::Confirm).await;
+    assert_eq!(
+        expect_state(&mut rig.events, session).await,
+        SessionState::Connected
+    );
+
+    assert_eq!(rig.open().await, session);
+    let close = Command::CloseSession { session };
+    assert!(rig.core.execute(close).await.is_err());
+    rig.next_sample(session).await;
+
+    // An agent that stops is reconnected, after a wait.
+    std::process::Command::new("pkill")
+        .arg("-f")
+        .arg(rig.remote())
+        .status()
+        .unwrap();
+    let step = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::SessionChanged {
+                session: s,
+                state: SessionState::Connecting { step },
+                ..
+            } = rig.events.recv().await.unwrap()
+                && s == session
+            {
+                return step;
+            }
+        }
+    })
+    .await
+    .expect("the monitor did not try again");
+    assert!(step.starts_with("Reconnecting in 30 s: "), "{step}");
+
+    rig.core
+        .execute(Command::SetMonitoring {
+            node: rig.node.id,
+            enabled: false,
+            expect: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        closed_error(expect_state(&mut rig.events, session).await),
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changing_the_host_stops_its_background_monitor() {
+    let Some(mut rig) = Rig::start().await else {
+        return;
+    };
+    let session = monitor_in_background(&mut rig).await;
+    let prompt = expect_prompt(&mut rig.events, session).await;
+    answer(&rig.core, session, &prompt, PromptAnswer::Confirm).await;
+    expect_state(&mut rig.events, session).await;
+
+    let mut props = rig.node.props.clone();
+    props.insert("user".into(), "someone-else".into());
+    let patch = NodePatch {
+        props: Some(props),
+        ..Default::default()
+    };
+    let command = Command::UpdateNode {
+        id: rig.node.id,
+        patch,
+    };
+    rig.core.execute(command).await.unwrap();
+    assert_eq!(
+        closed_error(expect_state(&mut rig.events, session).await),
+        None
+    );
+    match rig.core.execute(Command::ListMonitoring).await.unwrap() {
+        Response::Monitoring { nodes } => assert!(nodes.is_empty()),
+        other => panic!("expected monitoring, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_stops_answering_raises_an_alert_until_turned_off() {
+    let Some(mut rig) = Rig::start().await else {
+        return;
+    };
+    rig.core.set_monitor_waits(
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_secs(1),
+    );
+    let session = monitor_in_background(&mut rig).await;
+    let prompt = expect_prompt(&mut rig.events, session).await;
+    answer(&rig.core, session, &prompt, PromptAnswer::Confirm).await;
+    expect_state(&mut rig.events, session).await;
+
+    // Burrow's own copy is gone and the server's is broken, so the agent
+    // can't be started again.
+    fs::remove_dir_all(rig.server.path("builds")).unwrap();
+    fs::remove_file(rig.remote()).unwrap();
+    fs::write(rig.remote(), b"#!/bin/sh\nexit 1\n").unwrap();
+    std::process::Command::new("pkill")
+        .arg("-f")
+        .arg(rig.remote())
+        .status()
+        .unwrap();
+
+    let alert = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::AlertRaised { alert } = rig.events.recv().await.unwrap() {
+                return alert;
+            }
+        }
+    })
+    .await
+    .expect("no alert was raised");
+    assert_eq!(alert.node, rig.node.id);
+    assert!(
+        matches!(&alert.kind, AlertKind::Unreachable { error } if !error.is_empty()),
+        "{alert:?}"
+    );
+    match rig.core.execute(Command::ListAlerts).await.unwrap() {
+        Response::Alerts { alerts } => assert_eq!(alerts, vec![alert.clone()]),
+        other => panic!("expected alerts, got {other:?}"),
+    }
+
+    rig.core
+        .execute(Command::SetMonitoring {
+            node: rig.node.id,
+            enabled: false,
+            expect: None,
+        })
+        .await
+        .unwrap();
+    let cleared = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::AlertCleared { alert } = rig.events.recv().await.unwrap() {
+                return alert;
+            }
+        }
+    })
+    .await
+    .expect("the alert was not cleared");
+    assert_eq!(cleared.id, alert.id);
+    match rig.core.execute(Command::ListAlerts).await.unwrap() {
+        Response::Alerts { alerts } => assert!(alerts.is_empty()),
+        other => panic!("expected alerts, got {other:?}"),
+    }
 }

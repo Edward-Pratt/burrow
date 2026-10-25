@@ -331,7 +331,20 @@ impl Bridge {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         };
-        Ok(serde_json::to_string_pretty(&monitor_summary(&history, all_units)).unwrap_or_default())
+        let mut summary = monitor_summary(&history, all_units);
+        // A host monitored in the background has alerts too.
+        let running = self.sessions_list().await?;
+        let info = running.iter().find(|s| s.session == session);
+        if let Some(info) = info.filter(|info| info.background) {
+            let alerts = match self.execute(Command::ListAlerts).await? {
+                Response::Alerts { alerts } => alerts,
+                _ => Vec::new(),
+            };
+            let alerts: Vec<_> = alerts.into_iter().filter(|a| a.node == info.node).collect();
+            summary["background"] = json!(true);
+            summary["alerts"] = json!(alerts);
+        }
+        Ok(serde_json::to_string_pretty(&summary).unwrap_or_default())
     }
 
     async fn node(&self, arg: &str) -> Result<Node, Called> {
@@ -585,7 +598,7 @@ fn tools() -> Value {
         ),
         tool(
             "monitor",
-            "Show an SSH host's CPU, memory, disks, network, load and systemd services, with a summary of the last hour while the monitor has been open. Needs monitor-read, and burrow-agent installed on the host from Burrow.",
+            "Show an SSH host's CPU, memory, disks, network, load and systemd services, with a summary of the last hour while the monitor has been open. For a host Burrow monitors in the background, also the alerts that hold now (failed services, full disks, low memory, not answering). Needs monitor-read, and burrow-agent installed on the host from Burrow.",
             json!({
                 "node": node,
                 "units": {"type": "string", "enum": ["failed", "all"], "description": "Which services to list, default failed"},

@@ -127,8 +127,7 @@ impl Grants {
         let expect = expect.ok_or_else(|| {
             Error::invalid("expect", "granting needs the settings the user was shown")
         })?;
-        let current = fingerprint(lookup, node);
-        if shown_fingerprint(&node.kind, expect) != current {
+        if !matches(lookup, node, expect) {
             return Err(Error::invalid(
                 "expect",
                 format!("{} changed after it was shown; show it again", node.name),
@@ -138,7 +137,7 @@ impl Grants {
             node.id,
             Saving {
                 capabilities,
-                fingerprint: current,
+                fingerprint: fingerprint(lookup, node),
             },
         );
         save(&self.path, &saved)
@@ -183,6 +182,11 @@ fn via(lookup: &impl Lookup, node: &Node) -> Option<Node> {
 
 pub(crate) fn fingerprint(lookup: &impl Lookup, node: &Node) -> String {
     shown_fingerprint(&node.kind, &shown(lookup, node))
+}
+
+/// Whether `node` is still as `shown` says the user saw it.
+pub(crate) fn matches(lookup: &impl Lookup, node: &Node, shown: &GrantShown) -> bool {
+    shown_fingerprint(&node.kind, shown) == fingerprint(lookup, node)
 }
 
 /// A digest of everything that decides where a node leads. The name is in
