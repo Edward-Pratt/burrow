@@ -7,4 +7,4 @@ Icon=dev.burrow.Burrow
 Terminal=false
 Categories=Development;System;Network;
 Keywords=ssh;terminal;database;postgres;tunnel;sftp;
-StartupWMClass=dev.burrow.Burrow
+StartupWMClass=burrow-gtk

@@ -107,6 +107,11 @@ for arch in "${agents[@]}"; do
 done
 put 755 dist/install.sh "$bin/burrow-update"
 put 644 dist/icons/dev.burrow.Burrow.svg "$data/icons/hicolor/scalable/apps/dev.burrow.Burrow.svg"
+# GTK trusts an icon cache that another installer left here, which hides
+# icons added after it. Without one, it reads the folders themselves.
+if [ -f "$data/icons/hicolor/icon-theme.cache" ]; then
+  gtk4-update-icon-cache --quiet --force --ignore-theme-index "$data/icons/hicolor"
+fi
 # Launchers don't search ~/.local/bin, and neither does systemd.
 edit "s|^Exec=burrow-gtk|Exec=$bin/burrow-gtk|" \
   dist/dev.burrow.Burrow.desktop "$data/applications/dev.burrow.Burrow.desktop"
