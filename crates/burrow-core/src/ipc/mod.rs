@@ -9,6 +9,7 @@
 
 mod client;
 mod server;
+mod start;
 
 use std::path::PathBuf;
 
@@ -17,6 +18,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub use client::{Client, Events};
 pub use server::serve;
+pub(crate) use start::{LOCK, SOCKET};
+pub use start::{connect, ensure_private_dir, runtime_dir};
 
 /// The longest line either side accepts. Lines are long when a query
 /// returns many rows, so this is generous; it only stops a runaway peer
@@ -61,6 +64,11 @@ pub struct ServerInfo {
 
 /// This build's version, compared between client and daemon.
 pub const BUILD: &str = env!("CARGO_PKG_VERSION");
+
+pub(crate) fn own_uid() -> u32 {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}
 
 /// Reads one line, without its `\n`, into `line`. `Ok(None)` at the end of
 /// input. A line longer than `max` is an error, found before it is all

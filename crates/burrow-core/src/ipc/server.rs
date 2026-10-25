@@ -7,8 +7,9 @@
 //! SSH channel rather than losing bytes.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use data_encoding::BASE64;
 use serde::Deserialize;
@@ -35,19 +36,54 @@ const OUTBOX: usize = 64;
 /// Terminal output queued for a client, across all its sessions.
 const OUTPUT_QUEUE: usize = 16;
 
-/// Serves clients on `listener` until the task is dropped.
-pub async fn serve(core: Core, listener: UnixListener) {
+/// How often an idle daemon checks whether it can stop.
+const IDLE_CHECK: Duration = Duration::from_secs(5);
+
+/// Serves clients on `listener`. With `idle`, it returns once no client
+/// has been connected and no session running for that long; otherwise it
+/// runs until the task is dropped.
+pub async fn serve(core: Core, listener: UnixListener, idle: Option<Duration>) {
+    let clients = Arc::new(AtomicUsize::new(0));
+    let mut idle_since = Instant::now();
+    let mut check = tokio::time::interval(IDLE_CHECK);
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                tokio::spawn(connection(core.clone(), stream));
-            }
-            // Out of file descriptors, most likely. Waiting lets some close.
-            Err(e) => {
-                tracing::warn!("could not accept a client: {e}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let guard = Connected::new(&clients);
+                    tokio::spawn(connection(core.clone(), stream, guard));
+                }
+                // Out of file descriptors, most likely. Waiting lets some close.
+                Err(e) => {
+                    tracing::warn!("could not accept a client: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
+            _ = check.tick(), if idle.is_some() => {
+                let busy = clients.load(Ordering::SeqCst) > 0 || !core.sessions().list().is_empty();
+                if busy {
+                    idle_since = Instant::now();
+                } else if idle.is_some_and(|idle| idle_since.elapsed() >= idle) {
+                    return;
+                }
             }
         }
+    }
+}
+
+/// Counts a client as connected while it is alive.
+struct Connected(Arc<AtomicUsize>);
+
+impl Connected {
+    fn new(clients: &Arc<AtomicUsize>) -> Self {
+        clients.fetch_add(1, Ordering::SeqCst);
+        Connected(clients.clone())
+    }
+}
+
+impl Drop for Connected {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -64,9 +100,9 @@ struct Conn {
     alive: watch::Receiver<()>,
 }
 
-async fn connection(core: Core, stream: UnixStream) {
+async fn connection(core: Core, stream: UnixStream, _connected: Connected) {
     match stream.peer_cred() {
-        Ok(peer) if peer.uid() == own_uid() => {}
+        Ok(peer) if peer.uid() == super::own_uid() => {}
         Ok(peer) => {
             tracing::warn!("refused a client running as uid {}", peer.uid());
             return;
@@ -324,9 +360,4 @@ fn parse<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, Failure> {
 
 fn failed(error: Error) -> Failure {
     (SERVER_ERROR, error.to_string())
-}
-
-fn own_uid() -> u32 {
-    // SAFETY: getuid has no preconditions and cannot fail.
-    unsafe { libc::getuid() }
 }

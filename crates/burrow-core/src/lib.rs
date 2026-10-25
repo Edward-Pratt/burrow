@@ -7,6 +7,7 @@
 
 mod addon;
 mod api;
+pub mod daemon;
 mod db;
 mod engine;
 mod error;

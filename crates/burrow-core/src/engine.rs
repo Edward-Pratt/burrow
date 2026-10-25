@@ -47,6 +47,25 @@ impl CoreOptions {
             ssh_config: None,
         })
     }
+
+    /// [`system`](Self::system), changed by the environment:
+    /// `BURROW_CONFIG_DIR` points Burrow at another config folder,
+    /// `BURROW_STATE_DIR` at another state folder, and `BURROW_SSH_CONFIG`
+    /// at another OpenSSH config (as `ssh -F`), which keeps development
+    /// runs away from your real ones.
+    pub fn from_env() -> Result<Self> {
+        let mut options = CoreOptions::system()?;
+        if let Some(dir) = std::env::var_os("BURROW_CONFIG_DIR") {
+            options.config_dir = PathBuf::from(dir);
+        }
+        if let Some(dir) = std::env::var_os("BURROW_STATE_DIR") {
+            options.state_dir = PathBuf::from(dir);
+        }
+        if let Some(file) = std::env::var_os("BURROW_SSH_CONFIG") {
+            options.ssh_config = Some(PathBuf::from(file));
+        }
+        Ok(options)
+    }
 }
 
 /// The handle every client uses. Cheap to clone; all clones share state.

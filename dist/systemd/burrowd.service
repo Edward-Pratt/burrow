@@ -1,0 +1,13 @@
+[Unit]
+Description=Burrow core
+Requires=burrowd.socket
+After=burrowd.socket
+
+[Service]
+ExecStart=/usr/bin/burrowd
+# The daemon stops itself when idle; the socket starts it again.
+Restart=on-failure
+
+[Install]
+# Enable to start tunnels that autostart at login.
+WantedBy=default.target

@@ -26,11 +26,12 @@ sha1 = "0.11"
 sha2 = "0.11"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt", "sync", "macros", "net", "io-util", "process", "time", "fs"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "io-util", "process", "time", "fs", "signal"] }
 tokio-postgres = { version = "0.7.18", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 toml = "1.1.8"
 tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }
 zeroize = "1.9.1"

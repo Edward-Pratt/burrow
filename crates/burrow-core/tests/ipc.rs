@@ -20,7 +20,7 @@ use common::*;
 fn serve(core: Core, dir: &Path) -> PathBuf {
     let path = dir.join("burrowd.sock");
     let listener = UnixListener::bind(&path).unwrap();
-    tokio::spawn(ipc::serve(core, listener));
+    tokio::spawn(ipc::serve(core, listener, None));
     path
 }
 

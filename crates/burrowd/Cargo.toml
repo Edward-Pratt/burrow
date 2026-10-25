@@ -1,0 +1,15 @@
+[package]
+name = "burrowd"
+description = "Burrow's core as a user service, shared by every Burrow client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+burrow-core = { version = "0.1.0", path = "../burrow-core" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
