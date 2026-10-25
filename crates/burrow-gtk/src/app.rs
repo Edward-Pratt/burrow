@@ -18,7 +18,7 @@ use burrow_core::{
     SessionId, SessionInfo, SessionKind, SessionState, TunnelShown, View,
 };
 use relm4::gtk::prelude::*;
-use relm4::gtk::{gdk, gio, glib, graphene};
+use relm4::gtk::{gdk, gio, glib};
 use relm4::{Component, ComponentParts, ComponentSender, gtk};
 use tokio::sync::broadcast::error::RecvError;
 use vte4::TerminalExt;
@@ -95,9 +95,11 @@ pub enum AppMsg {
     Failed(String),
 
     // From the user.
-    RowActivated(i32),
+    RowActivated(NodeId),
+    /// A context menu for a sidebar row, or for the empty space when `node`
+    /// is `None`, pointing at `x`, `y` in the sidebar pane.
     ContextMenu {
-        row: Option<i32>,
+        node: Option<NodeId>,
         x: f64,
         y: f64,
     },
@@ -307,7 +309,6 @@ pub struct App {
     config_dir: PathBuf,
     settings: UiSettings,
     nodes: HashMap<NodeId, Node>,
-    expanded: HashSet<NodeId>,
     problems: Vec<Problem>,
     addons: Vec<AddonInfo>,
     /// The error the status bar shows, until the user does something or a
@@ -358,9 +359,7 @@ pub struct App {
 
 pub struct Widgets {
     sidebar_pane: gtk::Box,
-    list: gtk::ListBox,
-    /// The node shown in each sidebar row, by row index.
-    row_ids: Vec<NodeId>,
+    sidebar: sidebar::Sidebar,
     content: gtk::Stack,
     notebook: gtk::Notebook,
     new_button: gtk::MenuButton,
@@ -439,7 +438,6 @@ impl Component for App {
             config_dir,
             settings,
             nodes: HashMap::new(),
-            expanded: HashSet::new(),
             problems: Vec::new(),
             addons: Vec::new(),
             error: None,
@@ -521,18 +519,8 @@ impl Component for App {
             AppMsg::Reconnected(client) => self.reconnected(client, window, &sender),
             AppMsg::Failed(error) => self.fail(error),
 
-            AppMsg::RowActivated(index) => {
-                if let Some(&id) = widgets.row_ids.get(index as usize) {
-                    self.activate(id, widgets, &sender);
-                }
-            }
-            AppMsg::ContextMenu { row, x, y } => {
-                let id = row.and_then(|i| widgets.row_ids.get(i as usize).copied());
-                if let Some(row) = row.and_then(|i| widgets.list.row_at_index(i)) {
-                    widgets.list.select_row(Some(&row));
-                }
-                self.context_menu(id, x, y, widgets, &sender);
-            }
+            AppMsg::RowActivated(id) => self.activate(id, widgets, &sender),
+            AppMsg::ContextMenu { node, x, y } => self.context_menu(node, x, y, widgets, &sender),
             AppMsg::New { kind, parent } => {
                 let parent = parent.unwrap_or_else(|| self.selection_folder(widgets));
                 self.new_node(kind, parent, window, &sender);
@@ -1007,38 +995,20 @@ impl App {
         sender.input(AppMsg::Notice("Connected to burrowd again".to_string()));
     }
 
-    /// Redraws the sidebar when something marked it dirty, keeping the
-    /// selection and the focus where they were.
+    /// Brings the sidebar up to date when something marked it dirty.
     fn rebuild_sidebar(&mut self, widgets: &mut Widgets) {
         if !self.sidebar_dirty {
             return;
         }
         self.sidebar_dirty = false;
-        let selection = selected(widgets);
-        // Rebuilding destroys the focused row; remember whether the sidebar
-        // had focus so keyboard use (arrows, Delete) carries on.
-        let had_focus = widgets.list.focus_child().is_some();
+        widgets.sidebar.replace(&self.nodes, &self.icons());
         let running: HashSet<NodeId> = self
             .tunnels
             .iter()
             .filter(|(_, status)| status.is_up())
             .map(|(id, _)| *id)
             .collect();
-        let look = sidebar::Look {
-            expanded: &self.expanded,
-            icons: &self.icons(),
-            running: &running,
-        };
-        widgets.row_ids = sidebar::rebuild(&widgets.list, &self.nodes, &look);
-        let row = selection
-            .and_then(|id| widgets.row_ids.iter().position(|&r| r == id))
-            .and_then(|index| widgets.list.row_at_index(index as i32));
-        if let Some(row) = row {
-            widgets.list.select_row(Some(&row));
-            if had_focus {
-                row.grab_focus();
-            }
-        }
+        widgets.sidebar.set_running(running);
     }
 
     fn apply_event(&mut self, event: Event, widgets: &Widgets, sender: &ComponentSender<Self>) {
@@ -1046,7 +1016,7 @@ impl App {
             Event::NodeCreated { node } => {
                 // Show where the new node went.
                 if let Some(parent) = node.parent {
-                    self.expanded.insert(parent);
+                    widgets.sidebar.expand(parent);
                 }
                 self.nodes.insert(node.id, node);
                 self.sidebar_dirty = true;
@@ -1092,7 +1062,6 @@ impl App {
             Event::NodeDeleted { id } => {
                 self.nodes.remove(&id);
                 self.views.remove(&id);
-                self.expanded.remove(&id);
                 self.tunnels.remove(&id);
                 self.restarting.remove(&id);
                 self.close_tab(TabKey::Node(id), widgets);
@@ -1651,10 +1620,7 @@ impl App {
             return;
         };
         if node.is_folder() {
-            if !self.expanded.remove(&id) {
-                self.expanded.insert(id);
-            }
-            self.sidebar_dirty = true;
+            widgets.sidebar.toggle(id);
         } else {
             self.open_tab_now(id, widgets, sender);
         }
@@ -1662,12 +1628,7 @@ impl App {
 
     fn open_tab(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
         // Reveal the node in the sidebar, then open it.
-        let mut parent = self.nodes.get(&id).and_then(|n| n.parent);
-        while let Some(folder) = parent {
-            self.expanded.insert(folder);
-            parent = self.nodes.get(&folder).and_then(|n| n.parent);
-        }
-        self.sidebar_dirty = true;
+        widgets.sidebar.reveal(id);
         if self.nodes.get(&id).is_some_and(|n| !n.is_folder()) {
             self.open_tab_now(id, widgets, sender);
         }
@@ -2125,18 +2086,12 @@ impl App {
             entries.push(("Delete…".into(), AppMsg::Delete(node.id)));
         }
         let popover = menu_popover(entries, sender);
-        // Parented to the pane, not the list: the list is rebuilt wholesale
-        // on every change, and `ListBox::remove_all` never returns while a
-        // child that isn't a row is parented to it. A rebuild can land while
-        // the menu is open ("Open" reveals the node's folders, and events
-        // arrive at any time), and the window would hang.
-        let point = graphene::Point::new(x as f32, y as f32);
-        let point = widgets
-            .list
-            .compute_point(&widgets.sidebar_pane, &point)
-            .unwrap_or(point);
+        // Parented to the pane, never to the list view: the view owns its
+        // children and adds and removes them as rows come and go, and a
+        // popover among a list's children once hung the window when the
+        // list changed while the menu was open (commit 9fa1e36).
         popover.set_parent(&widgets.sidebar_pane);
-        let (x, y) = (point.x() as i32, point.y() as i32);
+        let (x, y) = (x as i32, y as i32);
         popover.set_pointing_to(Some(&gdk::Rectangle::new(x, y, 1, 1)));
         popover.connect_closed(|popover| {
             // Unparented once the signal has returned, not inside it.
@@ -2616,8 +2571,7 @@ fn capability_label(capability: Capability) -> &'static str {
 }
 
 fn selected(widgets: &Widgets) -> Option<NodeId> {
-    let row = widgets.list.selected_row()?;
-    widgets.row_ids.get(row.index() as usize).copied()
+    widgets.sidebar.selected()
 }
 
 fn close_page(notebook: &gtk::Notebook, page: &gtk::Widget) {
@@ -2779,49 +2733,8 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
     window.set_titlebar(Some(&header));
 
     // Sidebar.
-    let list = gtk::ListBox::new();
-    list.add_css_class("navigation-sidebar");
-    list.set_selection_mode(gtk::SelectionMode::Single);
-    list.connect_row_activated({
-        let sender = sender.clone();
-        move |_, row| sender.input(AppMsg::RowActivated(row.index()))
-    });
-    let right_click = gtk::GestureClick::new();
-    right_click.set_button(gdk::BUTTON_SECONDARY);
-    right_click.connect_pressed({
-        let (sender, list) = (sender.clone(), list.clone());
-        move |_, _, x, y| {
-            let row = list.row_at_y(y as i32).map(|r| r.index());
-            sender.input(AppMsg::ContextMenu { row, x, y });
-        }
-    });
-    list.add_controller(right_click);
-    // Delete and F2 only apply while the sidebar has focus, so they never
-    // eat a keypress meant for a text field or a terminal.
-    let keys = gtk::EventControllerKey::new();
-    keys.connect_key_pressed({
-        let sender = sender.clone();
-        move |_, key, _, _| {
-            let message = match key {
-                gdk::Key::Delete => AppMsg::DeleteSelected,
-                gdk::Key::F2 => AppMsg::RenameSelected,
-                _ => return glib::Propagation::Proceed,
-            };
-            sender.input(message);
-            glib::Propagation::Stop
-        }
-    });
-    list.add_controller(keys);
-
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&list)
-        .vexpand(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .build();
-    let sidebar_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    sidebar_pane.add_css_class("sidebar");
-    sidebar_pane.set_size_request(240, -1);
-    sidebar_pane.append(&scroller);
+    let sidebar = sidebar::Sidebar::new(sender);
+    let sidebar_pane = sidebar.pane.clone();
 
     // Tabs, with a welcome page when none are open.
     let notebook = gtk::Notebook::new();
@@ -2914,8 +2827,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
 
     Widgets {
         sidebar_pane,
-        list,
-        row_ids: Vec::new(),
+        sidebar,
         content,
         notebook,
         new_button,
