@@ -55,6 +55,11 @@ prepare() {
     fi
     mapfile -t missing < <(pacman -T "${want[@]}" || true)
     if [ ${#missing[@]} -gt 0 ]; then
+      if ! command -v sudo >/dev/null; then
+        echo "Burrow needs ${missing[*]} to build. As root, run:" >&2
+        echo "  pacman -S --needed ${missing[*]}" >&2
+        exit 1
+      fi
       echo "Burrow needs ${missing[*]} to build. Installing with pacman:"
       sudo pacman -S --needed --noconfirm "${missing[@]}"
     fi
