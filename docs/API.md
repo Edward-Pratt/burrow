@@ -46,6 +46,7 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `start_tunnel` | `node` | `session { session }` |
 | `list_autostart` | | `autostart { nodes }` |
 | `set_autostart` | `node`, `enabled`, `expect?` | `ok` |
+| `exec` | `node`, `command`, `timeout?` | `exec { result }` |
 | `open_files` | `node` | `session { session }` |
 | `list_dir` | `session`, `path?` (empty = home) | `dir { path, entries }` |
 | `make_dir` | `session`, `path` | `ok` |
@@ -104,13 +105,25 @@ A subscriber that falls more than 256 events behind gets a "lagged" error and sh
 
 `open_terminal` on an `ssh-host` node replies at once with a session id. The session then connects in the background and reports each step as `session_changed`.
 
-Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files` or `database`) and `state`.
+Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files`, `database` or `exec`) and `state`.
 
 - **Host settings** come from `ssh -G <alias>`, so `Include`, `Match`, `Host` patterns and defaults apply exactly as for `ssh <alias>`. `props.alias` is the alias (the node's name when missing). An alias that is empty, starts with `-`, or has spaces or control characters is refused, because node files can come from a shared folder.
 - **Host keys** are checked against the `UserKnownHostsFile` and `GlobalKnownHostsFile` files, following `StrictHostKeyChecking`. A changed or `@revoked` key is always refused. A new key is asked about (`ask`) or added (`accept-new`/`no`), except when the host has known keys of another type, which is always asked about. New keys go into the first user file, hashed if `HashKnownHosts` is on.
 - **Signing in** tries agent keys (`IdentityAgent`, configured keys first, only those with `IdentitiesOnly`), then key files (asking for passphrases), then a password, then keyboard-interactive.
 - **Saved passwords** are kept in the keyring with the `user@host:port` they were used for (`password-target`), and are only sent there.
 - **Not yet supported:** `ProxyJump` and `ProxyCommand` make the session fail with a message, rather than being ignored.
+
+### Commands without a terminal
+
+`exec` runs one command on an `ssh-host` node, as `ssh host command` does, and replies when it has finished:
+
+```json
+{"type": "exec", "result": {"status": 0, "signal": null, "stdout": "…", "stderr": "", "truncated": false, "timed_out": false}}
+```
+
+- **Session:** it runs as a session of kind `exec`, on the host's shared connection, so connecting reports `session_changed` and can ask questions like any session. The reply only comes at the end, so a client that wants to answer those prompts watches for `prompt_requested` from a session on that node.
+- **Timeout:** `timeout` is in seconds, 60 when missing and at most 3600, and covers connecting too. A command still running then is sent SIGTERM (on servers that take signals), and the reply has `timed_out` and the output so far.
+- **Output:** each stream is decoded as UTF-8, with invalid bytes replaced, and cut at 1 MiB (`truncated`).
 
 ### Prompts
 

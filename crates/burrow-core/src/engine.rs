@@ -189,6 +189,24 @@ impl Core {
                 };
                 return Ok(Response::Session { session });
             }
+            Command::Exec {
+                node,
+                command,
+                timeout,
+            } => {
+                let node = self.node(node)?;
+                if node.kind != SSH_HOST_KIND {
+                    return Err(Error::invalid(
+                        "node",
+                        format!("{} is a {}, not an SSH host", node.name, node.kind),
+                    ));
+                }
+                let result = ssh::exec::start(self, node, command, timeout)?
+                    .await
+                    // The session reports why, as `session_changed`.
+                    .map_err(|_| Error::Remote("the command did not run".to_string()))?;
+                return Ok(Response::Exec { result });
+            }
             Command::OpenFiles { node } => {
                 let node = self.node(node)?;
                 if node.kind != SSH_HOST_KIND {
@@ -696,6 +714,7 @@ impl Inner {
             | Command::ListSessions
             | Command::StartTunnel { .. }
             | Command::OpenFiles { .. }
+            | Command::Exec { .. }
             | Command::ListDir { .. }
             | Command::MakeDir { .. }
             | Command::RenamePath { .. }

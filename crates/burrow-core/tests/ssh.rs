@@ -11,8 +11,8 @@ use std::process::{Child, Command as Process, Stdio};
 use std::time::Duration;
 
 use burrow_core::{
-    Command, Core, Event, Node, NodePatch, PromptAnswer, PromptKind, Response, SecretValue,
-    SessionId, SessionKind, SessionState, TransferId, TransferState, TunnelShown,
+    Command, Core, Event, ExecResult, Node, NodePatch, PromptAnswer, PromptKind, Response,
+    SecretValue, SessionId, SessionKind, SessionState, TransferId, TransferState, TunnelShown,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1104,4 +1104,66 @@ async fn copies_keep_private_files_private() {
         TransferState::Finished
     );
     assert_eq!(mode(&copy), 0o600);
+}
+
+async fn exec(core: &Core, node: &Node, command: &str, timeout: Option<u32>) -> ExecResult {
+    let command = Command::Exec {
+        node: node.id,
+        command: command.into(),
+        timeout,
+    };
+    match core.execute(command).await.unwrap() {
+        Response::Exec { result } => result,
+        other => panic!("expected an exec result, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_returns_output_and_status() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+
+    let result = exec(&core, &node, "echo out; echo err >&2; exit 3", None).await;
+    assert_eq!(result.stdout, "out\n");
+    assert_eq!(result.stderr, "err\n");
+    assert_eq!(result.status, Some(3));
+    assert!(!result.truncated && !result.timed_out);
+    // It was a session while it ran, and is gone now.
+    assert!(match core.execute(Command::ListSessions).await.unwrap() {
+        Response::Sessions { sessions } => sessions.is_empty(),
+        _ => false,
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_cuts_long_output_and_stops_at_the_timeout() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+
+    let result = exec(&core, &node, "head -c 3000000 /dev/zero | tr '\\0' x", None).await;
+    assert!(result.truncated);
+    assert_eq!(result.stdout.len(), 1 << 20);
+    assert_eq!(result.status, Some(0));
+
+    let result = exec(&core, &node, "echo started; sleep 30", Some(1)).await;
+    assert!(result.timed_out);
+    assert_eq!(result.stdout, "started\n");
+
+    let error = core
+        .execute(Command::Exec {
+            node: node.id,
+            command: "true".into(),
+            timeout: Some(0),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timeout"), "{error}");
 }

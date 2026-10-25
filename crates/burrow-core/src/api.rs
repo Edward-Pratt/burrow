@@ -170,6 +170,8 @@ pub enum SessionKind {
     Files,
     /// A connection to a database.
     Database,
+    /// One command run with [`Command::Exec`].
+    Exec,
 }
 
 /// Identifies a download or upload. Unique for as long as the core runs.
@@ -441,6 +443,23 @@ pub struct TunnelShown {
 }
 
 /// What a query sent with [`Command::RunQuery`] returned. A query can hold
+/// What a command run with [`Command::Exec`] did. Output is decoded as
+/// UTF-8, with invalid bytes replaced, and each stream is cut at 1 MiB.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecResult {
+    /// The exit status, when the command exited.
+    pub status: Option<u32>,
+    /// The signal that ended it, when one did.
+    pub signal: Option<String>,
+    pub stdout: String,
+    pub stderr: String,
+    /// Output went past the limit and the rest was dropped.
+    pub truncated: bool,
+    /// The command was still running at the timeout. It was sent SIGTERM
+    /// (on servers that take signals) and the output so far is here.
+    pub timed_out: bool,
+}
+
 /// several statements; each one that finished has an entry in
 /// `statements`, in order. If one failed, `error` says why and the
 /// statements after it did not run.
@@ -680,6 +699,16 @@ pub enum Command {
     CancelTransfer {
         transfer: TransferId,
     },
+    /// Runs `command` on an SSH host node without a terminal, as
+    /// `ssh host command` does, and waits for it. `timeout` (60 s when
+    /// missing, at most 3600) covers connecting too. Returns
+    /// [`Response::Exec`].
+    Exec {
+        node: NodeId,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout: Option<u32>,
+    },
     /// Returns the tunnels that start with Burrow, as [`Response::Autostart`].
     ListAutostart,
     /// Makes a tunnel start with Burrow, or stops it doing so. The choice is
@@ -806,6 +835,9 @@ pub enum Response {
     },
     Query {
         result: QueryResult,
+    },
+    Exec {
+        result: ExecResult,
     },
     Schema {
         schemas: Vec<DbSchema>,

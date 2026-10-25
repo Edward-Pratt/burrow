@@ -12,6 +12,7 @@
 
 mod config;
 mod connection;
+pub(crate) mod exec;
 pub(crate) mod files;
 mod known_hosts;
 mod session;
@@ -147,6 +148,7 @@ impl Sessions {
                 SessionKind::Database => "a database session",
                 SessionKind::Terminal => "a terminal",
                 SessionKind::Tunnel => "a tunnel",
+                SessionKind::Exec => "a command",
             };
             return Err(Error::invalid("session", format!("{id} is not {what}")));
         }
