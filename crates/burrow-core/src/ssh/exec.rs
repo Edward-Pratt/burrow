@@ -36,7 +36,7 @@ pub(crate) fn start(
     node: Node,
     command: String,
     timeout: Option<u32>,
-) -> Result<oneshot::Receiver<ExecResult>> {
+) -> Result<oneshot::Receiver<std::result::Result<ExecResult, String>>> {
     let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT);
     if timeout == 0 || timeout > MAX_TIMEOUT {
         return Err(Error::invalid(
@@ -52,11 +52,19 @@ pub(crate) fn start(
         SessionKind::Exec,
         None,
         move |core, node, input, prompter| async move {
-            // `None` when a client closed it before it finished.
-            if let Some(result) = exec(&core, &node, &command, input, &prompter, deadline).await? {
-                let _ = tx.send(result);
+            // The caller gets the error too, not only the session's events.
+            match exec(&core, &node, &command, input, &prompter, deadline).await {
+                Ok(Some(result)) => {
+                    let _ = tx.send(Ok(result));
+                    Ok(())
+                }
+                // A client closed it before it finished.
+                Ok(None) => Ok(()),
+                Err(error) => {
+                    let _ = tx.send(Err(error.clone()));
+                    Err(error)
+                }
             }
-            Ok(())
         },
     );
     Ok(rx)

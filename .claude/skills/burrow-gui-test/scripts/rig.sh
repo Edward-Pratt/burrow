@@ -95,7 +95,8 @@ stop)
     stop_daemon
     stop_pid "$DIR/sshd/sshd.pid"
     stop_pid "$DIR/xvfb.pid"
-    rm -f "$DIR"/sshd/*key* "$DIR/sshd/authorized_keys"
+    # The keys are new on the next start, so their old known_hosts entry goes too.
+    rm -f "$DIR"/sshd/*key* "$DIR/sshd/authorized_keys" "$DIR/sshd/known_hosts"
     sleep 1 # let them exit before anything checks
     ss -ltn | grep -q ':2222 ' && echo "warning: something still listens on 2222" || true
     ;;

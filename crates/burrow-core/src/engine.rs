@@ -213,8 +213,8 @@ impl Core {
                 }
                 let result = ssh::exec::start(self, node, command, timeout)?
                     .await
-                    // The session reports why, as `session_changed`.
-                    .map_err(|_| Error::Remote("the command did not run".to_string()))?;
+                    .map_err(|_| Error::Remote("the command was stopped".to_string()))?
+                    .map_err(Error::Remote)?;
                 return Ok(Response::Exec { result });
             }
             Command::OpenFiles { node } => {
