@@ -436,7 +436,13 @@ The daemon sends:
   - A read-only transaction still allows `COPY … TO` a file and `COPY … TO PROGRAM`, which runs a command on the database server, also from inside a `DO` block. So read-only SQL is refused when the role is, or is a member of, a superuser role, `pg_write_server_files` or `pg_execute_server_program`, since a member can `SET ROLE` into them from a `DO` block.
   - Some functions still have effects, such as `pg_terminate_backend` for a role allowed to use it. For full safety, give the node a database role that can only read, such as one granted `pg_read_all_data`.
 - **Grants are pinned:** `set_grant` needs `expect`, the node as the user saw it (`name`, `props`, and the same for the node in `props.via`). A grant is kept in `$XDG_STATE_HOME/burrow/mcp.toml` with a fingerprint of those settings. If a node file changes, the grant goes stale (`stale` in `list_grants`) and allows nothing until it is granted again. An empty `capabilities` revokes.
-- **Audit log:** every command the bridge sends goes on a line of `$XDG_STATE_HOME/burrow/mcp-audit.log`, with whether it ran and why not. A refused command is logged by its type only, and file contents by their size.
+- **Audit log:** every command the bridge sends goes on a line of `$XDG_STATE_HOME/burrow/mcp-audit.log`, with whether it ran and why not. A refused command is logged by its type only, and file contents by their size. Each line is a JSON object:
+
+  ```json
+  {"time": 1792948331, "connection": 3, "command": {"type": "open_files", "node": "6f1c…"}, "rule": "run", "ok": true, "session": 12}
+  ```
+
+  `time` is Unix seconds. `connection` numbers each client connection since `burrowd` started, so two bridges can be told apart. `rule` is how the command was allowed, and is missing when it was refused: `run`, `read_only_query` (SQL kept from writing), `monitor_without_install` or `granted_alerts` (only granted hosts' alerts). `session` is there when the reply named a session, so later commands that only give its id can be tied to the node. `error` is there when the command failed. At 8 MiB the log is moved to `mcp-audit.log.1`, replacing the one there.
 - **Events:** the bridge only hears `node_*` events and `grants_changed`. It follows its own sessions by listing them.
 - **Not a wall against the user's own programs:** grants limit what the assistant can do through the bridge. Any process running as the user can connect with another role, so an assistant that can also run shell commands could use `burrow` directly.
 

@@ -7,7 +7,7 @@
 //! SSH channel rather than losing bytes.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,9 @@ const OUTPUT_QUEUE: usize = 16;
 
 /// How often an idle daemon checks whether it can stop.
 const IDLE_CHECK: Duration = Duration::from_secs(5);
+
+/// Connections so far, which numbers each one.
+static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Serves clients on `listener`. With `idle`, it returns once no client
 /// has been connected and no session running for that long; otherwise it
@@ -91,6 +94,8 @@ impl Drop for Connected {
 /// The parts of a connection its tasks share.
 struct Conn {
     core: Core,
+    /// Tells this client's lines in the audit log from another bridge's.
+    id: u64,
     role: OnceLock<Role>,
     control: mpsc::Sender<String>,
     output: mpsc::Sender<String>,
@@ -123,6 +128,7 @@ async fn connection(core: Core, stream: UnixStream, _connected: Connected) {
     tokio::spawn(write_all(write, control_rx, output_rx));
     let conn = Arc::new(Conn {
         core,
+        id: CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1,
         role: OnceLock::new(),
         control,
         output,
@@ -319,12 +325,24 @@ enum Rule {
     GrantedAlerts,
 }
 
+impl Rule {
+    /// How the audit log names it.
+    fn name(&self) -> &'static str {
+        match self {
+            Rule::Run => "run",
+            Rule::ReadOnlyQuery => "read_only_query",
+            Rule::MonitorWithoutInstall => "monitor_without_install",
+            Rule::GrantedAlerts => "granted_alerts",
+        }
+    }
+}
+
 impl Conn {
     /// Runs a command for the MCP bridge if its grants allow it, and
     /// records it in the audit log either way.
     async fn execute_mcp(&self, command: Command) -> Result<Response> {
         let rule = self.mcp_rule(&command);
-        let mut entry = audit_entry(&command, rule.is_ok());
+        let mut entry = audit_entry(&command, rule.as_ref().ok(), self.id);
         let result = match rule {
             Err(e) => Err(e),
             Ok(Rule::Run) => self.core.execute(command).await,
@@ -361,8 +379,12 @@ impl Conn {
             }
         };
         entry["ok"] = json!(result.is_ok());
-        if let Err(e) = &result {
-            entry["error"] = json!(e.to_string());
+        match &result {
+            // Commands on the session name only its id, so this ties them
+            // to the node it was opened on.
+            Ok(Response::Session { session }) => entry["session"] = json!(session),
+            Ok(_) => {}
+            Err(e) => entry["error"] = json!(e.to_string()),
         }
         self.core.audit(&entry);
         result
@@ -442,22 +464,26 @@ fn command_type(command: &Command) -> String {
         .unwrap_or_default()
 }
 
-/// What the audit log keeps of a command. A refused one is kept by type
-/// only, since it may carry a secret; file contents are kept by size.
-fn audit_entry(command: &Command, allowed: bool) -> Value {
+/// What the audit log keeps of a command, and the `rule` it runs under
+/// when it may run at all. A refused one is kept by type only, since it
+/// may carry a secret; file contents are kept by size.
+fn audit_entry(command: &Command, rule: Option<&Rule>, connection: u64) -> Value {
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let mut logged = if allowed {
-        serde_json::to_value(command).unwrap_or_default()
-    } else {
-        json!({"type": command_type(command)})
+    let mut logged = match rule {
+        Some(_) => serde_json::to_value(command).unwrap_or_default(),
+        None => json!({"type": command_type(command)}),
     };
     if let Command::WriteFile { data, .. } = command {
         logged["data"] = json!(format!("{} bytes", data.len()));
     }
-    json!({"time": time, "command": logged})
+    let mut entry = json!({"time": time, "connection": connection, "command": logged});
+    if let Some(rule) = rule {
+        entry["rule"] = json!(rule.name());
+    }
+    entry
 }
 
 /// Passes events on as `event` notifications. A client that falls behind

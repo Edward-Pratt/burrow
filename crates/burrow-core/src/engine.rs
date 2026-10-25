@@ -600,9 +600,23 @@ impl Core {
     pub(crate) fn audit(&self, entry: &serde_json::Value) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        /// Past this size the log moves to `mcp-audit.log.1`, replacing
+        /// the one there, so the two never pass twice this.
+        const MAX: u64 = 8 << 20;
+        // Requests run on tasks of their own. Two that both found the log
+        // full would both move it, and the second would put a log of one
+        // line in place of the old one.
+        static WRITING: Mutex<()> = Mutex::new(());
+        let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
         let path = &self.inner.audit_log;
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
+        }
+        if std::fs::metadata(path).is_ok_and(|meta| meta.len() >= MAX) {
+            let old = path.with_extension("log.1");
+            if let Err(e) = std::fs::rename(path, &old) {
+                tracing::warn!("could not move {} aside: {e}", path.display());
+            }
         }
         let written = std::fs::OpenOptions::new()
             .append(true)
