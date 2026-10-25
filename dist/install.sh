@@ -1,7 +1,9 @@
 #!/bin/bash
 # Installs Burrow from source for one user, into ~/.local, and keeps it up
 # to date: a daily systemd user timer runs this again as `burrow-update`,
-# which builds and installs only when the branch has moved.
+# which builds and installs only when the branch has moved. Run from a
+# terminal, it first installs what the build needs: with pacman, asking for
+# sudo once, and with rustup, the musl targets the server agent builds for.
 #
 #   dist/install.sh                  install from main
 #   burrow-update                    update now
@@ -41,6 +43,51 @@ edit() { # sed-script source destination
   mv -f "$3.new" "$3"
 }
 
+# Only with someone at the terminal to answer sudo. Under the timer a
+# missing piece fails the build, and the notification says so.
+prepare() {
+  if command -v pacman >/dev/null; then
+    local want=(git gcc pkgconf gtk4 vte4 gtksourceview5 openssh) missing
+    # pacman's rust-musl and rust-aarch64-musl need its rust, which rustup
+    # conflicts with, so they are only for a machine without rustup.
+    if ! command -v rustup >/dev/null; then
+      want+=(rust rust-musl rust-aarch64-musl)
+    fi
+    mapfile -t missing < <(pacman -T "${want[@]}" || true)
+    if [ ${#missing[@]} -gt 0 ]; then
+      if ! command -v sudo >/dev/null; then
+        echo "Burrow needs ${missing[*]} to build. As root, run:" >&2
+        echo "  pacman -S --needed ${missing[*]}" >&2
+        exit 1
+      fi
+      echo "Burrow needs ${missing[*]} to build. Installing with pacman:"
+      sudo pacman -S --needed --noconfirm "${missing[@]}"
+    fi
+  fi
+  if command -v rustup >/dev/null; then
+    rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
+    rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+  fi
+  local tool
+  for tool in git cargo; do
+    if ! command -v "$tool" >/dev/null; then
+      echo "Burrow needs $tool to build. Install it, then run this again." >&2
+      exit 1
+    fi
+  done
+}
+
+# The servers an agent can be built for here: those whose musl target is
+# installed.
+arches() {
+  local arch
+  for arch in x86_64 aarch64; do
+    if [ -d "$(rustc --print target-libdir --target "$arch-unknown-linux-musl" 2>/dev/null)" ]; then
+      echo "$arch"
+    fi
+  done
+}
+
 branch=
 while [ $# -gt 0 ]; do
   case $1 in
@@ -55,6 +102,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ -t 0 ]; then
+  prepare
+fi
+
 mkdir -p "$data/burrow"
 exec 9>"$data/burrow/update.lock"
 if ! flock -n 9; then
@@ -63,7 +114,14 @@ if ! flock -n 9; then
 fi
 
 if [ ! -d "$src/.git" ]; then
-  git clone --quiet "$url" "$src"
+  # Run from a checkout, clone the way it was cloned, which works here, as
+  # SSH may where HTTPS has no credentials.
+  from=$url
+  checkout=$(cd "$(dirname "$0")/.." && pwd)
+  if [ -f "$checkout/crates/burrowd/Cargo.toml" ]; then
+    from=$(git -C "$checkout" remote get-url origin 2>/dev/null || echo "$url")
+  fi
+  git clone --quiet "$from" "$src"
 fi
 # The clone remembers which branch it follows.
 branch=${branch:-$(git -C "$src" config burrow.branch || echo main)}
@@ -72,8 +130,13 @@ git -C "$src" fetch --quiet origin "$branch"
 git -C "$src" config burrow.branch "$branch"
 commit=$(git -C "$src" rev-parse FETCH_HEAD)
 # Compared with what was installed, not what was checked out, so a build
-# that failed is tried again next time.
-if [ "$(cat "$lib/commit" 2>/dev/null)" = "$commit" ]; then
+# that failed is tried again next time. A musl target added since then
+# needs a build too, for its agent.
+current=$([ "$(cat "$lib/commit" 2>/dev/null)" = "$commit" ] && echo yes || echo no)
+for arch in $(arches); do
+  [ -f "$lib/burrow-agent-$arch" ] || current=no
+done
+if [ "$current" = yes ]; then
   echo "Burrow is up to date: $branch at ${commit:0:7}."
   exit 0
 fi
@@ -91,12 +154,9 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 # out of date to the new window (ipc::BUILD).
 export BURROW_BUILD=$version+g${commit:0:7}
 cargo build --locked --release -p burrow-gtk -p burrowd -p burrow-cli
-agents=()
-for arch in x86_64 aarch64; do
-  target=$arch-unknown-linux-musl
-  [ -d "$(rustc --print target-libdir --target "$target" 2>/dev/null)" ] || continue
-  cargo build --locked --profile agent -p burrow-agent --target "$target"
-  agents+=("$arch")
+mapfile -t agents < <(arches)
+for arch in "${agents[@]}"; do
+  cargo build --locked --profile agent -p burrow-agent --target "$arch-unknown-linux-musl"
 done
 
 for program in burrow-gtk burrowd burrow; do
@@ -122,12 +182,15 @@ for unit in burrowd.socket burrow-update.service burrow-update.timer; do
 done
 printf '%s\n' "$commit" >"$lib/commit"
 
-systemctl --user daemon-reload
-systemctl --user enable --quiet --now burrow-update.timer
+if systemctl --user daemon-reload 2>/dev/null; then
+  systemctl --user enable --quiet --now burrow-update.timer
+else
+  echo "There is no systemd user manager, so Burrow won't update by itself. Run burrow-update to update."
+fi
 
 echo "Installed Burrow $BURROW_BUILD from $branch into ~/.local."
-if [ ${#agents[@]} -eq 0 ]; then
-  echo "No musl target is installed, so monitors can't put the agent on servers:"
-  echo "  rustup target add x86_64-unknown-linux-musl"
+# Says what is still missing at run time, such as a Secret Service.
+if [ -t 1 ]; then
+  "$bin/burrow" doctor || true
 fi
 notify "Burrow updated to ${commit:0:7}" "Restart Burrow to use it."

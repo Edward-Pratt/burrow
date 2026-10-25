@@ -4,7 +4,6 @@
 
 - [ ] **Get a friend testing Burrow** - send them the README's "Trying it" section. If anything fails, ask for the output of `burrow doctor` and for `~/.local/state/burrow/burrowd.log`. Their feedback sets the order of everything below.
 
-- [ ] **Point the installed Burrow back at main** - after the install-script PR merges, run `git -C ~/.local/share/burrow/src remote set-url origin https://github.com/Edward-Pratt/burrow.git` (if still the local checkout) and `burrow-update --branch main`, or every daily update fails once the branch is deleted.
 
 ## Waiting On
 
@@ -23,6 +22,7 @@ Next milestones from `docs/DESIGN.md`, in rough order; pick by what the tester u
 
 ## Done
 
+- [x] ~~Install script with daily updates from main, and an icon~~ (2026-10-25, PR #16 merged)
 - [x] ~~`burrow daemon stop` under an open window~~ (2026-10-25, PR #14 merged)
 - [x] ~~M10: hosts added in Burrow~~ (2026-10-25, PR #13 merged)
 - [x] ~~Review after M9, `burrow doctor`, start-up failure dialog, Arch package, review fixes~~ (2026-10-25, PR #10 merged)

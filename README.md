@@ -25,30 +25,23 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Addons run as separate processes and m
 
 ## Trying it
 
-Burrow needs GTK 4.20 or newer, VTE 4, GtkSourceView 5, OpenSSH and a Secret Service (a keyring daemon such as gnome-keyring, KWallet or KeePassXC). Building it needs Rust 1.93 or newer, best installed with [rustup](https://rustup.rs).
-
-On Arch, the package in `dist/` builds and installs everything: the window, the daemon, the command line, a desktop entry, the systemd units, and the server agent for each musl target you have (`rustup target add x86_64-unknown-linux-musl`, or the `rust-musl` package):
+Install it with one command. It builds Burrow from source and installs it for you only, in `~/.local`, with a start-menu entry and the server agent for x86_64 and aarch64 servers:
 
 ```sh
-git clone https://github.com/Edward-Pratt/burrow
-cd burrow/dist && makepkg -si
+git clone https://github.com/Edward-Pratt/burrow && burrow/dist/install.sh
 ```
 
-To install it for yourself only, in `~/.local`, and keep it up to date with main, run the install script. It needs no root, and adds the same pieces plus a systemd user timer. Once a day the timer fetches main, and when it has moved, builds and installs it in the background, then says so in a desktop notification. Restart Burrow to use the new build.
+On Arch and distros built on it, the script first installs what the build needs with pacman, asking for your password once: GTK 4.20 or newer, VTE 4, GtkSourceView 5, OpenSSH, a compiler, and Rust with its musl targets. With rustup it uses rustup instead, and sets it up if it has no toolchain yet. Elsewhere, install those yourself first (Rust 1.93 or newer, best with [rustup](https://rustup.rs)). It ends with `burrow doctor`, which says what is still missing at run time, such as a Secret Service (a keyring daemon such as gnome-keyring, KWallet or KeePassXC).
 
-```sh
-git clone https://github.com/Edward-Pratt/burrow
-burrow/dist/install.sh
-```
+It then keeps Burrow up to date by itself. Once a day a systemd user timer fetches main, and when it has moved, builds and installs it in the background, then says so in a desktop notification. Restart Burrow to use the new build.
 
 The script keeps its own clone in `~/.local/share/burrow/src`. Run `burrow-update` to update now, `burrow-update --branch NAME` to follow another branch, and `journalctl --user -u burrow-update` to see how the last update went. It builds and installs whatever lands on the branch without asking, so anyone who can push there can run code on your computer. To remove it, run `systemctl --user disable --now burrow-update.timer`, then delete `~/.local/bin/{burrow,burrowd,burrow-gtk,burrow-update}`, `~/.local/lib/burrow`, `~/.local/share/burrow/src`, `~/.local/share/icons/hicolor/scalable/apps/dev.burrow.Burrow.svg` and the `burrow*` units in `~/.local/share/systemd/user`.
 
-Anywhere else, build it from the checkout. If a library is missing, `cargo build` names it.
+To install it system-wide with pacman instead, without updates by itself, use the package in `dist/`: `cd burrow/dist && makepkg -si`. It packages the server agent for each musl target you have (`rust-musl` and `rust-aarch64-musl`, or `rustup target add`).
+
+For development, build it from the checkout. If a library is missing, `cargo build` names it.
 
 ```sh
-sudo pacman -S --needed gtk4 vte4 gtksourceview5 openssh gnome-keyring   # Arch
-git clone https://github.com/Edward-Pratt/burrow
-cd burrow
 cargo build --release
 ./target/release/burrow doctor      # says what is missing, and how to get it
 ./target/release/burrow-gtk

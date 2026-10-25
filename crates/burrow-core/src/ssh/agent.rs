@@ -130,7 +130,8 @@ pub(crate) async fn find_build(
         }
     }
     Err(format!(
-        "this Burrow has no burrow-agent for {arch} servers. Build one with \
+        "this Burrow has no burrow-agent for {arch} servers. If you installed it with \
+         dist/install.sh, run `burrow-update` in a terminal. Otherwise build one with \
          `cargo build -p burrow-agent --profile agent --target {arch}-unknown-linux-musl`"
     ))
 }
