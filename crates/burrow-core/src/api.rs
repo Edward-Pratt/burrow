@@ -250,6 +250,10 @@ pub struct Prompt {
     pub kind: PromptKind,
     pub title: String,
     pub message: String,
+    /// For a [`PromptKind::Confirm`], what "yes" does, as a button would
+    /// say it ("Install"). Clients pick their own words when it's missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

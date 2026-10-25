@@ -140,7 +140,7 @@ Terminals, tunnels and file sessions on the same host share one SSH connection, 
 
 | `type` | Answer with |
 |---|---|
-| `confirm` | `{"type": "confirm"}` or `{"type": "cancel"}` |
+| `confirm` | `{"type": "confirm"}` or `{"type": "cancel"}`. `prompt.action`, when there, is what confirming does, as a button would say it ("Install"). |
 | `secret` (`can_save`) | `{"type": "text", "value": "…", "save": false}`, or `cancel` |
 | `text` | `{"type": "text", "value": "…"}`, or `cancel` |
 

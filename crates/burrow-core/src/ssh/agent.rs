@@ -25,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::files::{self, join};
 use super::{Connection, Prompter};
-use crate::api::{Node, NodeId, PromptAnswer, PromptKind};
+use crate::api::{Node, NodeId, PromptAnswer};
 use crate::engine::Core;
 use crate::error::{Error, Result};
 use crate::grants::{self, Lookup};
@@ -224,7 +224,7 @@ pub(super) async fn ensure(
             node.name
         );
         let answer = prompter
-            .ask(PromptKind::Confirm, "Install burrow-agent?", &message)
+            .confirm("Install burrow-agent?", &message, "Install")
             .await;
         if answer != PromptAnswer::Confirm {
             return Err("burrow-agent was not installed".to_string());

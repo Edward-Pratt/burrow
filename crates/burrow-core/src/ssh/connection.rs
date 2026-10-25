@@ -362,7 +362,7 @@ async fn verify_host_key(config: &HostConfig, key: &PublicKey, prompter: &Prompt
                 key.algorithm()
             );
             let answer = prompter
-                .ask(PromptKind::Confirm, "Trust this host?", &message)
+                .confirm("Trust this host?", &message, "Trust and connect")
                 .await;
             if answer != PromptAnswer::Confirm {
                 return Err(format!("the host key for {name} was not trusted"));

@@ -372,6 +372,23 @@ impl Prompter {
 
     /// [`PromptAnswer::Cancel`] if the session closes first.
     pub async fn ask(&self, kind: PromptKind, title: &str, message: &str) -> PromptAnswer {
+        self.ask_with(kind, title, message, None).await
+    }
+
+    /// A yes-or-no question whose "yes" does `action`.
+    pub async fn confirm(&self, title: &str, message: &str, action: &str) -> PromptAnswer {
+        let action = Some(action.to_string());
+        self.ask_with(PromptKind::Confirm, title, message, action)
+            .await
+    }
+
+    async fn ask_with(
+        &self,
+        kind: PromptKind,
+        title: &str,
+        message: &str,
+        action: Option<String>,
+    ) -> PromptAnswer {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -382,6 +399,7 @@ impl Prompter {
                 kind,
                 title: title.to_string(),
                 message: message.to_string(),
+                action,
             },
         });
         // Announced however the wait ends, even if this future is dropped.

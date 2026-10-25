@@ -6,6 +6,7 @@ mod app;
 mod database;
 mod dialogs;
 mod files;
+mod monitor;
 mod palette;
 mod remote;
 mod runtime;

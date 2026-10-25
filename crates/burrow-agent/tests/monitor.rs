@@ -76,6 +76,7 @@ impl Rig {
         let prompt = expect_prompt(&mut self.events, session).await;
         assert_eq!(prompt.kind, PromptKind::Confirm);
         assert_eq!(prompt.title, "Install burrow-agent?");
+        assert_eq!(prompt.action.as_deref(), Some("Install"));
         answer(&self.core, session, &prompt, PromptAnswer::Confirm).await;
         assert_eq!(
             expect_state(&mut self.events, session).await,

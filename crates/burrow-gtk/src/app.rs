@@ -27,6 +27,7 @@ use crate::addons;
 use crate::database::{self, Database};
 use crate::dialogs;
 use crate::files::{self, Files};
+use crate::monitor::{self, Monitor};
 use crate::palette::{self, Item};
 use crate::remote::{self, Remote, Unclaimed};
 use crate::runtime::runtime;
@@ -135,6 +136,13 @@ pub enum AppMsg {
     },
     /// Opens an SSH host's file panel.
     OpenFiles(NodeId),
+    /// Opens an SSH host's monitor.
+    OpenMonitor(NodeId),
+    /// For the monitor of an SSH host.
+    Monitor {
+        node: NodeId,
+        msg: monitor::Msg,
+    },
     /// For the file panel of an SSH host.
     Files {
         node: NodeId,
@@ -201,13 +209,15 @@ pub enum TabKey {
     Node(NodeId),
     /// An SSH host's file panel. The host's own tab is its terminal.
     Files(NodeId),
+    /// An SSH host's monitor.
+    Monitor(NodeId),
     Terminal(u32),
 }
 
 impl TabKey {
     fn node(self) -> Option<NodeId> {
         match self {
-            TabKey::Node(id) | TabKey::Files(id) => Some(id),
+            TabKey::Node(id) | TabKey::Files(id) | TabKey::Monitor(id) => Some(id),
             TabKey::Terminal(_) => None,
         }
     }
@@ -238,6 +248,8 @@ pub struct App {
     remotes: HashMap<NodeId, Remote>,
     /// File panels, by SSH host node.
     files: HashMap<NodeId, Files>,
+    /// Monitors, by SSH host node.
+    monitors: HashMap<NodeId, Monitor>,
     /// Database tabs, by node.
     databases: HashMap<NodeId, Database>,
     /// Tabs drawn by addons: the box their view goes in, by node.
@@ -321,6 +333,7 @@ impl Component for App {
             next_terminal: 1,
             remotes: HashMap::new(),
             files: HashMap::new(),
+            monitors: HashMap::new(),
             databases: HashMap::new(),
             views: HashMap::new(),
             unclaimed: Unclaimed::default(),
@@ -401,6 +414,7 @@ impl Component for App {
                 let ended: Vec<(NodeId, SessionId)> = (self.remotes.iter())
                     .map(|(node, r)| (*node, &r.state))
                     .chain(self.files.iter().map(|(node, p)| (*node, &p.state)))
+                    .chain(self.monitors.iter().map(|(node, p)| (*node, &p.state)))
                     .chain(self.databases.iter().map(|(node, p)| (*node, &p.state)))
                     .filter_map(|(node, state)| match state {
                         remote::State::Running(session) => Some((node, *session)),
@@ -572,6 +586,25 @@ impl Component for App {
             AppMsg::Files { node, msg } => {
                 if let Some(panel) = self.files.get_mut(&node) {
                     panel.update(msg, &self.core, window, &sender);
+                }
+            }
+            AppMsg::OpenMonitor(id) => self.open_monitor(id, widgets, &sender),
+            AppMsg::Monitor {
+                node,
+                msg: monitor::Msg::Started(session),
+            } => match self.monitors.get_mut(&node) {
+                Some(panel) if panel.state == remote::State::Starting => {
+                    panel.state = remote::State::Running(session);
+                    for event in self.unclaimed.claim(session) {
+                        self.session_event(event, window, &sender);
+                    }
+                }
+                // The tab was closed while the session started.
+                _ => execute(&self.core, &sender, Command::CloseSession { session }),
+            },
+            AppMsg::Monitor { node, msg } => {
+                if let Some(panel) = self.monitors.get_mut(&node) {
+                    panel.update(msg, &self.core, &sender);
                 }
             }
             AppMsg::StartTunnel(node) => {
@@ -806,6 +839,9 @@ impl App {
                 if let Some(tab) = self.tabs.get(&TabKey::Files(id)) {
                     set_tab_title(&tab.title, &files_title(&node.name));
                 }
+                if let Some(tab) = self.tabs.get(&TabKey::Monitor(id)) {
+                    set_tab_title(&tab.title, &monitor_title(&node.name));
+                }
                 if let Some(tab) = self.tabs.get(&TabKey::Node(id)) {
                     set_tab_title(&tab.title, &node.name);
                     if !self.tunnel_pages.contains_key(&id)
@@ -842,6 +878,7 @@ impl App {
                 self.restarting.remove(&id);
                 self.close_tab(TabKey::Node(id), widgets);
                 self.close_tab(TabKey::Files(id), widgets);
+                self.close_tab(TabKey::Monitor(id), widgets);
                 self.sidebar_dirty = true;
                 self.refresh_tunnels(sender);
             }
@@ -858,8 +895,20 @@ impl App {
             }
             Event::AddonsChanged { addons } => self.set_addons(addons, widgets, sender),
             Event::ViewChanged { node, view } => self.show_view(node, Ok(view), sender),
-            // The window has no monitor tab yet.
-            Event::MonitorSample { .. } | Event::MonitorUnits { .. } => {}
+            Event::MonitorSample {
+                session, sample, ..
+            } => {
+                let running = remote::State::Running(session);
+                if let Some(panel) = self.monitors.values_mut().find(|p| p.state == running) {
+                    panel.sample(&sample);
+                }
+            }
+            Event::MonitorUnits { session, units, .. } => {
+                let running = remote::State::Running(session);
+                if let Some(panel) = self.monitors.values_mut().find(|p| p.state == running) {
+                    panel.set_units(units);
+                }
+            }
             Event::AutostartChanged { nodes } => {
                 self.autostart = nodes.into_iter().collect();
                 self.refresh_tunnels(sender);
@@ -1039,6 +1088,16 @@ impl App {
         }
         let running = remote::State::Running(session);
         if let Some(panel) = self.databases.values_mut().find(|p| p.state == running) {
+            match event {
+                Event::SessionChanged { state, .. } => {
+                    panel.session_changed(&state, &self.core, sender)
+                }
+                Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(panel) = self.monitors.values_mut().find(|p| p.state == running) {
             match event {
                 Event::SessionChanged { state, .. } => {
                     panel.session_changed(&state, &self.core, sender)
@@ -1451,6 +1510,26 @@ impl App {
         self.files.insert(id, panel);
     }
 
+    fn open_monitor(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
+        let key = TabKey::Monitor(id);
+        if let Some(tab) = self.tabs.get(&key) {
+            if let Some(index) = widgets.notebook.page_num(&tab.page) {
+                widgets.notebook.set_current_page(Some(index));
+            }
+            return;
+        }
+        let Some(node) = self.nodes.get(&id).filter(|n| n.kind == SSH_HOST_KIND) else {
+            return;
+        };
+        let title = monitor_title(&node.name);
+        let panel = Monitor::new(id, sender);
+        let page = panel.page.clone().upcast();
+        let icon = "utilities-system-monitor-symbolic";
+        self.add_tab(key, page, icon, &title, widgets, sender);
+        monitor::start(&self.core, id, sender);
+        self.monitors.insert(id, panel);
+    }
+
     fn open_terminal(
         &mut self,
         shell: Option<String>,
@@ -1532,6 +1611,7 @@ impl App {
                 .map(|r| r.state)
                 .or_else(|| self.databases.remove(&id).map(|d| d.state)),
             TabKey::Files(id) => self.files.remove(&id).map(|f| f.state),
+            TabKey::Monitor(id) => self.monitors.remove(&id).map(|m| m.state),
             TabKey::Terminal(_) => None,
         };
         if let Some(remote::State::Running(session)) = state {
@@ -1673,6 +1753,7 @@ impl App {
                 entries.push(("Open".into(), AppMsg::Open(node.id)));
                 if node.kind == SSH_HOST_KIND {
                     entries.push(("Browse files".into(), AppMsg::OpenFiles(node.id)));
+                    entries.push(("Monitor".into(), AppMsg::OpenMonitor(node.id)));
                 }
                 if node.kind == SSH_TUNNEL_KIND {
                     let running = self.tunnels.get(&node.id).and_then(|s| s.running());
@@ -1839,10 +1920,20 @@ impl App {
             nodes
                 .iter()
                 .filter(|n| n.kind == SSH_HOST_KIND)
-                .map(|node| Item {
-                    title: format!("Browse files: {}", node.name),
-                    subtitle: sidebar::location(&self.nodes, node),
-                    message: AppMsg::OpenFiles(node.id),
+                .flat_map(|node| {
+                    let subtitle = sidebar::location(&self.nodes, node);
+                    [
+                        Item {
+                            title: format!("Browse files: {}", node.name),
+                            subtitle: subtitle.clone(),
+                            message: AppMsg::OpenFiles(node.id),
+                        },
+                        Item {
+                            title: format!("Monitor: {}", node.name),
+                            subtitle,
+                            message: AppMsg::OpenMonitor(node.id),
+                        },
+                    ]
                 }),
         );
         items.extend(nodes.into_iter().map(|node| {
@@ -2092,6 +2183,10 @@ fn shown(nodes: &HashMap<NodeId, Node>, props: &toml::Table) -> Option<TunnelSho
 }
 
 /// The title of an SSH host's file panel tab.
+fn monitor_title(host: &str) -> String {
+    format!("{host} monitor")
+}
+
 fn files_title(host: &str) -> String {
     format!("{host} files")
 }
