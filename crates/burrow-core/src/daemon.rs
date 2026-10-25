@@ -83,7 +83,7 @@ async fn serve(activated: Option<std::os::unix::net::UnixListener>) -> Result<()
         .truncate(false)
         .open(&lock_path)
         .map_err(|e| Error::io(&lock_path, e))?;
-    if lock.try_lock().is_err() {
+    if !ipc::take_lock(&lock).await {
         tracing::info!("another burrowd is already running for {}", dir.display());
         return Ok(());
     }

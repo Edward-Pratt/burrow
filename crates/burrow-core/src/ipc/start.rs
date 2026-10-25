@@ -26,6 +26,11 @@ const OVERRIDES: [&str; 3] = ["BURROW_CONFIG_DIR", "BURROW_STATE_DIR", "BURROW_S
 /// How long a client waits for a daemon it started.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many times a starting daemon tries for the lock, and how long it
+/// waits between tries: about a second in all.
+const LOCK_TRIES: u32 = 50;
+const LOCK_WAIT: Duration = Duration::from_millis(20);
+
 /// The folder holding the daemon's socket: `$BURROW_RUNTIME_DIR` when set,
 /// otherwise `$XDG_RUNTIME_DIR/burrow`.
 ///
@@ -180,6 +185,22 @@ pub async fn stop(dir: &Path) -> Result<bool> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err(Error::Remote("burrowd did not stop".to_string()))
+}
+
+/// Takes the daemon's lock on `file`. `false` when another daemon holds it.
+///
+/// [`stop`] holds the lock shared for an instant to see whether a daemon
+/// runs. A daemon starting in that instant would take that for another
+/// daemon and exit, and the client that started it would wait out
+/// [`START_TIMEOUT`], so it keeps trying for a while first.
+pub(crate) async fn take_lock(file: &std::fs::File) -> bool {
+    for _ in 1..LOCK_TRIES {
+        if file.try_lock().is_ok() {
+            return true;
+        }
+        tokio::time::sleep(LOCK_WAIT).await;
+    }
+    file.try_lock().is_ok()
 }
 
 /// The pid written in the lock file, or `None` while it is empty: a daemon
@@ -341,6 +362,28 @@ mod tests {
         assert_eq!(holder(&path), Some(std::process::id() as libc::pid_t));
         lock.set_len(0).unwrap();
         assert_eq!(holder(&path), None);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_starting_while_stop_looks_still_takes_the_lock() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join(LOCK);
+        // Held shared as `stop` holds it to look, if longer.
+        let looking = std::fs::File::create(&path).unwrap();
+        looking.try_lock_shared().unwrap();
+        let done = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            looking.unlock().unwrap();
+        });
+        let daemon = std::fs::File::open(&path).unwrap();
+        assert!(take_lock(&daemon).await);
+        done.join().unwrap();
+
+        // A lock another daemon holds is given up on, after about a second.
+        let second = std::fs::File::open(&path).unwrap();
+        let started = Instant::now();
+        assert!(!take_lock(&second).await);
+        assert!(started.elapsed() >= LOCK_WAIT * (LOCK_TRIES - 1));
     }
 
     #[test]
