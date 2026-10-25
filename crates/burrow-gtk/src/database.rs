@@ -382,9 +382,12 @@ impl Database {
             SessionState::Closed { error } => {
                 self.state = State::Closed;
                 self.set_running(false);
-                let text = match error {
-                    Some(error) => format!("The connection ended: {}", printable(error)),
-                    None => "The connection ended.".into(),
+                // The editor only shows once connected.
+                let was_connected = self.stack.visible_child_name().as_deref() == Some("main");
+                let text = match (error, was_connected) {
+                    (Some(error), true) => format!("The connection ended: {}", printable(error)),
+                    (Some(error), false) => format!("Couldn't connect: {}", printable(error)),
+                    (None, _) => "The connection ended.".into(),
                 };
                 self.show_message(&text, true);
             }
