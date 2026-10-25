@@ -9,6 +9,7 @@ use crate::api::{
     API_VERSION, AlertKind, Capability, Command, Event, Grant, Node, NodeId, POSTGRES_KIND,
     Problem, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionKind, View,
 };
+use crate::class::AddonRule;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::grants::{self, Grants};
@@ -794,16 +795,7 @@ impl Inner {
     }
 
     fn execute(&self, command: Command) -> Result<Response> {
-        let changes_tree = matches!(
-            command,
-            Command::CreateNode { .. }
-                | Command::UpdateNode { .. }
-                | Command::MoveNode { .. }
-                | Command::DeleteNode { .. }
-                | Command::SetAutostart { .. }
-                | Command::SetMonitoring { .. }
-                | Command::SetGrant { .. }
-        );
+        let changes_tree = command.class().changes_tree;
         let response = self.execute_inner(command);
         if changes_tree {
             self.check_autostart();
@@ -1060,8 +1052,8 @@ impl Inner {
         }
     }
 
-    /// The permission table for commands sent by addons. Anything not
-    /// listed, such as secrets, sessions and managing addons, is refused.
+    /// Whether an addon may send `command`, by what its class says it
+    /// needs (see [`AddonRule`]) and the addon's permissions and kinds.
     fn permit(&self, manifest: &Manifest, command: &Command) -> Result<()> {
         let need = |permission: Permission| {
             if manifest.has(permission) {
@@ -1083,20 +1075,18 @@ impl Inner {
                 )))
             }
         };
-        match command {
-            Command::Version => Ok(()),
-            Command::ListNodes | Command::GetNode { .. } => need(Permission::NodesRead),
-            Command::CreateNode { kind, .. } => {
+        match command.class().addon {
+            AddonRule::Free => Ok(()),
+            AddonRule::ReadNodes => need(Permission::NodesRead),
+            AddonRule::CreateNode(kind) => {
                 need(Permission::NodesWrite)?;
                 own(kind)
             }
-            Command::UpdateNode { id, .. }
-            | Command::MoveNode { id, .. }
-            | Command::DeleteNode { id, .. } => {
+            AddonRule::ChangeNode(id) => {
                 need(Permission::NodesWrite)?;
-                own(&self.tree().get(*id)?.node.kind)
+                own(&self.tree().get(id)?.node.kind)
             }
-            _ => Err(Error::PermissionDenied(format!(
+            AddonRule::Denied => Err(Error::PermissionDenied(format!(
                 "addons may not send {}",
                 command_name(command)
             ))),

@@ -27,6 +27,7 @@ use super::{
     read_line,
 };
 use crate::api::{API_VERSION, Capability, Command, Event, NodeId, Response, SessionId};
+use crate::class::McpRule;
 use crate::engine::Core;
 use crate::error::{Error, Result};
 
@@ -211,13 +212,7 @@ impl Conn {
         match method {
             "execute" => {
                 let command: Command = parse(params)?;
-                let owns = matches!(
-                    command,
-                    Command::OpenTerminal { .. }
-                        | Command::OpenFiles { .. }
-                        | Command::OpenDatabase { .. }
-                        | Command::OpenMonitor { .. }
-                );
+                let owns = command.class().opens_session;
                 let response = match role {
                     Role::Gui | Role::Cli => self.core.execute(command).await,
                     Role::Mcp => self.execute_mcp(command).await,
@@ -373,69 +368,41 @@ impl Conn {
         result
     }
 
-    /// The table of what the MCP bridge may run. Reading the sidebar is
-    /// free; acting needs a grant on the node, and a session it opened
-    /// itself. Anything not listed, such as changing nodes, secrets,
-    /// prompts, autostart, addons and grants, is refused. So are commands
-    /// that take a local path: the bridge reads and writes contents
-    /// instead, so it can't read or overwrite the user's own files.
+    /// What the MCP bridge may run. The command's class says what it
+    /// needs (see [`McpRule`]); this checks that against the grants and
+    /// the sessions the bridge opened itself.
     fn mcp_rule(&self, command: &Command) -> Result<Rule> {
-        use Capability::*;
-        let node = |node: NodeId, capability| self.require(node, capability);
-        let session = |session: SessionId, capability| {
-            let node = self.own_session(session)?;
-            self.require(node, capability)
-        };
-        match command {
-            Command::Version
-            | Command::ListNodes
-            | Command::GetNode { .. }
-            | Command::ListSessions
-            | Command::ListGrants => {}
-            Command::Exec { node: id, .. } => node(*id, Exec)?,
-            Command::OpenFiles { node: id } => node(*id, FilesRead)?,
-            Command::ListDir { session: s, .. } | Command::ReadFile { session: s, .. } => {
-                session(*s, FilesRead)?;
+        match command.class().mcp {
+            McpRule::Free => {}
+            McpRule::Node(node, capability) => self.require(node, capability)?,
+            McpRule::Session(session, capability) => {
+                let node = self.own_session(session)?;
+                self.require(node, capability)?;
             }
-            Command::WriteFile { session: s, .. }
-            | Command::MakeDir { session: s, .. }
-            | Command::RenamePath { session: s, .. }
-            | Command::RemovePath { session: s, .. } => session(*s, FilesWrite)?,
-            Command::OpenDatabase { node: id } => node(*id, SqlRead)?,
-            Command::ListSchema { session: s } | Command::CancelQuery { session: s } => {
-                session(*s, SqlRead)?;
-            }
-            Command::RunQuery { session: s, .. } => {
-                session(*s, SqlRead)?;
-                let id = self.own_session(*s)?;
-                if !self.core.granted(id, SqlWrite) {
+            McpRule::Query(session) => {
+                let node = self.own_session(session)?;
+                self.require(node, Capability::SqlRead)?;
+                if !self.core.granted(node, Capability::SqlWrite) {
                     return Ok(Rule::ReadOnlyQuery);
                 }
             }
-            Command::SetReadOnly { session: s, .. } => session(*s, SqlWrite)?,
-            Command::StartTunnel { node: id } => node(*id, Tunnel)?,
-            Command::OpenMonitor { node: id } => {
-                node(*id, MonitorRead)?;
+            McpRule::Monitor(node) => {
+                self.require(node, Capability::MonitorRead)?;
                 return Ok(Rule::MonitorWithoutInstall);
             }
-            Command::MonitorHistory { session: s } => session(*s, MonitorRead)?,
-            Command::MonitorTrend { node: id, .. } => node(*id, MonitorRead)?,
-            Command::ListAlerts => return Ok(Rule::GrantedAlerts),
-            Command::CloseSession { session: s } => {
-                if self.own_session(*s).is_err() {
-                    let tunnel = self
-                        .core
-                        .sessions()
-                        .list()
-                        .into_iter()
-                        .find(|i| i.session == *s && i.kind == crate::api::SessionKind::Tunnel);
+            McpRule::Alerts => return Ok(Rule::GrantedAlerts),
+            McpRule::Close(session) => {
+                if self.own_session(session).is_err() {
+                    let tunnel = self.core.sessions().list().into_iter().find(|i| {
+                        i.session == session && i.kind == crate::api::SessionKind::Tunnel
+                    });
                     match tunnel {
-                        Some(info) => self.require(info.node, Tunnel)?,
+                        Some(info) => self.require(info.node, Capability::Tunnel)?,
                         None => return Err(denied("close a session it did not open")),
                     }
                 }
             }
-            other => return Err(denied(&format!("run {}", command_type(other)))),
+            McpRule::Denied => return Err(denied(&format!("run {}", command_type(command)))),
         }
         Ok(Rule::Run)
     }
