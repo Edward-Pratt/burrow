@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use burrow_core::ipc::Client;
 use burrow_core::{
-    Command, Core, DbSchema, DbTable, DbTableKind, HistoryEntry, Node, NodeId, QueryError,
-    QueryResult, Response, SessionId, SessionState, StatementResult,
+    Command, DbSchema, DbTable, DbTableKind, HistoryEntry, Node, NodeId, QueryError, QueryResult,
+    Response, SessionId, SessionState, StatementResult,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gio, glib};
@@ -366,7 +367,7 @@ impl Database {
     pub fn session_changed(
         &mut self,
         state: &SessionState,
-        core: &Core,
+        core: &Client,
         sender: &ComponentSender<App>,
     ) {
         match state {
@@ -397,7 +398,7 @@ impl Database {
     pub fn update(
         &mut self,
         msg: Msg,
-        core: &Core,
+        core: &Client,
         window: &gtk::ApplicationWindow,
         sender: &ComponentSender<App>,
     ) {
@@ -597,7 +598,7 @@ impl Database {
         sql: String,
         offset: i32,
         browsing: Option<String>,
-        core: &Core,
+        core: &Client,
         sender: &ComponentSender<App>,
     ) {
         let State::Running(session) = self.state else {
@@ -627,7 +628,7 @@ impl Database {
     fn request(
         &self,
         command: Command,
-        core: &Core,
+        core: &Client,
         sender: &ComponentSender<App>,
         reply: impl FnOnce(Response) -> Option<Msg> + Send + 'static,
     ) {
@@ -638,7 +639,7 @@ impl Database {
     fn send(
         &self,
         command: Command,
-        core: &Core,
+        core: &Client,
         sender: &ComponentSender<App>,
         reply: impl FnOnce(Response) -> Option<Msg> + Send + 'static,
         failed: fn(String) -> Msg,
@@ -656,7 +657,7 @@ impl Database {
         });
     }
 
-    fn load_schema(&self, core: &Core, sender: &ComponentSender<App>) {
+    fn load_schema(&self, core: &Client, sender: &ComponentSender<App>) {
         let State::Running(session) = self.state else {
             return;
         };
@@ -853,7 +854,7 @@ impl Database {
 
 /// Asks the core to connect to `node`. The reply arrives as
 /// [`Msg::Started`] or [`Msg::StartFailed`].
-pub fn start(core: &Core, node: NodeId, sender: &ComponentSender<App>) {
+pub fn start(core: &Client, node: NodeId, sender: &ComponentSender<App>) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
         let msg = match core.execute(Command::OpenDatabase { node }).await {

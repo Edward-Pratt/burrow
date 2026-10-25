@@ -111,36 +111,26 @@ impl Client {
 
     /// Takes a session's terminal output stream, as
     /// [`Core::take_output`](crate::Core::take_output) does. Dropping it
-    /// ends the session.
+    /// ends the session once the next output finds nobody reading, as
+    /// in-process.
     pub async fn take_output(&self, session: SessionId) -> Result<mpsc::Receiver<Vec<u8>>> {
         let (tx, rx) = mpsc::channel(OUTPUT_BUFFER);
-        self.shared
-            .outputs
-            .lock()
-            .unwrap()
-            .insert(session, tx.clone());
+        self.shared.outputs.lock().unwrap().insert(session, tx);
         if let Err(e) =
             call::<Value>(&self.shared, "take_output", json!({"session": session})).await
         {
             self.shared.outputs.lock().unwrap().remove(&session);
             return Err(e);
         }
-        let shared = self.shared.clone();
-        tokio::spawn(async move {
-            tx.closed().await;
-            let mine = {
-                let mut outputs = shared.outputs.lock().unwrap();
-                let mine = outputs.get(&session).is_some_and(|t| t.same_channel(&tx));
-                if mine {
-                    outputs.remove(&session);
-                }
-                mine
-            };
-            if mine {
-                notify(&shared, "release_output", json!({"session": session})).await;
-            }
-        });
         Ok(rx)
+    }
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("build", &self.info.build)
+            .finish_non_exhaustive()
     }
 }
 
@@ -284,8 +274,11 @@ async fn dispatch(shared: &Shared, method: &str, params: Value) {
             // Waiting here stops reading the socket, which slows the
             // daemon's writer and so the session, rather than buffer
             // without limit.
-            if let Some(tx) = tx {
-                let _ = tx.send(data).await;
+            if let Some(tx) = tx
+                && tx.send(data).await.is_err()
+            {
+                shared.outputs.lock().unwrap().remove(&session);
+                notify(shared, "release_output", json!({"session": session})).await;
             }
         }
         "output_ended" => {

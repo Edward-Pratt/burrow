@@ -1,5 +1,5 @@
 //! Burrow's GTK4 front end. It is a thin client: every change goes through
-//! `burrow_core::Core`, and the window redraws from the core's events.
+//! the core in `burrowd`, and the window redraws from the core's events.
 
 mod addons;
 mod app;
@@ -14,44 +14,28 @@ mod sidebar;
 mod terminal;
 mod tunnels;
 
-use std::path::PathBuf;
+use burrow_core::CoreOptions;
+use burrow_core::ipc::{self, Role};
 
-use burrow_core::{Core, CoreOptions};
+use crate::runtime::runtime;
 
 const APP_ID: &str = "dev.burrow.Burrow";
 
 fn main() {
-    let options = match core_options() {
-        Ok(options) => options,
+    // Before GTK or tokio start any threads: this may be the daemon.
+    burrow_core::daemon::run_if_asked();
+    let config_dir = match CoreOptions::from_env() {
+        Ok(options) => options.config_dir,
         Err(e) => fail(&e),
     };
-    let config_dir = options.config_dir.clone();
-    let core = match Core::open(options) {
-        Ok(core) => core,
+    let core = match runtime().block_on(ipc::connect(Role::Gui)) {
+        Ok(client) => client,
         Err(e) => fail(&e),
     };
 
     let app = relm4::RelmApp::new(APP_ID);
     relm4::set_global_css(include_str!("style.css"));
     app.run::<app::App>(app::Init { core, config_dir });
-}
-
-/// `BURROW_CONFIG_DIR` points Burrow at another config folder,
-/// `BURROW_STATE_DIR` at another state folder (addon approvals), and
-/// `BURROW_SSH_CONFIG` at another OpenSSH config (as `ssh -F`), which keeps
-/// development runs away from your real ones.
-fn core_options() -> burrow_core::Result<CoreOptions> {
-    let mut options = CoreOptions::system()?;
-    if let Some(dir) = std::env::var_os("BURROW_CONFIG_DIR") {
-        options.config_dir = PathBuf::from(dir);
-    }
-    if let Some(dir) = std::env::var_os("BURROW_STATE_DIR") {
-        options.state_dir = PathBuf::from(dir);
-    }
-    if let Some(file) = std::env::var_os("BURROW_SSH_CONFIG") {
-        options.ssh_config = Some(PathBuf::from(file));
-    }
-    Ok(options)
 }
 
 fn fail(error: &burrow_core::Error) -> ! {

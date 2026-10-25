@@ -7,6 +7,7 @@
 //! once nothing has been connected or running for [`IDLE`].
 
 use std::ffi::OsStr;
+use std::io::Write;
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -72,11 +73,22 @@ async fn serve(activated: Option<std::os::unix::net::UnixListener>) -> Result<()
     let dir = ipc::runtime_dir()?;
     ipc::ensure_private_dir(&dir)?;
     let lock_path = dir.join(LOCK);
-    let lock = std::fs::File::create(&lock_path).map_err(|e| Error::io(&lock_path, e))?;
+    // Opened without truncating: the pid in it belongs to whoever holds it.
+    let mut lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| Error::io(&lock_path, e))?;
     if lock.try_lock().is_err() {
         tracing::info!("another burrowd is already running for {}", dir.display());
         return Ok(());
     }
+    // The pid, for scripts that need to find the daemon.
+    lock.set_len(0)
+        .and_then(|()| writeln!(lock, "{}", std::process::id()))
+        .map_err(|e| Error::io(&lock_path, e))?;
     // A socket left behind is removed only by the daemon holding the lock,
     // so it never takes the place of a live one.
     let (listener, bound) = match activated {
@@ -119,6 +131,8 @@ async fn serve(activated: Option<std::os::unix::net::UnixListener>) -> Result<()
     if let Some(path) = bound {
         let _ = std::fs::remove_file(path);
     }
+    // A pid left behind could later name some other process.
+    let _ = lock.set_len(0);
     drop(lock);
     Ok(())
 }

@@ -10,10 +10,11 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
+use burrow_core::ipc::{self, Client, Role};
 use burrow_core::{
-    AddonInfo, Command, Core, Event, FormValue, Node, NodeId, NodePatch, POSTGRES_KIND, Problem,
-    Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId, SessionInfo, SessionKind,
-    SessionState, TunnelShown, View, Watcher,
+    AddonInfo, Command, Event, FormValue, Node, NodeId, NodePatch, POSTGRES_KIND, Problem, Prompt,
+    Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId, SessionInfo, SessionKind, SessionState,
+    TunnelShown, View,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
@@ -34,9 +35,12 @@ use crate::terminal;
 use crate::tunnels;
 
 pub struct Init {
-    pub core: Core,
+    pub core: Client,
     pub config_dir: PathBuf,
 }
+
+/// How long to wait between attempts to reach a daemon that went away.
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// How long a message from an addon stays in the status bar.
 const NOTICE_TIME: Duration = Duration::from_secs(6);
@@ -67,6 +71,10 @@ pub enum AppMsg {
     SessionsListed(Vec<SessionInfo>),
     /// We missed events; reload everything.
     Resync,
+    /// The daemon went away; [`AppMsg::Reconnected`] follows once a new
+    /// connection is up.
+    Disconnected,
+    Reconnected(Client),
     Failed(String),
 
     // From the user.
@@ -205,7 +213,7 @@ struct Tab {
 }
 
 pub struct App {
-    core: Core,
+    core: Client,
     config_dir: PathBuf,
     settings: UiSettings,
     nodes: HashMap<NodeId, Node>,
@@ -239,8 +247,6 @@ pub struct App {
     restarting: HashSet<NodeId>,
     /// Tunnels that start with Burrow.
     autostart: HashSet<NodeId>,
-    /// Watches the config folder while the window is open.
-    _watcher: Option<Watcher>,
     sidebar_dirty: bool,
 }
 
@@ -283,17 +289,6 @@ impl Component for App {
         // missed.
         listen(&core, &sender);
         load(&core, &sender);
-        {
-            let _runtime = runtime().enter();
-            core.autostart();
-        }
-        let (watcher, error) = {
-            let _runtime = runtime().enter();
-            match core.watch() {
-                Ok(watcher) => (Some(watcher), None),
-                Err(e) => (None, Some(format!("Live reload is off: {e}"))),
-            }
-        };
 
         let widgets = build(&window, &sender);
         widgets.sidebar_pane.set_visible(settings.sidebar_visible);
@@ -307,7 +302,7 @@ impl Component for App {
             expanded: HashSet::new(),
             problems: Vec::new(),
             addons: Vec::new(),
-            error,
+            error: None,
             notice: None,
             notice_id: 0,
             tabs: HashMap::new(),
@@ -322,7 +317,6 @@ impl Component for App {
             tunnel_pages: HashMap::new(),
             restarting: HashSet::new(),
             autostart: HashSet::new(),
-            _watcher: watcher,
             sidebar_dirty: false,
         };
         model.apply_theme();
@@ -379,6 +373,37 @@ impl Component for App {
                 self.take_sessions(sessions, window, &sender);
             }
             AppMsg::Resync => load(&self.core, &sender),
+            AppMsg::Disconnected => {
+                self.error = Some("Lost the connection to burrowd. Reconnecting…".to_string());
+            }
+            AppMsg::Reconnected(client) => {
+                self.core = client;
+                self.error = None;
+                // Sessions ended with the daemon that ran them. Tunnels are
+                // settled by the reload; the rest are only known here.
+                let ended: Vec<(NodeId, SessionId)> = (self.remotes.iter())
+                    .map(|(node, r)| (*node, &r.state))
+                    .chain(self.files.iter().map(|(node, p)| (*node, &p.state)))
+                    .chain(self.databases.iter().map(|(node, p)| (*node, &p.state)))
+                    .filter_map(|(node, state)| match state {
+                        remote::State::Running(session) => Some((node, *session)),
+                        _ => None,
+                    })
+                    .collect();
+                for (node, session) in ended {
+                    let state = SessionState::Closed {
+                        error: Some("Burrow's core stopped".to_string()),
+                    };
+                    let event = Event::SessionChanged {
+                        session,
+                        node,
+                        state,
+                    };
+                    self.session_event(event, window, &sender);
+                }
+                listen(&self.core, &sender);
+                load(&self.core, &sender);
+            }
             AppMsg::Failed(error) => self.error = Some(error),
 
             AppMsg::RowActivated(index) => {
@@ -661,7 +686,7 @@ impl Component for App {
                 execute(&self.core, &sender, Command::RevokeAddon { id });
             }
             AppMsg::OpenAddonsFolder => {
-                let folder = gio::File::for_path(self.core.addons_dir());
+                let folder = gio::File::for_path(&self.core.info().addons_dir);
                 gtk::FileLauncher::new(Some(&folder)).launch(
                     Some(window),
                     None::<&gio::Cancellable>,
@@ -1777,7 +1802,7 @@ impl App {
 
 /// Runs a command on the core's runtime. Successful results arrive as
 /// events, so only failures are reported back here.
-fn execute(core: &Core, sender: &ComponentSender<App>, command: Command) {
+fn execute(core: &Client, sender: &ComponentSender<App>, command: Command) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
         if let Err(e) = core.execute(command).await {
@@ -1788,7 +1813,7 @@ fn execute(core: &Core, sender: &ComponentSender<App>, command: Command) {
 
 /// Loads the full node list, problems, addons, sessions and autostart
 /// tunnels.
-fn load(core: &Core, sender: &ComponentSender<App>) {
+fn load(core: &Client, sender: &ComponentSender<App>) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
         let result = async {
@@ -1826,7 +1851,7 @@ fn load(core: &Core, sender: &ComponentSender<App>) {
 }
 
 /// Looks up every running session, for [`AppMsg::SessionsListed`].
-fn list_sessions(core: &Core, sender: &ComponentSender<App>) {
+fn list_sessions(core: &Client, sender: &ComponentSender<App>) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
         let sessions = match core.execute(Command::ListSessions).await {
@@ -1837,8 +1862,9 @@ fn list_sessions(core: &Core, sender: &ComponentSender<App>) {
     });
 }
 
-/// Forwards core events to the window until it closes.
-fn listen(core: &Core, sender: &ComponentSender<App>) {
+/// Forwards core events to the window until it closes. If the daemon goes
+/// away, connects again, which starts a new one.
+fn listen(core: &Client, sender: &ComponentSender<App>) {
     let mut events = core.subscribe();
     let input = sender.input_sender().clone();
     runtime().spawn(async move {
@@ -1849,7 +1875,22 @@ fn listen(core: &Core, sender: &ComponentSender<App>) {
                 Err(RecvError::Closed) => break,
             };
             if input.send(message).is_err() {
-                break; // The window is gone.
+                return; // The window is gone.
+            }
+        }
+        if input.send(AppMsg::Disconnected).is_err() {
+            return;
+        }
+        loop {
+            match ipc::connect(Role::Gui).await {
+                Ok(client) => {
+                    let _ = input.send(AppMsg::Reconnected(client));
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("burrow: could not reach burrowd: {e}");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                }
             }
         }
     });

@@ -3,7 +3,7 @@
 # sshd, and Burrow pointed at a scratch config.
 #
 #   rig.sh start [--sshd]   Xvfb, plus a test sshd on 127.0.0.1:2222 (host "testbox")
-#   rig.sh app [--real-ssh] (re)start burrow-gtk; --real-ssh uses ~/.ssh/config and the agent
+#   rig.sh app [--real-ssh] (re)start burrow-gtk and its burrowd; --real-ssh uses ~/.ssh/config and the agent
 #   rig.sh shot NAME        screenshot to $BURROW_TEST_DIR/NAME.png
 #   rig.sh stop             stop everything and delete the test keys
 #
@@ -14,9 +14,18 @@ DIR=${BURROW_TEST_DIR:?set BURROW_TEST_DIR to a scratch folder}
 REPO=$(cd "$(dirname "$0")/../../../.." && pwd)
 mkdir -p "$DIR/cfg/tree" "$DIR/state"
 
+# The app's burrowd, kept apart from any real one. Socket paths max out
+# at 107 bytes, so it can't live in a scratchpad.
+RUN="/run/user/$(id -u)/burrow-rig"
+
 stop_pid() {
     [ -f "$1" ] && kill "$(cat "$1")" 2>/dev/null || true
     rm -f "$1"
+}
+
+# burrowd keeps its pid in its lock file while it runs.
+stop_daemon() {
+    [ -f "$RUN/burrowd.lock" ] && kill "$(cat "$RUN/burrowd.lock")" 2>/dev/null || true
 }
 
 case "${1:-}" in
@@ -62,6 +71,8 @@ EOF
     ;;
 app)
     stop_pid "$DIR/app.pid"
+    # A new build needs a new daemon too: the app starts it.
+    stop_daemon
     cargo build -q -p burrow-gtk --manifest-path "$REPO/Cargo.toml"
     if [ "${2:-}" = --real-ssh ]; then
         ssh_env="SSH_AUTH_SOCK=/run/user/$(id -u)/ssh-agent.socket"
@@ -70,7 +81,7 @@ app)
     fi
     # no-portals: file dialogs would otherwise open on the real desktop.
     env $ssh_env GDK_DEBUG=no-portals DISPLAY=:99 GDK_BACKEND=x11 \
-        BURROW_CONFIG_DIR="$DIR/cfg" BURROW_STATE_DIR="$DIR/state" \
+        BURROW_CONFIG_DIR="$DIR/cfg" BURROW_STATE_DIR="$DIR/state" BURROW_RUNTIME_DIR="$RUN" \
         setsid "$REPO/target/debug/burrow-gtk" >"$DIR/app.log" 2>&1 </dev/null &
     echo $! >"$DIR/app.pid"
     sleep 3
@@ -81,6 +92,7 @@ shot)
     ;;
 stop)
     stop_pid "$DIR/app.pid"
+    stop_daemon
     stop_pid "$DIR/sshd/sshd.pid"
     stop_pid "$DIR/xvfb.pid"
     rm -f "$DIR"/sshd/*key* "$DIR/sshd/authorized_keys"

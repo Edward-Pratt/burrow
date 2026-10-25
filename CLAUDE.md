@@ -9,6 +9,7 @@ A Linux-first desktop app for servers and databases, in Rust + GTK4 (gtk4-rs + r
   - `src/addon/`: manifests, approval, JSON-RPC over stdio.
 - `crates/burrow-gtk`: a thin client. State flows one way: user action → `Command` → core `Event` → redraw. Each tab kind has a module: `terminal.rs`/`remote.rs` (terminals), `tunnels.rs`, `files.rs`, `addons.rs`. `app.rs` routes messages and session events between them.
 - `crates/burrow-addon-notes`: the example addon, plus the addon integration tests.
+- `crates/burrowd`: the daemon binary. The daemon itself is `burrow-core/src/daemon.rs`, and the socket protocol (server, client, finding and starting the daemon) is `src/ipc/`.
 
 ## Checks
 
@@ -44,9 +45,13 @@ cargo test --workspace
 cargo run -p burrow-gtk
 ```
 
+The window is a client of `burrowd`. If no daemon is running, it starts its own binary again with `--burrowd`, so the daemon is always the same build. The daemon stops after a minute with no clients and no sessions. Its log is `burrowd.log` in the state folder.
+
 For dev runs, point Burrow away from the user's real setup:
 - `BURROW_CONFIG_DIR` sets the config folder.
 - `BURROW_STATE_DIR` sets the folder for approvals and autostart.
 - `BURROW_SSH_CONFIG` replaces `~/.ssh/config`, as `ssh -F` does.
+- `BURROW_RUNTIME_DIR` sets the daemon's socket folder. If it isn't set but any of the three above is, the run gets a private daemon under `$XDG_RUNTIME_DIR/burrow/dev-<hash>/`, so it never joins the real one. Socket paths max out at 107 bytes, so don't put it in the scratchpad.
+- While the daemon runs, its pid is in `burrowd.lock` in the socket folder. After changing core code, stop the old dev daemon, because a running daemon keeps its old code.
 
 The user's agent socket is `/run/user/1000/ssh-agent.socket`. A shell started earlier may not have `SSH_AUTH_SOCK` set.

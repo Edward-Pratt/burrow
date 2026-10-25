@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 
-use burrow_core::{Command, Core, Event, NodeId, Response, SessionId, SessionState};
+use burrow_core::ipc::Client;
+use burrow_core::{Command, Event, NodeId, Response, SessionId, SessionState};
 use relm4::ComponentSender;
 use vte4::TerminalExt;
 
@@ -87,7 +88,12 @@ impl Unclaimed {
 
 /// Asks the core for a session on `node`. The reply arrives as
 /// [`AppMsg::SessionStarted`], followed by the session's output.
-pub fn start(core: &Core, node: NodeId, terminal: &vte4::Terminal, sender: &ComponentSender<App>) {
+pub fn start(
+    core: &Client,
+    node: NodeId,
+    terminal: &vte4::Terminal,
+    sender: &ComponentSender<App>,
+) {
     let (cols, rows) = terminal::size(terminal);
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
@@ -111,7 +117,7 @@ pub fn start(core: &Core, node: NodeId, terminal: &vte4::Terminal, sender: &Comp
         {
             return;
         }
-        if let Ok(mut output) = core.take_output(session) {
+        if let Ok(mut output) = core.take_output(session).await {
             while let Some(mut data) = output.recv().await {
                 while data.len() < OUTPUT_BATCH {
                     match output.try_recv() {
