@@ -68,8 +68,8 @@ fi
 # The clone remembers which branch it follows.
 branch=${branch:-$(git -C "$src" config burrow.branch || echo main)}
 git check-ref-format --branch "$branch" >/dev/null
-git -C "$src" config burrow.branch "$branch"
 git -C "$src" fetch --quiet origin "$branch"
+git -C "$src" config burrow.branch "$branch"
 commit=$(git -C "$src" rev-parse FETCH_HEAD)
 # Compared with what was installed, not what was checked out, so a build
 # that failed is tried again next time.
