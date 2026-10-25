@@ -507,10 +507,20 @@ impl Core {
     }
 
     /// Starts `node`'s background monitor unless it has one.
+    ///
+    /// The host is read again here, after the choice was checked, so it
+    /// may have changed in between, as with a `git pull`. It only starts
+    /// as the host it was chosen for, and the check after it stops it if a
+    /// change landed while it started, which that change's own check
+    /// would have missed.
     fn start_monitoring(&self, node: NodeId) {
-        if let Ok(node) = self.node(node) {
-            ssh::open_background_monitor(self, node);
+        let lookup = self.inner.lookup();
+        let Some(node) = lookup(node) else { return };
+        if !self.inner.monitoring.has(&lookup, &node) {
+            return;
         }
+        ssh::open_background_monitor(self, node);
+        self.inner.check_monitoring();
     }
 
     /// For tests: read burrow-agent builds from `local`, and put the agent
