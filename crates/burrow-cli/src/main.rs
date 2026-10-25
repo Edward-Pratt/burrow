@@ -130,8 +130,10 @@ fn main() -> ExitCode {
     code.unwrap_or_else(|e| fail(&*e))
 }
 
+/// Errors can quote a server, such as an SSH or Postgres message, so their
+/// control characters are escaped like any other text from one.
 fn fail(error: &dyn Error) -> ExitCode {
-    eprintln!("burrow: {error}");
+    eprintln!("burrow: {}", clean(&error.to_string()));
     ExitCode::FAILURE
 }
 
