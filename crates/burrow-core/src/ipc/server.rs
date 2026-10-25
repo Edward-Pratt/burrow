@@ -216,6 +216,7 @@ impl Conn {
                     Command::OpenTerminal { .. }
                         | Command::OpenFiles { .. }
                         | Command::OpenDatabase { .. }
+                        | Command::OpenMonitor { .. }
                 );
                 let response = match role {
                     Role::Gui | Role::Cli => self.core.execute(command).await,

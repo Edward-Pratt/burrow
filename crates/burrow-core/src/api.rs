@@ -11,6 +11,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+/// What burrow-agent reports, as monitor events carry it.
+pub use burrow_agent as monitor;
+
 /// Major version of the command/event API.
 pub const API_VERSION: u32 = 1;
 
@@ -172,6 +175,8 @@ pub enum SessionKind {
     Database,
     /// One command run with [`Command::Exec`].
     Exec,
+    /// burrow-agent reporting a server's state, for [`Command::OpenMonitor`].
+    Monitor,
 }
 
 /// Identifies a download or upload. Unique for as long as the core runs.
@@ -515,6 +520,17 @@ impl GrantShown {
     }
 }
 
+/// What a monitor has seen, for [`Command::MonitorHistory`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MonitorHistory {
+    /// Whether the server runs systemd, so whether `units` will come.
+    pub systemd: bool,
+    /// The samples of about the last hour, oldest first.
+    pub samples: Vec<monitor::Sample>,
+    /// The services, as last listed.
+    pub units: Option<Vec<monitor::Unit>>,
+}
+
 /// What a query sent with [`Command::RunQuery`] returned. A query can hold
 /// What a command run with [`Command::Exec`] did. Output is decoded as
 /// UTF-8, with invalid bytes replaced, and each stream is cut at 1 MiB.
@@ -802,6 +818,16 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout: Option<u32>,
     },
+    /// Starts burrow-agent on an SSH host node, putting it there first if
+    /// needed, and reports what it sees as [`Event::MonitorSample`] and
+    /// [`Event::MonitorUnits`]. Returns [`Response::Session`].
+    OpenMonitor {
+        node: NodeId,
+    },
+    /// What a monitor session has seen so far, as [`Response::Monitor`].
+    MonitorHistory {
+        session: SessionId,
+    },
     /// Returns the tunnels that start with Burrow, as [`Response::Autostart`].
     ListAutostart,
     /// Makes a tunnel start with Burrow, or stops it doing so. The choice is
@@ -944,6 +970,9 @@ pub enum Response {
     Exec {
         result: ExecResult,
     },
+    Monitor {
+        history: MonitorHistory,
+    },
     /// The start of a file, and its whole size.
     File {
         #[serde(with = "base64_bytes")]
@@ -1005,6 +1034,19 @@ pub enum Event {
         transfer: TransferId,
         session: SessionId,
         state: TransferState,
+    },
+    /// A monitor's server sent new stats, every 2 seconds.
+    MonitorSample {
+        session: SessionId,
+        node: NodeId,
+        sample: monitor::Sample,
+    },
+    /// A monitor's server has different services, or a service changed
+    /// state.
+    MonitorUnits {
+        session: SessionId,
+        node: NodeId,
+        units: Vec<monitor::Unit>,
     },
     /// The tunnels that start with Burrow changed.
     AutostartChanged {

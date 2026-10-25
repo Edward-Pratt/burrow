@@ -858,6 +858,8 @@ impl App {
             }
             Event::AddonsChanged { addons } => self.set_addons(addons, widgets, sender),
             Event::ViewChanged { node, view } => self.show_view(node, Ok(view), sender),
+            // The window has no monitor tab yet.
+            Event::MonitorSample { .. } | Event::MonitorUnits { .. } => {}
             Event::AutostartChanged { nodes } => {
                 self.autostart = nodes.into_iter().collect();
                 self.refresh_tunnels(sender);

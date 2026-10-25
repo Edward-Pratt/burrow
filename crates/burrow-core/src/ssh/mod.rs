@@ -10,15 +10,18 @@
 //!
 //! Sessions on the same host share one connection ([`Connections`]).
 
+mod agent;
 mod config;
 mod connection;
 pub(crate) mod exec;
 pub(crate) mod files;
 mod known_hosts;
+mod monitor;
 mod session;
 mod socks;
 mod tunnel;
 
+pub(crate) use agent::Agents;
 pub(crate) use connection::{Connection, Connections, alias};
 pub(crate) use files::Transfers;
 pub(crate) use tunnel::Autostart;
@@ -75,6 +78,7 @@ struct Entry {
 pub(crate) enum Attached {
     Sftp(Arc<SftpSession>),
     Database(Arc<db::Handle>),
+    Monitor(Arc<monitor::Monitor>),
 }
 
 /// Prompts waiting for an answer, by prompt id.
@@ -149,6 +153,7 @@ impl Sessions {
                 SessionKind::Terminal => "a terminal",
                 SessionKind::Tunnel => "a tunnel",
                 SessionKind::Exec => "a command",
+                SessionKind::Monitor => "a monitor",
             };
             return Err(Error::invalid("session", format!("{id} is not {what}")));
         }
@@ -172,6 +177,14 @@ impl Sessions {
         match self.attached(id, SessionKind::Database)? {
             (Attached::Database(handle), node) => Ok((handle, node)),
             _ => unreachable!("database sessions attach a database"),
+        }
+    }
+
+    /// What a connected monitor session has seen.
+    pub fn monitor(&self, id: SessionId) -> Result<Arc<monitor::Monitor>> {
+        match self.attached(id, SessionKind::Monitor)? {
+            (Attached::Monitor(monitor), _) => Ok(monitor),
+            _ => unreachable!("monitor sessions attach a monitor"),
         }
     }
 
@@ -271,6 +284,21 @@ pub(crate) fn open_files(core: &Core, node: Node) -> SessionId {
         SessionKind::Files,
         None,
         |core, node, input, prompter| async move { files::run(&core, &node, input, &prompter).await },
+    )
+}
+
+/// Starts burrow-agent on an SSH host node. Without `install` it only runs
+/// an agent that is already there. It runs until a client closes it, the
+/// agent stops, or the connection fails.
+pub(crate) fn open_monitor(core: &Core, node: Node, install: bool) -> SessionId {
+    spawn(
+        core,
+        node,
+        SessionKind::Monitor,
+        None,
+        move |core, node, input, prompter| async move {
+            monitor::run(&core, &node, input, &prompter, install).await
+        },
     )
 }
 

@@ -12,7 +12,7 @@ use crate::db;
 use crate::error::{Error, Result};
 use crate::grants::Grants;
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
-use crate::ssh::{self, Autostart, Connections, Input, Sessions, Transfers, files};
+use crate::ssh::{self, Agents, Autostart, Connections, Input, Sessions, Transfers, files};
 use crate::tree::{Entry, Tree};
 
 /// How many events a slow subscriber can fall behind before it starts
@@ -91,6 +91,8 @@ struct Inner {
     connections: Connections,
     transfers: Transfers,
     autostart: Autostart,
+    /// Which hosts burrow-agent may be put on.
+    agents: Agents,
     /// The tunnels starting with Burrow, as last announced.
     autostart_nodes: Mutex<Vec<NodeId>>,
     grants: Grants,
@@ -127,6 +129,7 @@ impl Core {
                 connections: Connections::default(),
                 transfers: Transfers::default(),
                 autostart: Autostart::load(options.state_dir.join("autostart.toml")),
+                agents: Agents::load(options.state_dir.join("agent.toml")),
                 autostart_nodes: Mutex::default(),
                 grants: Grants::load(options.state_dir.join("mcp.toml")),
                 audit_log: options.state_dir.join("mcp-audit.log"),
@@ -230,6 +233,14 @@ impl Core {
                 }
                 let session = ssh::open_files(self, node);
                 return Ok(Response::Session { session });
+            }
+            Command::OpenMonitor { node } => {
+                let session = self.open_monitor(node, true)?;
+                return Ok(Response::Session { session });
+            }
+            Command::MonitorHistory { session } => {
+                let history = sessions.monitor(session)?.history();
+                return Ok(Response::Monitor { history });
             }
             Command::ListDir { session, path } => {
                 let sftp = sessions.sftp(session)?;
@@ -414,6 +425,27 @@ impl Core {
         Ok(Response::Ok)
     }
 
+    /// Starts a monitor on an SSH host node. Without `install` it runs only
+    /// an agent the user already let Burrow put there, which is how the MCP
+    /// bridge opens one.
+    pub(crate) fn open_monitor(&self, node: NodeId, install: bool) -> Result<SessionId> {
+        let node = self.node(node)?;
+        if node.kind != SSH_HOST_KIND {
+            return Err(Error::invalid(
+                "node",
+                format!("{} is a {}, not an SSH host", node.name, node.kind),
+            ));
+        }
+        Ok(ssh::open_monitor(self, node, install))
+    }
+
+    /// For tests: read burrow-agent builds from `local`, and put the agent
+    /// in `remote` on servers instead of `~/.local/share/burrow`.
+    #[doc(hidden)]
+    pub fn set_agent_dirs(&self, local: PathBuf, remote: String) {
+        self.inner.agents.set_dirs(local, remote);
+    }
+
     /// Looks up a node's secret.
     ///
     /// This is deliberately not a [`Command`]: secrets never cross the API
@@ -530,6 +562,10 @@ impl Core {
 
     pub(crate) fn transfers(&self) -> &Transfers {
         &self.inner.transfers
+    }
+
+    pub(crate) fn agents(&self) -> &Agents {
+        &self.inner.agents
     }
 
     pub(crate) fn connections(&self) -> &Connections {
@@ -673,6 +709,7 @@ impl Inner {
                 self.forget_secrets(&removed);
                 let ids: Vec<NodeId> = removed.iter().map(|e| e.node.id).collect();
                 self.autostart.forget(&ids);
+                self.agents.forget(&ids);
                 self.history.forget(&ids);
                 Ok(Response::Ok)
             }
@@ -849,6 +886,8 @@ impl Inner {
             | Command::ListSchema { .. }
             | Command::ExportQuery { .. }
             | Command::OpenView { .. }
+            | Command::OpenMonitor { .. }
+            | Command::MonitorHistory { .. }
             | Command::InvokeAction { .. } => unreachable!("async command on the blocking path"),
         }
     }

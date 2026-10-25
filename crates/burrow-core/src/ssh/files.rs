@@ -71,22 +71,7 @@ pub(super) async fn run(
     let setup = async {
         let connection = core.connections().get(core, node, prompter, &step).await?;
         step("Starting SFTP".into());
-        let channel = connection
-            .handle()
-            .channel_open_session()
-            .await
-            .map_err(text)?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .map_err(text)?;
-        let config = russh_sftp::client::Config {
-            request_timeout_secs: REQUEST_TIMEOUT,
-            ..Default::default()
-        };
-        let sftp = SftpSession::new_with_config(channel.into_stream(), config)
-            .await
-            .map_err(|e| format!("the server did not start SFTP: {e}"))?;
+        let sftp = open_sftp(&connection).await?;
         Ok::<_, String>((connection, sftp))
     };
     let closed = async {
@@ -116,6 +101,26 @@ pub(super) async fn run(
             },
         }
     }
+}
+
+/// Starts SFTP on its own channel of a connection.
+pub(crate) async fn open_sftp(connection: &super::Connection) -> Result<SftpSession> {
+    let channel = connection
+        .handle()
+        .channel_open_session()
+        .await
+        .map_err(text)?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(text)?;
+    let config = russh_sftp::client::Config {
+        request_timeout_secs: REQUEST_TIMEOUT,
+        ..Default::default()
+    };
+    SftpSession::new_with_config(channel.into_stream(), config)
+        .await
+        .map_err(|e| format!("the server did not start SFTP: {e}"))
 }
 
 fn text(error: impl std::fmt::Display) -> String {
@@ -329,7 +334,7 @@ impl Progress {
 
 /// The file being written, removed if the transfer stops part way.
 #[derive(Default)]
-struct Partial(Mutex<Option<Target>>);
+pub(crate) struct Partial(Mutex<Option<Target>>);
 
 enum Target {
     Local(PathBuf),
@@ -642,7 +647,7 @@ async fn upload_file(
 /// `fill` writes and which then takes the file's place. A file it replaces
 /// keeps its mode; a new one gets `source`'s, made safe by [`copy_mode`].
 /// `tag` keeps temporary names apart.
-async fn put(
+pub(crate) async fn put(
     sftp: &SftpSession,
     remote: &str,
     tag: &str,
