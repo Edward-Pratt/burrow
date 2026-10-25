@@ -78,6 +78,12 @@ if [ "$(cat "$lib/commit" 2>/dev/null)" = "$commit" ]; then
   exit 0
 fi
 git -C "$src" checkout --quiet --force --detach "$commit"
+# The steps below come from the commit being installed rather than from the
+# copy running now, so a new step takes effect in the update that adds it.
+# It inherits the lock, and takes it again when it reopens the lock file.
+if [ "${BURROW_INSTALL_FROM:-}" != "$commit" ]; then
+  BURROW_INSTALL_FROM=$commit exec "$src/dist/install.sh" --branch "$branch"
+fi
 
 cd "$src"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
