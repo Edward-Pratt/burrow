@@ -27,7 +27,7 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Addons run as separate processes and m
 
 Burrow needs GTK 4.20 or newer, VTE 4, GtkSourceView 5, OpenSSH and a Secret Service (a keyring daemon such as gnome-keyring, KWallet or KeePassXC). Building it needs Rust 1.93 or newer, best installed with [rustup](https://rustup.rs).
 
-On Arch, the package in `dist/` builds and installs everything, including the server agent, a desktop entry and the systemd units:
+On Arch, the package in `dist/` builds and installs everything: the window, the daemon, the command line, a desktop entry, the systemd units, and the server agent for each musl target you have (`rustup target add x86_64-unknown-linux-musl`, or the `rust-musl` package):
 
 ```sh
 git clone https://github.com/Edward-Pratt/burrow

@@ -383,6 +383,22 @@ fn text(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn builds_are_looked_for_in_order_and_named_when_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let own = Some(dir.path().to_path_buf());
+        let looked = candidates("riscv64", own.clone());
+        assert_eq!(looked[0], dir.path().join("burrow-agent-riscv64"));
+        assert_eq!(looked[1], Path::new(INSTALLED).join("burrow-agent-riscv64"));
+        let error = find_build("riscv64", own.clone()).await.unwrap_err();
+        assert!(
+            error.contains("--target riscv64-unknown-linux-musl"),
+            "{error}"
+        );
+        std::fs::write(&looked[0], b"").unwrap();
+        assert_eq!(find_build("riscv64", own).await.unwrap(), looked[0]);
+    }
+
     #[test]
     fn arch_names_the_builds() {
         assert_eq!(arch("x86_64\n"), Some("x86_64"));

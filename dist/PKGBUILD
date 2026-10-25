@@ -14,13 +14,18 @@ url="https://github.com/Edward-Pratt/burrow"
 license=(GPL-3.0-or-later)
 # gtk4 4.20 or newer: the window follows gtk-interface-color-scheme.
 depends=(gtk4 vte4 gtksourceview5 openssh)
-# The musl targets build burrow-agent, which Burrow uploads to servers.
-makedepends=(git cargo rust-musl rust-aarch64-musl)
+# burrow-agent, which Burrow uploads to servers, is built for each musl
+# target whose standard library is installed: rust-musl and
+# rust-aarch64-musl, or `rustup target add <target>`. Only those are
+# packaged, and `burrow doctor` says which are missing.
+makedepends=(git cargo)
 optdepends=(
   'gnome-keyring: a Secret Service, which Burrow keeps passwords in (or KWallet, or KeePassXC)'
 )
 provides=(burrow)
 conflicts=(burrow)
+# ring's C parts don't link with makepkg's -flto.
+options=(!lto)
 source=("git+$url.git")
 sha256sums=(SKIP)
 
@@ -42,6 +47,7 @@ build() {
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release -p burrow-gtk -p burrowd -p burrow-cli
   for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+    [ -d "$(rustc --print target-libdir --target "$target")" ] || continue
     cargo build --frozen --profile agent -p burrow-agent --target "$target"
   done
 }
@@ -54,10 +60,12 @@ package() {
   install -Dm755 target/release/burrow-gtk target/release/burrowd target/release/burrow \
     -t "$pkgdir/usr/bin"
   # Where the core looks for agent builds (ssh/agent.rs, INSTALLED).
-  install -Dm755 target/x86_64-unknown-linux-musl/agent/burrow-agent \
-    "$pkgdir/usr/lib/burrow/burrow-agent-x86_64"
-  install -Dm755 target/aarch64-unknown-linux-musl/agent/burrow-agent \
-    "$pkgdir/usr/lib/burrow/burrow-agent-aarch64"
+  for arch in x86_64 aarch64; do
+    agent="target/$arch-unknown-linux-musl/agent/burrow-agent"
+    if [ -f "$agent" ]; then
+      install -Dm755 "$agent" "$pkgdir/usr/lib/burrow/burrow-agent-$arch"
+    fi
+  done
   install -Dm644 dist/systemd/burrowd.service dist/systemd/burrowd.socket \
     -t "$pkgdir/usr/lib/systemd/user"
   install -Dm644 dist/dev.burrow.Burrow.desktop -t "$pkgdir/usr/share/applications"

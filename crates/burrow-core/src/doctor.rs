@@ -298,19 +298,4 @@ mod tests {
         assert!(!wanted.ok());
         assert!(!wanted.blocks());
     }
-
-    #[tokio::test]
-    async fn a_missing_agent_build_names_where_it_looked() {
-        // SAFETY: tests in this crate run their own threads, but none read
-        // this variable, and its value only adds a folder to look in.
-        unsafe { std::env::set_var("BURROW_AGENT_DIR", "/nonexistent/agents") };
-        let check = agent_build("riscv64").await;
-        assert!(check.optional);
-        assert!(
-            check
-                .found
-                .contains("/nonexistent/agents/burrow-agent-riscv64")
-        );
-        assert!(check.fix.unwrap().contains("riscv64-unknown-linux-musl"));
-    }
 }
