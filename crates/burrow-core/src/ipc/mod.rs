@@ -62,8 +62,14 @@ pub struct ServerInfo {
     pub addons_dir: PathBuf,
 }
 
-/// This build's version, compared between client and daemon.
-pub const BUILD: &str = env!("CARGO_PKG_VERSION");
+/// This build's version, compared between client and daemon. Builds from
+/// main all share the crate version, so the install script and the package
+/// set `BURROW_BUILD` to one naming the commit, or an update would leave an
+/// old daemon looking current.
+pub const BUILD: &str = match option_env!("BURROW_BUILD") {
+    Some(build) => build,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 pub(crate) fn own_uid() -> u32 {
     // SAFETY: getuid has no preconditions and cannot fail.
