@@ -11,9 +11,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use data_encoding::BASE64;
+use data_encoding::{BASE64, HEXLOWER};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
@@ -43,8 +44,8 @@ const IDLE_CHECK: Duration = Duration::from_secs(5);
 /// Connections so far, which numbers each one.
 static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
-/// The longest string the audit log keeps of a command or an error, so
-/// a few lines can't fill the log and push out what came before.
+/// The longest string the audit log keeps whole, so a few lines can't
+/// fill the log and push out what came before. See [`cut`].
 const AUDIT_FIELD: usize = 4 << 10;
 
 /// Serves clients on `listener`. With `idle`, it returns once no client
@@ -388,9 +389,9 @@ impl Conn {
             // to the node it was opened on.
             Ok(Response::Session { session }) => entry["session"] = json!(session),
             Ok(_) => {}
-            Err(e) => entry["error"] = json!(e.to_string()),
+            Err(e) => entry["error"] = json!(cut_error(&e.to_string())),
         }
-        cap_strings(&mut entry);
+        cap_strings(&mut entry["command"]);
         self.core.audit(&entry);
         result
     }
@@ -471,7 +472,7 @@ fn command_type(command: &Command) -> String {
 
 /// What the audit log keeps of a command, and the `rule` it runs under
 /// when it may run at all. A refused one is kept by type only, since it
-/// may carry a secret; file contents are kept by size.
+/// may carry a secret; file contents are kept by size and hash.
 fn audit_entry(command: &Command, rule: Option<&Rule>, connection: u64) -> Value {
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -482,7 +483,7 @@ fn audit_entry(command: &Command, rule: Option<&Rule>, connection: u64) -> Value
         None => json!({"type": command_type(command)}),
     };
     if let Command::WriteFile { data, .. } = command {
-        logged["data"] = json!(format!("{} bytes", data.len()));
+        logged["data"] = json!({"bytes": data.len(), "sha256": sha256(data)});
     }
     let mut entry = json!({"time": time, "connection": connection, "command": logged});
     if let Some(rule) = rule {
@@ -491,21 +492,57 @@ fn audit_entry(command: &Command, rule: Option<&Rule>, connection: u64) -> Value
     entry
 }
 
-/// Cuts every string in `value` that is longer than [`AUDIT_FIELD`], and
-/// says how long it was.
+/// Replaces every string in a command that is longer than
+/// [`AUDIT_FIELD`] with what [`cut`] keeps of it.
 fn cap_strings(value: &mut Value) {
     match value {
         Value::String(text) if text.len() > AUDIT_FIELD => {
-            let mut end = AUDIT_FIELD;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            *text = format!("{}… ({} bytes)", &text[..end], text.len());
+            let kept = cut(text);
+            *value = kept;
         }
         Value::Array(items) => items.iter_mut().for_each(cap_strings),
         Value::Object(fields) => fields.values_mut().for_each(cap_strings),
         _ => {}
     }
+}
+
+/// What the audit log keeps of a long string in a command: its start and
+/// its end, since a harmless start can hide what a command really does,
+/// and the whole value's length and SHA-256, so what was left out can be
+/// checked against a copy of the command.
+fn cut(text: &str) -> Value {
+    let half = AUDIT_FIELD / 2;
+    let mut head = half;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - half;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    json!({
+        "head": &text[..head],
+        "tail": &text[tail..],
+        "bytes": text.len(),
+        "sha256": sha256(text.as_bytes()),
+    })
+}
+
+/// An error's start, and how long it was. An error says why a command
+/// failed rather than what it did, so its start is enough.
+fn cut_error(text: &str) -> String {
+    if text.len() <= AUDIT_FIELD {
+        return text.to_string();
+    }
+    let mut end = AUDIT_FIELD;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes)", &text[..end], text.len())
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    HEXLOWER.encode(&Sha256::digest(bytes))
 }
 
 /// Passes events on as `event` notifications. A client that falls behind
@@ -584,28 +621,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_audit_line_keeps_only_the_start_of_long_strings() {
+    fn an_audit_line_keeps_the_ends_and_hash_of_long_strings() {
+        let sql = format!("select '{}'", "é".repeat(1 << 20));
         let command = Command::RunQuery {
             session: SessionId(1),
-            sql: format!("select '{}'", "é".repeat(1 << 20)),
+            sql: sql.clone(),
             limit: None,
         };
         let mut entry = audit_entry(&command, Some(&Rule::ReadOnlyQuery), 1);
-        entry["error"] = json!("x".repeat(AUDIT_FIELD + 1));
-        cap_strings(&mut entry);
-        assert!(entry.to_string().len() < 3 * AUDIT_FIELD);
-        let sql = entry["command"]["sql"].as_str().unwrap();
-        assert!(sql.starts_with("select 'éé"));
-        assert!(
-            sql.ends_with(&format!("… ({} bytes)", 9 + (2 << 20))),
-            "{sql}"
-        );
-        assert!(entry["error"].as_str().unwrap().ends_with("… (4097 bytes)"));
+        cap_strings(&mut entry["command"]);
+        assert!(entry.to_string().len() < 2 * AUDIT_FIELD);
+        let kept = &entry["command"]["sql"];
+        assert!(kept["head"].as_str().unwrap().starts_with("select 'éé"));
+        assert!(kept["tail"].as_str().unwrap().ends_with("éé'"));
+        assert_eq!(kept["bytes"], sql.len());
+        assert_eq!(kept["sha256"], HEXLOWER.encode(&Sha256::digest(&sql)));
 
-        // Short ones, and everything else, are left as they were.
+        let error = cut_error(&"x".repeat(AUDIT_FIELD + 1));
+        assert!(error.ends_with("… (4097 bytes)"));
+        assert_eq!(cut_error("short"), "short");
+
+        // Contents are kept by size and hash alone.
+        let command = Command::WriteFile {
+            session: SessionId(1),
+            path: "notes".into(),
+            data: b"abc".to_vec(),
+            overwrite: false,
+        };
+        let entry = audit_entry(&command, Some(&Rule::Run), 1);
+        assert_eq!(
+            entry["command"]["data"],
+            json!({
+                "bytes": 3,
+                "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            })
+        );
+
+        // Short strings, and everything else, are left as they were.
         let mut entry = audit_entry(&Command::ListNodes, Some(&Rule::Run), 2);
         let before = entry.clone();
-        cap_strings(&mut entry);
+        cap_strings(&mut entry["command"]);
         assert_eq!(entry, before);
     }
 }
