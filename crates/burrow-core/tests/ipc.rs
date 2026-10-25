@@ -176,3 +176,97 @@ async fn a_terminal_runs_over_the_socket() {
         SessionState::Closed { .. }
     ));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_client_can_answer_a_prompt() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let socket = serve(core, server.dir.path());
+    let gui = Client::connect(&socket, Role::Gui).await.unwrap();
+    let cli = Client::connect(&socket, Role::Cli).await.unwrap();
+    let mut gui_events = gui.subscribe();
+    let mut cli_events = cli.subscribe();
+
+    let command = Command::OpenTerminal {
+        node: node.id,
+        cols: 80,
+        rows: 24,
+    };
+    let Response::Session { session } = cli.execute(command).await.unwrap() else {
+        panic!("expected a session");
+    };
+    // The window hears the host key question and answers it.
+    let prompt = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::PromptRequested { session: s, prompt } = gui_events.recv().await.unwrap()
+                && s == session
+            {
+                return prompt;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    gui.execute(Command::AnswerPrompt {
+        session,
+        prompt: prompt.id,
+        answer: burrow_core::PromptAnswer::Confirm,
+    })
+    .await
+    .unwrap();
+
+    // The CLI is told the question is gone, then that it connected.
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::PromptClosed {
+                session: s,
+                prompt: p,
+            } = cli_events.recv().await.unwrap()
+                && (s, p) == (session, prompt.id)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("no prompt_closed");
+    assert_eq!(
+        next_state(&mut cli_events, session).await,
+        SessionState::Connected
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clients_sessions_close_when_it_goes() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let socket = serve(core, server.dir.path());
+    let watcher = Client::connect(&socket, Role::Gui).await.unwrap();
+    let mut events = watcher.subscribe();
+
+    let client = Client::connect(&socket, Role::Cli).await.unwrap();
+    let command = Command::OpenTerminal {
+        node: node.id,
+        cols: 80,
+        rows: 24,
+    };
+    let Response::Session { session } = client.execute(command).await.unwrap() else {
+        panic!("expected a session");
+    };
+    assert_eq!(
+        next_state(&mut events, session).await,
+        SessionState::Connected
+    );
+    drop(client);
+    assert!(matches!(
+        next_state(&mut events, session).await,
+        SessionState::Closed { .. }
+    ));
+}

@@ -96,6 +96,9 @@ struct Conn {
     /// The output forwarders, by session. Aborting one drops the core's
     /// stream, which ends the session.
     forwarders: Mutex<HashMap<SessionId, AbortHandle>>,
+    /// Sessions this client opened, closed when it goes. Tunnels are left
+    /// out: they belong to the daemon and outlive the window.
+    owned: Mutex<Vec<SessionId>>,
     /// Never sent on; tasks watch for it being dropped.
     alive: watch::Receiver<()>,
 }
@@ -123,6 +126,7 @@ async fn connection(core: Core, stream: UnixStream, _connected: Connected) {
         control,
         output,
         forwarders: Mutex::default(),
+        owned: Mutex::default(),
         alive,
     });
 
@@ -154,6 +158,11 @@ async fn connection(core: Core, stream: UnixStream, _connected: Connected) {
         forwarder.abort();
     }
     drop(alive_tx);
+    let owned = std::mem::take(&mut *conn.owned.lock().unwrap());
+    for session in owned {
+        // Most have ended already; the rest end now.
+        let _ = conn.core.execute(Command::CloseSession { session }).await;
+    }
 }
 
 #[derive(Deserialize)]
@@ -203,7 +212,19 @@ impl Conn {
             "execute" => {
                 let command: Command = parse(params)?;
                 permit(role, &command).map_err(failed)?;
+                let owns = matches!(
+                    command,
+                    Command::OpenTerminal { .. }
+                        | Command::OpenFiles { .. }
+                        | Command::OpenDatabase { .. }
+                );
                 let response: Response = self.core.execute(command).await.map_err(failed)?;
+                if owns && let Response::Session { session } = response {
+                    let running = self.core.sessions().list();
+                    let mut owned = self.owned.lock().unwrap();
+                    owned.retain(|s| running.iter().any(|r| r.session == *s));
+                    owned.push(session);
+                }
                 Ok(serde_json::to_value(response).unwrap_or_default())
             }
             "take_output" => {

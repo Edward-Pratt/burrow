@@ -5,6 +5,7 @@
 //! it. The UI never edits its node list directly, so it always matches the
 //! core, including after edits made outside Burrow.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -247,6 +248,10 @@ pub struct App {
     restarting: HashSet<NodeId>,
     /// Tunnels that start with Burrow.
     autostart: HashSet<NodeId>,
+    /// Prompt dialogs on screen, by session and prompt id, to close when
+    /// another client answers first. A `RefCell` because prompts are asked
+    /// while a tab's panel is borrowed.
+    prompts: RefCell<HashMap<(SessionId, u32), dialogs::Dismiss>>,
     sidebar_dirty: bool,
 }
 
@@ -317,6 +322,7 @@ impl Component for App {
             tunnel_pages: HashMap::new(),
             restarting: HashSet::new(),
             autostart: HashSet::new(),
+            prompts: RefCell::default(),
             sidebar_dirty: false,
         };
         model.apply_theme();
@@ -379,6 +385,10 @@ impl Component for App {
             AppMsg::Reconnected(client) => {
                 self.core = client;
                 self.error = None;
+                // Their sessions are gone, and no answer could reach them.
+                for (_, dialog) in self.prompts.get_mut().drain() {
+                    dialog.dismiss();
+                }
                 // Sessions ended with the daemon that ran them. Tunnels are
                 // settled by the reload; the rest are only known here.
                 let ended: Vec<(NodeId, SessionId)> = (self.remotes.iter())
@@ -816,6 +826,11 @@ impl App {
             Event::ProblemsChanged { problems } => self.problems = problems,
             // Handled by `session_event`, which needs the window.
             Event::SessionChanged { .. } | Event::PromptRequested { .. } => {}
+            Event::PromptClosed { session, prompt } => {
+                if let Some(dialog) = self.prompts.get_mut().remove(&(session, prompt)) {
+                    dialog.dismiss();
+                }
+            }
             Event::AddonsChanged { addons } => self.set_addons(addons, widgets, sender),
             Event::ViewChanged { node, view } => self.show_view(node, Ok(view), sender),
             Event::AutostartChanged { nodes } => {
@@ -1055,7 +1070,7 @@ impl App {
     ) {
         let (core, sender) = (self.core.clone(), sender.clone());
         let id = prompt.id;
-        dialogs::answer(window, prompt, move |answer| {
+        let dialog = dialogs::answer(window, prompt, move |answer| {
             let command = Command::AnswerPrompt {
                 session,
                 prompt: id,
@@ -1063,6 +1078,7 @@ impl App {
             };
             execute(&core, &sender, command);
         });
+        self.prompts.borrow_mut().insert((session, id), dialog);
     }
 
     fn tunnel_of(&self, session: SessionId) -> Option<NodeId> {

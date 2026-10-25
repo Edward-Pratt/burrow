@@ -869,6 +869,12 @@ pub enum Event {
         session: SessionId,
         prompt: Prompt,
     },
+    /// A prompt stopped waiting: a client answered it, or its session
+    /// ended. Clients still showing it should close it.
+    PromptClosed {
+        session: SessionId,
+        prompt: u32,
+    },
     /// An addon was added, removed, approved, revoked, started or stopped.
     AddonsChanged {
         addons: Vec<AddonInfo>,

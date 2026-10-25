@@ -354,6 +354,28 @@ impl Prompter {
                 message: message.to_string(),
             },
         });
+        // Announced however the wait ends, even if this future is dropped.
+        let _closed = Closed {
+            core: &self.core,
+            session: self.session,
+            prompt: id,
+        };
         rx.await.unwrap_or(PromptAnswer::Cancel)
+    }
+}
+
+/// Emits [`Event::PromptClosed`] when dropped.
+struct Closed<'a> {
+    core: &'a Core,
+    session: SessionId,
+    prompt: u32,
+}
+
+impl Drop for Closed<'_> {
+    fn drop(&mut self) {
+        self.core.emit(Event::PromptClosed {
+            session: self.session,
+            prompt: self.prompt,
+        });
     }
 }

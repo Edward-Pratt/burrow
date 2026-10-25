@@ -39,6 +39,17 @@ type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>;
 pub struct Client {
     shared: Arc<Shared>,
     info: Arc<ServerInfo>,
+    _reader: Arc<Reader>,
+}
+
+/// Stops the reader when the last [`Client`] goes. The reader holds the
+/// shared state and with it the writer's queue, so the socket closes too.
+struct Reader(tokio::task::AbortHandle);
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 struct Shared {
@@ -77,7 +88,7 @@ impl Client {
             closed: AtomicBool::new(false),
         });
         tokio::spawn(write_all(write, outbox_rx));
-        tokio::spawn(read_all(read, shared.clone()));
+        let reader = Reader(tokio::spawn(read_all(read, shared.clone())).abort_handle());
         let hello = Initialize {
             api: API_VERSION,
             role,
@@ -87,6 +98,7 @@ impl Client {
         Ok(Client {
             shared,
             info: Arc::new(info),
+            _reader: Arc::new(reader),
         })
     }
 

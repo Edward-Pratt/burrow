@@ -94,6 +94,7 @@ Every subscriber receives events. They are sent for changes made through command
 | `transfer_changed` | `transfer`, `session`, `state` | A download or upload moved on: `running { done, total }` (at most a few times a second), `finished`, `failed { error }` or `cancelled`. |
 | `autostart_changed` | `nodes` | The tunnels that start with Burrow changed. |
 | `prompt_requested` | `session`, `prompt { id, kind, title, message }` | A session waits for `answer_prompt`. |
+| `prompt_closed` | `session`, `prompt` (the id) | A prompt stopped waiting: a client answered it, or its session ended. A client still showing it should close it. |
 | `addons_changed` | `addons` | An addon was added, removed, changed, approved, revoked, started or stopped. |
 | `view_changed` | `node`, `view` | The addon that owns `node` redrew its view. |
 
@@ -121,7 +122,7 @@ Terminals, tunnels and file sessions on the same host share one SSH connection, 
 | `secret` (`can_save`) | `{"type": "text", "value": "…", "save": false}`, or `cancel` |
 | `text` | `{"type": "text", "value": "…"}`, or `cancel` |
 
-A prompt left unanswered when the session closes counts as cancelled.
+A prompt left unanswered when the session closes counts as cancelled. Any client that may run `answer_prompt` can answer any session's prompt, and the first answer wins. Every prompt ends with `prompt_closed`, so the others can close their dialogs.
 
 ### Output stream
 
@@ -332,6 +333,7 @@ The daemon sends:
 
 - **`initialize` first:** anything else before it is refused. `api` must be the daemon's `API_VERSION`. `build` is the client's version; the daemon's comes back, so a client can tell it is talking to a daemon from before an upgrade.
 - **Roles:** `role` is `gui` (the GTK window), `cli` or `mcp` (the MCP bridge). `gui` and `cli` may run every command. `mcp` is refused everything it has not been granted.
+- **Sessions belong to their client:** terminals, file sessions and database sessions close when the client that opened them disconnects. Tunnels belong to the daemon and keep running.
 - **Output and events:** replies and events are sent before terminal output, so a busy terminal does not hold them up. Terminal output that the client reads slowly slows the session down rather than being dropped.
 
 ## Secrets
