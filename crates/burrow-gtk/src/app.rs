@@ -2042,10 +2042,13 @@ impl App {
         let Some(node) = self.nodes.get(&id) else {
             return;
         };
+        // The core closes the sessions of every node it deletes.
         let detail = if node.is_folder() {
-            "Everything inside it is deleted too, along with any saved passwords."
+            "Everything inside it is deleted too, along with any saved passwords. \
+             Anything running on what it holds, such as a terminal or a tunnel, stops."
         } else {
-            "Its saved passwords are removed from the keyring too."
+            "Its saved passwords are removed from the keyring too. Anything running \
+             on it, such as a terminal or a tunnel, stops."
         };
         let (core, sender) = (self.core.clone(), sender.clone());
         dialogs::confirm(
@@ -2198,6 +2201,15 @@ impl App {
                  Allowing SQL that writes as a superuser also lets Claude run \
                  programs on the database server.",
             );
+        }
+        if node.kind == SSH_HOST_KIND {
+            details.push_str(&format!(
+                "\n\n“{}” amounts to running commands, since it can change \
+                 ~/.ssh/authorized_keys or shell start-up files. Give it as carefully \
+                 as “{}”.",
+                capability_label(Capability::FilesWrite),
+                capability_label(Capability::Exec),
+            ));
         }
         let offered = capabilities(&node.kind);
         let options = offered
@@ -2924,6 +2936,9 @@ fn welcome() -> gtk::Box {
         ("Ctrl+Shift+B", "Toggle sidebar"),
         ("Ctrl+Shift+W", "Close tab"),
         ("F2", "Rename the selected item"),
+        // Not keys, but the two things the window doesn't show by itself.
+        ("+", "Add a host, tunnel or database"),
+        ("Right-click", "Open a host's files or monitor"),
     ] {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let key = gtk::Label::new(Some(keys));
