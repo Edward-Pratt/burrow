@@ -25,6 +25,7 @@ use super::{Input, Prompter, socks};
 use crate::api::{Event, Node, NodeId, SSH_HOST_KIND, SessionState};
 use crate::engine::Core;
 use crate::error::{Error, Result};
+use crate::net::check_host;
 use crate::tree::write_atomic;
 
 /// What a tunnel node's props describe.
@@ -93,7 +94,7 @@ impl Spec {
         let forward = match string("type") {
             Some("local") => {
                 let host = string("target_host").ok_or("target_host is missing")?;
-                check_host(host)?;
+                check_host("target_host", host)?;
                 Forward::Local {
                     host: host.to_string(),
                     port: port("target_port")?,
@@ -121,22 +122,6 @@ impl Spec {
         };
         let text = format!("{}\n{alias}\n{}\n{forward}", self.via, self.listen);
         HEXLOWER.encode(&Sha256::digest(text.as_bytes()))
-    }
-}
-
-/// A destination host name or address: something the SSH server resolves,
-/// so only its shape is checked.
-fn check_host(host: &str) -> std::result::Result<(), String> {
-    let ok = !host.is_empty()
-        && host.len() <= 255
-        && !host.starts_with('-')
-        && host.chars().all(|c| c.is_ascii_graphic() && c != '/');
-    if ok {
-        Ok(())
-    } else {
-        Err(format!(
-            "target_host {host:?} is not a host name or address"
-        ))
     }
 }
 

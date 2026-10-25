@@ -20,8 +20,9 @@ use tokio::sync::watch;
 use super::Prompter;
 use super::config::{self, HostConfig, StrictHostKeyChecking};
 use super::known_hosts::{self, Check};
-use crate::api::{Command, Node, NodeId, PromptAnswer, PromptKind, SecretValue};
+use crate::api::{Node, NodeId, PromptAnswer, PromptKind, SecretValue};
 use crate::engine::Core;
+use crate::password::{Saved, save_password, saved_password};
 
 /// Used when the OpenSSH config sets no `ConnectTimeout`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -656,54 +657,7 @@ async fn load_key(path: &Path, prompter: &Prompter) -> Result<Option<PrivateKey>
     Ok(None)
 }
 
-/// The keyring field recording where the saved password belongs.
-const PASSWORD_TARGET: &str = "password-target";
-
 /// `user@host:port`, where a password is sent.
 fn password_target(config: &HostConfig) -> String {
     format!("{}@{}:{}", config.user, config.hostname, config.port)
-}
-
-enum Saved {
-    None,
-    Matches(SecretValue),
-    /// Saved for another destination, so not sent.
-    ForElsewhere(String),
-}
-
-/// The saved password, if it was saved for `target`.
-///
-/// A node's file can be changed by a `git pull` or a shared folder, and its
-/// alias pointed at another server. The keyring can't be changed that way,
-/// so it records where the password was used, and the password is only sent
-/// there.
-async fn saved_password(core: &Core, node: &Node, target: &str) -> Saved {
-    let get = |field| async move { core.resolve_secret(node.id, field).await.ok().flatten() };
-    let Some(password) = get("password").await else {
-        return Saved::None;
-    };
-    match get(PASSWORD_TARGET).await {
-        Some(saved) if saved.expose() == target => Saved::Matches(password),
-        Some(saved) => Saved::ForElsewhere(saved.expose().to_string()),
-        None => Saved::ForElsewhere("an unknown host".into()),
-    }
-}
-
-/// Best effort: the user is signed in either way. The target is stored
-/// first, so a failure part way never leaves a password without one.
-async fn save_password(core: &Core, node: &Node, password: SecretValue, target: String) {
-    for (field, value) in [
-        (PASSWORD_TARGET, SecretValue::new(target)),
-        ("password", password),
-    ] {
-        let command = Command::SetSecret {
-            id: node.id,
-            field: field.into(),
-            value,
-        };
-        if let Err(e) = core.execute(command).await {
-            tracing::warn!("could not save the password for {}: {e}", node.name);
-            return;
-        }
-    }
 }

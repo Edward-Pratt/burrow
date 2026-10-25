@@ -7,8 +7,11 @@
 
 mod addon;
 mod api;
+mod db;
 mod engine;
 mod error;
+mod net;
+mod password;
 mod secrets;
 mod ssh;
 mod tree;
@@ -16,10 +19,11 @@ mod watch;
 
 pub use api::{
     API_VERSION, AddonAction, AddonCommand, AddonInfo, AddonKind, AddonState, Block, Button,
-    Command, Event, FOLDER_KIND, Field, FileEntry, FileKind, FormField, FormInput, FormValue, Node,
-    NodeId, NodePatch, Problem, Prompt, PromptAnswer, PromptKind, Response, SSH_HOST_KIND,
-    SSH_TUNNEL_KIND, SecretValue, SessionId, SessionInfo, SessionKind, SessionState, TransferId,
-    TransferState, TunnelShown, View,
+    Command, DbColumn, DbSchema, DbTable, DbTableKind, Event, FOLDER_KIND, Field, FileEntry,
+    FileKind, FormField, FormInput, FormValue, HistoryEntry, Node, NodeId, NodePatch,
+    POSTGRES_KIND, Problem, Prompt, PromptAnswer, PromptKind, QueryError, QueryResult, Response,
+    SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionInfo, SessionKind, SessionState,
+    StatementResult, TransferId, TransferState, TunnelShown, View,
 };
 pub use engine::{Core, CoreOptions};
 pub use error::{Error, Result};

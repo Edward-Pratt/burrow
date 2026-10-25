@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::api::{
-    API_VERSION, AddonAction, AddonCommand, AddonKind, FOLDER_KIND, Problem, SSH_HOST_KIND,
-    SSH_TUNNEL_KIND,
+    API_VERSION, AddonAction, AddonCommand, AddonKind, FOLDER_KIND, POSTGRES_KIND, Problem,
+    SSH_HOST_KIND, SSH_TUNNEL_KIND,
 };
 use crate::tree::validate_kind;
 
@@ -27,7 +27,7 @@ pub(crate) const MANIFEST_FILE: &str = "addon.toml";
 const PROTOCOL: &str = "jsonrpc-stdio";
 
 /// Kinds the core handles itself, which no addon may claim.
-const RESERVED_KINDS: [&str; 3] = [FOLDER_KIND, SSH_HOST_KIND, SSH_TUNNEL_KIND];
+const RESERVED_KINDS: [&str; 4] = [FOLDER_KIND, SSH_HOST_KIND, SSH_TUNNEL_KIND, POSTGRES_KIND];
 
 /// What an addon may do through the API. This limits the Burrow API only:
 /// an addon is a normal program running as the user.
@@ -470,6 +470,10 @@ label = "Note"
         assert!(error(&MANIFEST.replace(r#"api = "1""#, r#"api = "2""#)).contains("API 2"));
         assert!(error(&MANIFEST.replace("jsonrpc-stdio", "grpc")).contains("protocol"));
         assert!(error(&MANIFEST.replace("nodes:read", "db")).contains("unknown permission"));
+        assert!(
+            error(&MANIFEST.replace(r#"kind = "note""#, r#"kind = "postgres""#))
+                .contains("belongs to Burrow")
+        );
         assert!(
             error(&MANIFEST.replace(r#"kind = "note""#, r#"kind = "ssh-host""#))
                 .contains("belongs to Burrow")

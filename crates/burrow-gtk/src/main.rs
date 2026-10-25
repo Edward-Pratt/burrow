@@ -3,6 +3,7 @@
 
 mod addons;
 mod app;
+mod database;
 mod dialogs;
 mod files;
 mod palette;

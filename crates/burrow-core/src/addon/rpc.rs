@@ -281,13 +281,14 @@ async fn read(
             Ok(Some(())) => {}
             // The supervisor reports the exit.
             Ok(None) => return shared.close(),
+            // Recorded before requests fail, so a caller that sees its
+            // request fail also sees why.
             Err(error) => {
-                shared.close();
                 if let Some(core) = core.upgrade() {
                     core.addons()
                         .stopped(&core, &manifest.id, generation, error);
                 }
-                return;
+                return shared.close();
             }
         }
         let message: Value = match serde_json::from_slice(&line) {

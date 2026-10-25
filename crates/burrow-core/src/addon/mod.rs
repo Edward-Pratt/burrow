@@ -34,6 +34,8 @@ use crate::engine::Core;
 use crate::error::{Error, Result};
 use crate::tree::write_atomic;
 
+#[cfg(test)]
+pub(crate) use manifest::load as load_manifest;
 pub(crate) use manifest::{Manifest, Permission};
 use rpc::Process;
 
@@ -374,32 +376,34 @@ impl Host {
         if addon.process.as_ref().map(|p| p.generation) != Some(generation) {
             return;
         }
-        let ran = addon.process.take().map(|p| p.started.elapsed());
-        drop(state);
         tracing::warn!(addon = %id, "{error}");
-        self.record_failure_after(id, error, ran);
+        // Under the same lock, so nobody sees the addon neither running nor
+        // failed.
+        let ran = addon.process.take().map(|p| p.started.elapsed());
+        addon.fail(error, ran);
+        drop(state);
         core.emit(Event::AddonsChanged {
             addons: self.infos(),
         });
     }
 
     fn record_failure(&self, id: &str, error: String) {
-        self.record_failure_after(id, error, None);
+        if let Some(addon) = self.state().addons.get_mut(id) {
+            addon.fail(error, None);
+        }
     }
+}
 
+impl Addon {
     /// The delay doubles while the addon keeps stopping within a minute of
     /// starting, and starts over once it ran longer.
-    fn record_failure_after(&self, id: &str, error: String, ran: Option<Duration>) {
-        let mut state = self.state();
-        let Some(addon) = state.addons.get_mut(id) else {
-            return;
-        };
-        let backoff = match (&addon.failure, ran) {
+    fn fail(&mut self, error: String, ran: Option<Duration>) {
+        let backoff = match (&self.failure, ran) {
             (_, Some(ran)) if ran > MAX_BACKOFF => FIRST_BACKOFF,
             (Some(failure), _) => (failure.backoff * 2).min(MAX_BACKOFF),
             (None, _) => FIRST_BACKOFF,
         };
-        addon.failure = Some(Failure {
+        self.failure = Some(Failure {
             error,
             retry_at: Instant::now() + backoff,
             backoff,

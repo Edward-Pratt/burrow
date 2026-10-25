@@ -11,9 +11,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use burrow_core::{
-    AddonInfo, Command, Core, Event, FormValue, Node, NodeId, NodePatch, Problem, Prompt, Response,
-    SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId, SessionInfo, SessionKind, SessionState, TunnelShown,
-    View, Watcher,
+    AddonInfo, Command, Core, Event, FormValue, Node, NodeId, NodePatch, POSTGRES_KIND, Problem,
+    Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId, SessionInfo, SessionKind,
+    SessionState, TunnelShown, View, Watcher,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
@@ -22,6 +22,7 @@ use tokio::sync::broadcast::error::RecvError;
 use vte4::TerminalExt;
 
 use crate::addons;
+use crate::database::{self, Database};
 use crate::dialogs;
 use crate::files::{self, Files};
 use crate::palette::{self, Item};
@@ -46,6 +47,7 @@ pub enum NewKind {
     Folder,
     SshHost,
     SshTunnel,
+    Database,
     /// A kind owned by an addon.
     Addon(String),
 }
@@ -134,6 +136,12 @@ pub enum AppMsg {
     /// Stops the tunnel and starts it again once it has closed.
     RestartTunnel(NodeId),
     EditTunnel(NodeId),
+    /// For the tab of a database node.
+    Database {
+        node: NodeId,
+        msg: database::Msg,
+    },
+    EditDatabase(NodeId),
     SetAutostart {
         node: NodeId,
         enabled: bool,
@@ -215,6 +223,8 @@ pub struct App {
     remotes: HashMap<NodeId, Remote>,
     /// File panels, by SSH host node.
     files: HashMap<NodeId, Files>,
+    /// Database tabs, by node.
+    databases: HashMap<NodeId, Database>,
     /// Tabs drawn by addons: the box their view goes in, by node.
     views: HashMap<NodeId, gtk::Box>,
     unclaimed: Unclaimed,
@@ -266,6 +276,8 @@ impl Component for App {
     fn init(init: Init, window: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         let Init { core, config_dir } = init;
         let settings = UiSettings::load(&config_dir);
+        // Registers the SQL editor's widgets and finds its languages.
+        sourceview5::init();
 
         // Subscribe before listing, so nothing that happens in between is
         // missed.
@@ -302,6 +314,7 @@ impl Component for App {
             next_terminal: 1,
             remotes: HashMap::new(),
             files: HashMap::new(),
+            databases: HashMap::new(),
             views: HashMap::new(),
             unclaimed: Unclaimed::default(),
             looking_up: false,
@@ -535,6 +548,25 @@ impl Component for App {
                 }
             }
             AppMsg::EditTunnel(node) => self.edit_tunnel(Some(node), None, window, &sender),
+            AppMsg::Database {
+                node,
+                msg: database::Msg::Started(session),
+            } => match self.databases.get_mut(&node) {
+                Some(panel) if panel.state == remote::State::Starting => {
+                    panel.state = remote::State::Running(session);
+                    for event in self.unclaimed.claim(session) {
+                        self.session_event(event, window, &sender);
+                    }
+                }
+                // The tab was closed while the session started.
+                _ => execute(&self.core, &sender, Command::CloseSession { session }),
+            },
+            AppMsg::Database { node, msg } => {
+                if let Some(panel) = self.databases.get_mut(&node) {
+                    panel.update(msg, &self.core, window, &sender);
+                }
+            }
+            AppMsg::EditDatabase(node) => self.edit_database(Some(node), None, window, &sender),
             AppMsg::SetAutostart { node, enabled } => {
                 // What the tab shows: it is redrawn on every change.
                 let expect = self
@@ -720,6 +752,7 @@ impl App {
                 if let Some(tab) = self.tabs.get(&TabKey::Node(id)) {
                     set_tab_title(&tab.title, &node.name);
                     if !self.tunnel_pages.contains_key(&id)
+                        && !self.databases.contains_key(&id)
                         && let Some(page) = tab.page.downcast_ref::<gtk::Box>()
                     {
                         fill_page(page, &node, &self.nodes);
@@ -830,6 +863,7 @@ impl App {
             ("folder".to_string(), NewKind::Folder),
             ("SSH host".to_string(), NewKind::SshHost),
             ("SSH tunnel".to_string(), NewKind::SshTunnel),
+            ("PostgreSQL database".to_string(), NewKind::Database),
         ];
         for addon in self.addons.iter().filter(|a| addons::usable(a)) {
             for kind in &addon.kinds {
@@ -937,6 +971,16 @@ impl App {
             return;
         }
         let running = remote::State::Running(session);
+        if let Some(panel) = self.databases.values_mut().find(|p| p.state == running) {
+            match event {
+                Event::SessionChanged { state, .. } => {
+                    panel.session_changed(&state, &self.core, sender)
+                }
+                Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
+                _ => {}
+            }
+            return;
+        }
         if let Some(panel) = self.files.values_mut().find(|p| p.state == running) {
             match event {
                 Event::SessionChanged { state, .. } => {
@@ -1174,6 +1218,48 @@ impl App {
         });
     }
 
+    /// Creates a database in `parent`, or edits the database `id`.
+    fn edit_database(
+        &self,
+        id: Option<NodeId>,
+        parent: Option<NodeId>,
+        window: &gtk::ApplicationWindow,
+        sender: &ComponentSender<Self>,
+    ) {
+        let node = id.and_then(|id| self.nodes.get(&id));
+        if id.is_some() && node.is_none() {
+            return;
+        }
+        let mut hosts: Vec<(NodeId, String)> = self
+            .nodes
+            .values()
+            .filter(|n| n.kind == SSH_HOST_KIND)
+            .map(|n| (n.id, n.name.clone()))
+            .collect();
+        hosts.sort_by_key(|(id, name)| (name.to_lowercase(), *id));
+        let (core, sender) = (self.core.clone(), sender.clone());
+        database::edit(window, node, hosts, move |name, props| {
+            let command = match id {
+                Some(id) => Command::UpdateNode {
+                    id,
+                    patch: NodePatch {
+                        name: Some(name),
+                        props: Some(props),
+                        ..Default::default()
+                    },
+                },
+                None => Command::CreateNode {
+                    parent,
+                    kind: POSTGRES_KIND.into(),
+                    name,
+                    color: None,
+                    props,
+                },
+            };
+            execute(&core, &sender, command);
+        });
+    }
+
     fn activate(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
         let Some(node) = self.nodes.get(&id) else {
             return;
@@ -1237,6 +1323,20 @@ impl App {
             term.grab_focus();
             remote::start(&self.core, id, &term, sender);
             self.remotes.insert(id, Remote::new(term));
+            return;
+        }
+        if node.kind == POSTGRES_KIND {
+            let panel = Database::new(id, sender);
+            self.add_tab(
+                key,
+                panel.page.clone().upcast(),
+                icon,
+                &name,
+                widgets,
+                sender,
+            );
+            database::start(&self.core, id, sender);
+            self.databases.insert(id, panel);
             return;
         }
         if node.kind == SSH_TUNNEL_KIND {
@@ -1358,7 +1458,11 @@ impl App {
         // A session still starting is closed when its id arrives. Closing
         // a file panel's session stops its transfers too.
         let state = match key {
-            TabKey::Node(id) => self.remotes.remove(&id).map(|r| r.state),
+            TabKey::Node(id) => self
+                .remotes
+                .remove(&id)
+                .map(|r| r.state)
+                .or_else(|| self.databases.remove(&id).map(|d| d.state)),
             TabKey::Files(id) => self.files.remove(&id).map(|f| f.state),
             TabKey::Terminal(_) => None,
         };
@@ -1395,6 +1499,7 @@ impl App {
                 "Host alias (as in ~/.ssh/config)",
             ),
             NewKind::SshTunnel => return self.edit_tunnel(None, parent, window, sender),
+            NewKind::Database => return self.edit_database(None, parent, window, sender),
             NewKind::Addon(kind) => {
                 let label = self
                     .addons
@@ -1415,7 +1520,9 @@ impl App {
                     ("ssh-host", props)
                 }
                 NewKind::Addon(kind) => (kind.as_str(), toml::Table::new()),
-                NewKind::SshTunnel => unreachable!("tunnels have their own dialog"),
+                NewKind::SshTunnel | NewKind::Database => {
+                    unreachable!("tunnels and databases have their own dialogs")
+                }
             };
             execute(
                 &core,
@@ -1506,6 +1613,9 @@ impl App {
                         None => ("Start".into(), AppMsg::StartTunnel(node.id)),
                     });
                     entries.push(("Edit…".into(), AppMsg::EditTunnel(node.id)));
+                }
+                if node.kind == POSTGRES_KIND {
+                    entries.push(("Edit…".into(), AppMsg::EditDatabase(node.id)));
                 }
                 for addon in self.addons.iter().filter(|a| addons::usable(a)) {
                     let actions = addon.actions.iter();
