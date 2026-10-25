@@ -50,6 +50,17 @@
   margin: 24px;
 }
 
+/* The editor and grid want the room more than the other tabs do. */
+.database-view {
+  margin: 12px;
+}
+
+/* Set apart from a value that reads "NULL". */
+.result-grid .null {
+  font-style: italic;
+  opacity: 0.5;
+}
+
 .running,
 .running-badge {
   color: #26a269;
