@@ -16,6 +16,7 @@ mod grants;
 pub mod ipc;
 mod net;
 mod password;
+mod pins;
 mod secrets;
 mod ssh;
 mod tree;

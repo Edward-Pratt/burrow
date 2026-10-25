@@ -9,7 +9,6 @@
 //! because a node file must never be able to put a program on a server.
 //! Later uploads, such as a new version, go ahead without asking.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -19,7 +18,6 @@ use data_encoding::HEXLOWER;
 use russh::ChannelMsg;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -27,9 +25,9 @@ use super::files::{self, join};
 use super::{Connection, Prompter};
 use crate::api::{Node, NodeId, PromptAnswer};
 use crate::engine::Core;
-use crate::error::{Error, Result};
-use crate::grants::{self, Lookup};
-use crate::tree::write_atomic;
+use crate::error::Result;
+use crate::grants::Lookup;
+use crate::pins::Pins;
 
 /// Where packages install the agent builds, as `burrow-agent-<arch>`.
 const INSTALLED: &str = "/usr/lib/burrow";
@@ -46,66 +44,34 @@ const MAX_SIZE: u64 = 16 << 20;
 /// Which hosts the user let Burrow put the agent on, and where the agent
 /// builds are.
 pub(crate) struct Agents {
-    path: PathBuf,
-    consents: Mutex<Consents>,
+    consents: Pins,
     /// Set by tests only: the local builds, and the server folder.
     local_dir: Mutex<Option<PathBuf>>,
     remote_dir: Mutex<Option<String>>,
 }
 
-/// The state file: host node id to the fingerprint it was allowed for.
-#[derive(Default, Serialize, Deserialize)]
-struct Consents {
-    #[serde(default)]
-    hosts: BTreeMap<NodeId, String>,
-}
-
 impl Agents {
-    /// Reads the state file. A broken one is logged and treated as empty,
-    /// so Burrow asks again.
+    /// Reads the state file. A broken one is treated as empty, so Burrow
+    /// asks again.
     pub fn load(path: PathBuf) -> Agents {
-        let consents = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|e: toml::de::Error| {
-                tracing::warn!("ignoring {}: {}", path.display(), e.message());
-                Consents::default()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Consents::default(),
-            Err(e) => {
-                tracing::warn!("ignoring {}: {e}", path.display());
-                Consents::default()
-            }
-        };
         Agents {
-            path,
-            consents: Mutex::new(consents),
+            consents: Pins::load(path),
             local_dir: Mutex::default(),
             remote_dir: Mutex::default(),
         }
     }
 
     fn consented(&self, lookup: &impl Lookup, node: &Node) -> bool {
-        let consents = self.consents.lock().unwrap();
-        consents.hosts.get(&node.id) == Some(&grants::fingerprint(lookup, node))
+        self.consents.has(lookup, node)
     }
 
     fn consent(&self, lookup: &impl Lookup, node: &Node) -> Result<()> {
-        let mut consents = self.consents.lock().unwrap();
-        consents
-            .hosts
-            .insert(node.id, grants::fingerprint(lookup, node));
-        save(&self.path, &consents)
+        self.consents.set(lookup, node, true)
     }
 
     /// Drops consents for hosts that no longer exist.
     pub fn forget(&self, nodes: &[NodeId]) {
-        let mut consents = self.consents.lock().unwrap();
-        let before = consents.hosts.len();
-        consents.hosts.retain(|id, _| !nodes.contains(id));
-        if consents.hosts.len() != before
-            && let Err(e) = save(&self.path, &consents)
-        {
-            tracing::warn!("could not update {}: {e}", self.path.display());
-        }
+        self.consents.forget(nodes);
     }
 
     /// For tests: read the agent builds from `local`, and put the agent in
@@ -159,17 +125,6 @@ pub(crate) async fn find_build(
         "this Burrow has no burrow-agent for {arch} servers. Build one with \
          `cargo build -p burrow-agent --profile agent --target {arch}-unknown-linux-musl`"
     ))
-}
-
-fn save(path: &Path, consents: &Consents) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
-    }
-    let text = toml::to_string_pretty(consents).map_err(|e| Error::Encode {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
-    write_atomic(path, &text)
 }
 
 /// Makes sure the current agent is on the server, and returns its path

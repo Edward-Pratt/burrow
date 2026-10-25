@@ -940,7 +940,8 @@ impl App {
             // The grant dialog lists grants when it opens.
             Event::SessionChanged { .. }
             | Event::PromptRequested { .. }
-            | Event::GrantsChanged { .. } => {}
+            | Event::GrantsChanged { .. }
+            | Event::MonitoringChanged { .. } => {}
             Event::PromptClosed { session, prompt } => {
                 if let Some(dialog) = self.prompts.get_mut().remove(&(session, prompt)) {
                     dialog.dismiss();

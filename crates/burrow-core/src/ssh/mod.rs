@@ -72,6 +72,8 @@ struct Entry {
     output: Option<mpsc::Receiver<Vec<u8>>>,
     /// What a connected file or database session serves requests with.
     attached: Option<Attached>,
+    /// A background monitor, which clients may use but not close.
+    background: bool,
 }
 
 /// A connected session's client, which commands on it use.
@@ -94,6 +96,12 @@ impl Sessions {
             .ok_or(Error::SessionNotFound(id))?;
         if entry.kind != SessionKind::Terminal && !matches!(input, Input::Close) {
             return Err(Error::invalid("session", format!("{id} is not a terminal")));
+        }
+        if entry.background {
+            return Err(Error::invalid(
+                "session",
+                format!("{id} monitors its host in the background; turn that off to stop it"),
+            ));
         }
         let sender = entry.input.as_ref().ok_or(Error::SessionNotFound(id))?;
         // A send error means the session is finishing; it reports that
@@ -126,6 +134,7 @@ impl Sessions {
                 node: e.node,
                 kind: e.kind,
                 state: e.state.clone(),
+                background: e.background,
             })
             .collect();
         sessions.sort_by_key(|s| s.session.0);
@@ -138,6 +147,26 @@ impl Sessions {
             .into_iter()
             .find(|s| s.node == node && s.kind == kind)
             .map(|s| s.session)
+    }
+
+    /// The background monitor of `node`, if it has one.
+    pub fn background(&self, node: NodeId) -> Option<SessionId> {
+        self.list()
+            .into_iter()
+            .find(|s| s.node == node && s.background)
+            .map(|s| s.session)
+    }
+
+    /// Stops the background monitors of hosts not in `keep`.
+    pub fn stop_background(&self, keep: &[NodeId]) {
+        for entry in self.map.lock().unwrap().values() {
+            if entry.background
+                && !keep.contains(&entry.node)
+                && let Some(input) = &entry.input
+            {
+                let _ = input.send(Input::Close);
+            }
+        }
     }
 
     /// The client of a connected session of `kind`, and the session's node.
@@ -297,8 +326,25 @@ pub(crate) fn open_monitor(core: &Core, node: Node, install: bool) -> SessionId 
         node,
         SessionKind::Monitor,
         None,
-        move |core, node, input, prompter| async move {
-            monitor::run(&core, &node, input, &prompter, install).await
+        move |core, node, mut input, prompter| async move {
+            let monitor = Arc::default();
+            monitor::run(&core, &node, &mut input, &prompter, install, &monitor).await
+        },
+    )
+}
+
+/// Starts the background monitor of an SSH host node, or returns the one
+/// it already has. It reconnects whenever it stops, until the node's
+/// monitoring is turned off or the node is deleted.
+pub(crate) fn open_background_monitor(core: &Core, node: Node) -> SessionId {
+    spawn_session(
+        core,
+        node,
+        SessionKind::Monitor,
+        None,
+        true,
+        |core, node, input, prompter| async move {
+            monitor::run_background(&core, &node, input, &prompter).await
         },
     )
 }
@@ -316,10 +362,36 @@ where
     F: FnOnce(Core, Node, mpsc::UnboundedReceiver<Input>, Prompter) -> Fut + Send + 'static,
     Fut: Future<Output = std::result::Result<(), String>> + Send,
 {
-    let id = SessionId(core.sessions().next.fetch_add(1, Ordering::Relaxed) + 1);
+    spawn_session(core, node, kind, output, false, body)
+}
+
+/// [`spawn`], for a background session too. A node has at most one: if
+/// it has one already, that is returned and `body` never runs.
+fn spawn_session<F, Fut>(
+    core: &Core,
+    node: Node,
+    kind: SessionKind,
+    output: Option<mpsc::Receiver<Vec<u8>>>,
+    background: bool,
+    body: F,
+) -> SessionId
+where
+    F: FnOnce(Core, Node, mpsc::UnboundedReceiver<Input>, Prompter) -> Fut + Send + 'static,
+    Fut: Future<Output = std::result::Result<(), String>> + Send,
+{
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let prompts = Pending::default();
-    core.sessions().map.lock().unwrap().insert(
+    let mut map = core.sessions().map.lock().unwrap();
+    // Checked under the same lock as the insert, so two starts at once
+    // still make one.
+    let running = map
+        .iter()
+        .find(|(_, e)| e.background && e.node == node.id && e.input.is_some());
+    if background && let Some((&id, _)) = running {
+        return id;
+    }
+    let id = SessionId(core.sessions().next.fetch_add(1, Ordering::Relaxed) + 1);
+    map.insert(
         id,
         Entry {
             node: node.id,
@@ -331,8 +403,10 @@ where
             prompts: prompts.clone(),
             output,
             attached: None,
+            background,
         },
     );
+    drop(map);
     let prompter = Prompter {
         core: core.clone(),
         session: id,

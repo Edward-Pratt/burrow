@@ -7,6 +7,7 @@
 //! within bounds before anything is shown or stored.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,6 +43,11 @@ const _: () = assert!(HISTORY * MAX_SAMPLE + MAX_LINE < crate::ipc::MAX_LINE / 2
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const QUIET_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a background monitor waits before it reconnects: the first
+/// time, and at most, as the wait doubles while it keeps failing.
+const RETRY_FIRST: Duration = Duration::from_secs(30);
+const RETRY_MAX: Duration = Duration::from_secs(300);
+
 /// Limits on what is kept of each sample and unit list.
 const MAX_TEXT: usize = 256;
 const MAX_ITEMS: usize = 256;
@@ -51,6 +57,9 @@ const MAX_UNITS: usize = 4096;
 #[derive(Default)]
 pub(crate) struct Monitor {
     history: Mutex<History>,
+    /// Set when the agent says hello, so a background monitor knows a
+    /// failure came after it had connected.
+    connected: AtomicBool,
 }
 
 #[derive(Default)]
@@ -73,13 +82,14 @@ impl Monitor {
 
 /// Runs the agent until a client closes the session, the agent stops, or
 /// the connection ends. Without `install`, an agent that isn't there yet
-/// is an error rather than an upload.
+/// is an error rather than an upload. What it sees goes into `monitor`.
 pub(super) async fn run(
     core: &Core,
     node: &Node,
-    mut input: mpsc::UnboundedReceiver<Input>,
+    input: &mut mpsc::UnboundedReceiver<Input>,
     prompter: &Prompter,
     install: bool,
+    monitor: &Arc<Monitor>,
 ) -> Result<(), String> {
     let step = |step: String| {
         core.emit(Event::SessionChanged {
@@ -102,19 +112,11 @@ pub(super) async fn run(
         channel.exec(true, command).await.map_err(text)?;
         Ok::<_, String>((connection, channel))
     };
-    let closed = async {
-        while let Some(message) = input.recv().await {
-            if matches!(message, Input::Close) {
-                return;
-            }
-        }
-    };
     let (connection, mut channel) = tokio::select! {
         result = setup => result?,
-        () = closed => return Ok(()),
+        () = closed(input) => return Ok(()),
     };
 
-    let monitor = Arc::new(Monitor::default());
     let mut reader = Reader::default();
     let mut said_hello = false;
     let mut deadline = Instant::now() + HELLO_TIMEOUT;
@@ -134,6 +136,7 @@ pub(super) async fn run(
                                     ));
                                 }
                                 said_hello = true;
+                                monitor.connected.store(true, Ordering::Relaxed);
                                 monitor.history.lock().unwrap().systemd = systemd;
                                 core.sessions()
                                     .attach(prompter.session, Attached::Monitor(monitor.clone()));
@@ -198,6 +201,53 @@ pub(super) async fn run(
                 let _ = channel.close().await;
                 return Ok(());
             },
+        }
+    }
+}
+
+/// Runs a background monitor: [`run`] again after each failure, waiting
+/// longer while it keeps failing, until it is closed. Its history carries
+/// over from one connection to the next.
+///
+/// It may put the agent on the server: the user chose to monitor the host,
+/// and the agent's own consent still decides the first upload. Until a
+/// client answers that, or any other question, the monitor waits.
+pub(super) async fn run_background(
+    core: &Core,
+    node: &Node,
+    mut input: mpsc::UnboundedReceiver<Input>,
+    prompter: &Prompter,
+) -> Result<(), String> {
+    let monitor = Arc::new(Monitor::default());
+    let mut wait = RETRY_FIRST;
+    loop {
+        let error = match run(core, node, &mut input, prompter, true, &monitor).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if monitor.connected.swap(false, Ordering::Relaxed) {
+            wait = RETRY_FIRST;
+        }
+        core.emit(Event::SessionChanged {
+            session: prompter.session,
+            node: node.id,
+            state: SessionState::Connecting {
+                step: format!("Reconnecting in {} s: {error}", wait.as_secs()),
+            },
+        });
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = closed(&mut input) => return Ok(()),
+        }
+        wait = (wait * 2).min(RETRY_MAX);
+    }
+}
+
+/// Returns once a client closes the session.
+async fn closed(input: &mut mpsc::UnboundedReceiver<Input>) {
+    while let Some(message) = input.recv().await {
+        if matches!(message, Input::Close) {
+            return;
         }
     }
 }

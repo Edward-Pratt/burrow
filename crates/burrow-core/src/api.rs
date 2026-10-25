@@ -239,6 +239,11 @@ pub struct SessionInfo {
     pub kind: SessionKind,
     #[serde(flatten)]
     pub state: SessionState,
+    /// A monitor the core runs for [`Command::SetMonitoring`] rather than
+    /// for a client. It reconnects by itself, and only turning monitoring
+    /// off stops it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
 }
 
 /// A question a session needs answered before it can go on, such as
@@ -858,13 +863,27 @@ pub enum Command {
     },
     /// Starts burrow-agent on an SSH host node, putting it there first if
     /// needed, and reports what it sees as [`Event::MonitorSample`] and
-    /// [`Event::MonitorUnits`]. Returns [`Response::Session`].
+    /// [`Event::MonitorUnits`]. Returns [`Response::Session`]: the host's
+    /// background monitor if it has one, otherwise a new session.
     OpenMonitor {
         node: NodeId,
     },
     /// What a monitor session has seen so far, as [`Response::Monitor`].
     MonitorHistory {
         session: SessionId,
+    },
+    /// Returns the SSH hosts monitored in the background, as
+    /// [`Response::Monitoring`].
+    ListMonitoring,
+    /// Monitors an SSH host in the background, from when Burrow starts, or
+    /// stops doing so. Like autostart, the choice is kept on this computer
+    /// and only holds while the host's settings stay as they were, and
+    /// turning it on needs `expect`, the host as the user was shown it.
+    SetMonitoring {
+        node: NodeId,
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<GrantShown>,
     },
     /// Returns the tunnels that start with Burrow, as [`Response::Autostart`].
     ListAutostart,
@@ -994,6 +1013,10 @@ pub enum Response {
     Autostart {
         nodes: Vec<NodeId>,
     },
+    /// SSH hosts monitored in the background.
+    Monitoring {
+        nodes: Vec<NodeId>,
+    },
     /// A remote folder: its absolute `path` and its entries, sorted by name.
     Dir {
         path: String,
@@ -1095,6 +1118,10 @@ pub enum Event {
     },
     /// The tunnels that start with Burrow changed.
     AutostartChanged {
+        nodes: Vec<NodeId>,
+    },
+    /// The SSH hosts monitored in the background changed.
+    MonitoringChanged {
         nodes: Vec<NodeId>,
     },
     /// The session waits for [`Command::AnswerPrompt`].

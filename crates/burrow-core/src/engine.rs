@@ -10,7 +10,8 @@ use crate::api::{
 };
 use crate::db;
 use crate::error::{Error, Result};
-use crate::grants::Grants;
+use crate::grants::{self, Grants};
+use crate::pins::Pins;
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
 use crate::ssh::{self, Agents, Autostart, Connections, Input, Sessions, Transfers, files, hosts};
 use crate::tree::{Entry, Tree};
@@ -95,6 +96,10 @@ struct Inner {
     agents: Agents,
     /// The tunnels starting with Burrow, as last announced.
     autostart_nodes: Mutex<Vec<NodeId>>,
+    /// Which hosts are monitored in the background.
+    monitoring: Pins,
+    /// Those hosts, as last announced.
+    monitoring_nodes: Mutex<Vec<NodeId>>,
     grants: Grants,
     /// Where each command the MCP bridge sends is recorded.
     audit_log: PathBuf,
@@ -134,6 +139,8 @@ impl Core {
                 autostart: Autostart::load(options.state_dir.join("autostart.toml")),
                 agents: Agents::load(options.state_dir.join("agent.toml")),
                 autostart_nodes: Mutex::default(),
+                monitoring: Pins::load(options.state_dir.join("monitoring.toml")),
+                monitoring_nodes: Mutex::default(),
                 grants: Grants::load(options.state_dir.join("mcp.toml")),
                 audit_log: options.state_dir.join("mcp-audit.log"),
                 grants_shown: Mutex::default(),
@@ -143,13 +150,18 @@ impl Core {
             }),
         };
         *core.inner.autostart_nodes.lock().unwrap() = core.inner.autostart_enabled();
+        *core.inner.monitoring_nodes.lock().unwrap() = core.inner.monitoring_enabled();
         *core.inner.grants_shown.lock().unwrap() = core.inner.grants.list(&core.inner.lookup());
         Ok(core)
     }
 
-    /// Starts the tunnels the user chose to start with Burrow. The process
-    /// that hosts the core calls this once, on its runtime.
+    /// Starts the tunnels the user chose to start with Burrow, and the
+    /// hosts' background monitors. The process that hosts the core calls
+    /// this once, on its runtime.
     pub fn autostart(&self) {
+        for node in self.inner.monitoring_enabled() {
+            self.start_monitoring(node);
+        }
         for node in self.inner.autostart_enabled() {
             if let Ok(node) = self.node(node)
                 && self
@@ -241,6 +253,22 @@ impl Core {
             Command::OpenMonitor { node } => {
                 let session = self.open_monitor(node, true)?;
                 return Ok(Response::Session { session });
+            }
+            Command::SetMonitoring {
+                node,
+                enabled,
+                expect,
+            } => {
+                let command = Command::SetMonitoring {
+                    node,
+                    enabled,
+                    expect,
+                };
+                let response = self.blocking(command).await?;
+                if enabled {
+                    self.start_monitoring(node);
+                }
+                return Ok(response);
             }
             Command::MonitorHistory { session } => {
                 let history = sessions.monitor(session)?.history();
@@ -444,15 +472,17 @@ impl Core {
                 };
                 return self.add_ssh_host(parent, host, add_include).await;
             }
-            command => {
-                let inner = self.inner.clone();
-                return tokio::task::spawn_blocking(move || inner.execute(command))
-                    .await
-                    .map_err(|e| Error::Task(e.to_string()))?;
-            }
+            command => return self.blocking(command).await,
         };
         sessions.send(session, input)?;
         Ok(Response::Ok)
+    }
+
+    async fn blocking(&self, command: Command) -> Result<Response> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.execute(command))
+            .await
+            .map_err(|e| Error::Task(e.to_string()))?
     }
 
     /// Starts a monitor on an SSH host node. Without `install` it runs only
@@ -466,7 +496,17 @@ impl Core {
                 format!("{} is a {}, not an SSH host", node.name, node.kind),
             ));
         }
+        if let Some(session) = self.inner.sessions.background(node.id) {
+            return Ok(session);
+        }
         Ok(ssh::open_monitor(self, node, install))
+    }
+
+    /// Starts `node`'s background monitor unless it has one.
+    fn start_monitoring(&self, node: NodeId) {
+        if let Ok(node) = self.node(node) {
+            ssh::open_background_monitor(self, node);
+        }
     }
 
     /// For tests: read burrow-agent builds from `local`, and put the agent
@@ -700,6 +740,24 @@ impl Inner {
         }
     }
 
+    fn monitoring_enabled(&self) -> Vec<NodeId> {
+        self.monitoring.nodes(&self.lookup())
+    }
+
+    /// Announces a change in which hosts are monitored in the background,
+    /// and stops the monitors of hosts that left. One that comes back,
+    /// such as a host file put back as it was, starts with Burrow.
+    fn check_monitoring(&self) {
+        let nodes = self.monitoring_enabled();
+        self.sessions.stop_background(&nodes);
+        let mut current = self.monitoring_nodes.lock().unwrap();
+        if *current != nodes {
+            current.clone_from(&nodes);
+            drop(current);
+            self.emit(Event::MonitoringChanged { nodes });
+        }
+    }
+
     /// Announces a change in what the MCP bridge may do, such as an edit
     /// that made a grant stale. Called with the tree unlocked.
     fn check_grants(&self) {
@@ -720,11 +778,13 @@ impl Inner {
                 | Command::MoveNode { .. }
                 | Command::DeleteNode { .. }
                 | Command::SetAutostart { .. }
+                | Command::SetMonitoring { .. }
                 | Command::SetGrant { .. }
         );
         let response = self.execute_inner(command);
         if changes_tree {
             self.check_autostart();
+            self.check_monitoring();
             self.check_grants();
         }
         response
@@ -777,6 +837,7 @@ impl Inner {
                 let ids: Vec<NodeId> = removed.iter().map(|e| e.node.id).collect();
                 self.autostart.forget(&ids);
                 self.agents.forget(&ids);
+                self.monitoring.forget(&ids);
                 self.history.forget(&ids);
                 Ok(Response::Ok)
             }
@@ -882,6 +943,48 @@ impl Inner {
                 }
                 let lookup = |id| snapshot.iter().find(|n| n.id == id).cloned();
                 self.autostart.set(&lookup, node, enabled)?;
+                Ok(Response::Ok)
+            }
+            Command::ListMonitoring => Ok(Response::Monitoring {
+                nodes: self.monitoring_nodes.lock().unwrap().clone(),
+            }),
+            Command::SetMonitoring {
+                node,
+                enabled,
+                expect,
+            } => {
+                // Read under one lock, as for grants, so the choice covers
+                // a host and a `via` that existed together.
+                let snapshot: Vec<Node> = {
+                    let tree = self.tree();
+                    let node = tree.get(node)?.node.clone();
+                    let via = node.props.get("via").and_then(|v| v.as_str());
+                    let via = via
+                        .and_then(|via| via.parse().ok())
+                        .and_then(|id| tree.get(NodeId(id)).ok())
+                        .map(|e| e.node.clone());
+                    std::iter::once(node).chain(via).collect()
+                };
+                let node = &snapshot[0];
+                if node.kind != SSH_HOST_KIND {
+                    return Err(Error::invalid(
+                        "node",
+                        format!("{} is a {}, not an SSH host", node.name, node.kind),
+                    ));
+                }
+                let lookup = |id| snapshot.iter().find(|n| n.id == id).cloned();
+                if enabled {
+                    let expect = expect.ok_or_else(|| {
+                        Error::invalid("expect", "turning it on needs the host the user was shown")
+                    })?;
+                    if !grants::matches(&lookup, node, &expect) {
+                        return Err(Error::invalid(
+                            "expect",
+                            format!("{} changed after it was shown; show it again", node.name),
+                        ));
+                    }
+                }
+                self.monitoring.set(&lookup, node, enabled)?;
                 Ok(Response::Ok)
             }
             Command::ListGrants => Ok(Response::Grants {
@@ -1055,6 +1158,7 @@ impl Inner {
             self.emit(event);
         }
         self.check_autostart();
+        self.check_monitoring();
         self.check_grants();
         if self.addons.rescan() {
             self.emit(Event::AddonsChanged {
