@@ -168,16 +168,22 @@ impl Spec {
     }
 
     /// Where a password goes: everything that decides who could read it.
-    /// `host` is the SSH host it goes through.
+    /// `host` is the SSH host it goes through. Each part is quoted, so no
+    /// user or database name can make one target read as another.
     fn password_target(&self, host: Option<&Node>) -> String {
-        let mut target = format!("{}@{}/{}", self.user, self.route.target, self.database);
+        let mut target = format!(
+            "{:?}@{:?}/{:?}",
+            self.user,
+            self.route.target.to_string(),
+            self.database
+        );
         if let Some(host) = host {
             let alias = crate::ssh::alias(host);
-            target += &format!(" through {alias} ({})", host.id);
+            target += &format!(" through {alias:?} ({})", host.id);
         }
-        target += &format!(", sslmode={}", self.sslmode);
+        target += &format!(", sslmode={:?}", self.sslmode);
         if let Some(path) = self.tls.as_ref().and_then(|t| t.root_cert.as_ref()) {
-            target += &format!(", sslrootcert={}", path.display());
+            target += &format!(", sslrootcert={:?}", path.display().to_string());
         }
         target
     }
@@ -740,7 +746,10 @@ mod tests {
         let spec = spec(&format!("{via}\nhost = \"localhost\"")).unwrap();
         assert!(spec.route.via.is_some());
         assert_eq!(spec.tls, None);
-        let spec = self::spec(&format!("{via}\nhost = \"db\"\nsslmode = \"verify-ca\"")).unwrap();
+        let spec = self::spec(&format!(
+            "{via}\nhost = \"db\"\nsslmode = \"verify-ca\"\nsslrootcert = \"/ca.pem\""
+        ))
+        .unwrap();
         assert_eq!(spec.tls.unwrap().verify, Verify::Ca);
     }
 
@@ -781,16 +790,30 @@ mod tests {
         let direct = spec("host = \"db\"\nuser = \"app\"").unwrap();
         assert_eq!(
             direct.password_target(None),
-            "app@db:5432/app, sslmode=verify-full"
+            r#""app"@"db:5432"/"app", sslmode="verify-full""#
         );
         let plain = spec("host = \"db\"\nuser = \"app\"\nsslmode = \"disable\"").unwrap();
         assert_ne!(plain.password_target(None), direct.password_target(None));
         let host = node("ssh-host", "alias = \"prod-web\"");
         let through = plain.password_target(Some(&host));
         assert!(
-            through.contains(&format!("through prod-web ({})", host.id)),
+            through.contains(&format!("through \"prod-web\" ({})", host.id)),
             "{through}"
         );
+    }
+
+    #[test]
+    fn a_name_cant_make_one_password_target_read_as_another() {
+        // Unquoted, both would read
+        // `app@db:5432/app, sslmode=verify-full, sslrootcert=/a, sslmode=require`.
+        let honest =
+            spec("host = \"db\"\nuser = \"app\"\nsslrootcert = \"/a, sslmode=require\"").unwrap();
+        let forged = spec(
+            "host = \"db\"\nuser = \"app\"\nsslmode = \"require\"\n\
+             database = \"app, sslmode=verify-full, sslrootcert=/a\"",
+        )
+        .unwrap();
+        assert_ne!(honest.password_target(None), forged.password_target(None));
     }
 
     #[test]

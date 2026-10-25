@@ -34,7 +34,17 @@ fn provider() -> Arc<CryptoProvider> {
 /// A client config for `verify`. Certificates are checked against
 /// `root_cert` (a PEM file) when it is given, and against the system's
 /// trusted CAs otherwise.
+///
+/// `verify-ca` needs `root_cert`: checked against the system's CAs, any
+/// public site's certificate would pass, since the name isn't checked.
 pub(crate) fn client_config(verify: Verify, root_cert: Option<&Path>) -> Result<Arc<ClientConfig>> {
+    if verify == Verify::Ca && root_cert.is_none() {
+        return Err(
+            "verify-ca needs sslrootcert, the CA to trust: with the system's CAs, \
+                    any site's certificate would pass"
+                .into(),
+        );
+    }
     let provider = provider();
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -267,6 +277,12 @@ pub(crate) mod tests {
             ..certs
         };
         assert!(handshake(&stranger, Verify::Nothing, "other.test"));
+    }
+
+    #[test]
+    fn verify_ca_needs_a_root_cert_of_its_own() {
+        let error = client_config(Verify::Ca, None).unwrap_err();
+        assert!(error.contains("needs sslrootcert"), "{error}");
     }
 
     #[test]

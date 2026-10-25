@@ -263,7 +263,7 @@ async fn signs_in_over_tcp_and_saves_the_password_for_that_target_only() {
     let prompt = expect_prompt(&mut events, session).await;
     assert_eq!(prompt.kind, PromptKind::Secret { can_save: true });
     assert!(
-        prompt.message.contains("sslmode=disable"),
+        prompt.message.contains(r#"sslmode="disable""#),
         "{}",
         prompt.message
     );
