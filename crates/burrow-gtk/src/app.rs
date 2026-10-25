@@ -2728,13 +2728,17 @@ fn menu_popover(
         if let Some(child) = button.child().and_downcast::<gtk::Label>() {
             child.set_xalign(0.0);
         }
-        button.connect_clicked({
-            let (popover, sender) = (popover.clone(), sender.clone());
+        // Weak: the button is inside the popover.
+        button.connect_clicked(glib::clone!(
+            #[weak]
+            popover,
+            #[strong]
+            sender,
             move |_| {
                 popover.popdown();
                 sender.input(message.clone());
             }
-        });
+        ));
         column.append(&button);
     }
     popover.set_child(Some(&column));

@@ -816,8 +816,12 @@ impl Database {
                 line.append(&when);
                 list.append(&line);
             }
-            list.connect_row_activated({
-                let (sender, popover) = (sender.clone(), popover.clone());
+            // Weak: the list is inside the popover.
+            list.connect_row_activated(glib::clone!(
+                #[weak]
+                popover,
+                #[strong]
+                sender,
                 move |_, row| {
                     if let Some(entry) = newest_first.get(row.index() as usize) {
                         let msg = Msg::UseQuery(entry.sql.clone());
@@ -825,7 +829,7 @@ impl Database {
                     }
                     popover.popdown();
                 }
-            });
+            ));
             let scroller = gtk::ScrolledWindow::builder()
                 .child(&list)
                 .hscrollbar_policy(gtk::PolicyType::Never)
@@ -836,8 +840,11 @@ impl Database {
             content.append(&scroller);
             let clear = gtk::Button::with_label("Clear history");
             clear.set_halign(gtk::Align::End);
-            clear.connect_clicked({
-                let (sender, popover) = (sender.clone(), popover.clone());
+            clear.connect_clicked(glib::clone!(
+                #[weak]
+                popover,
+                #[strong]
+                sender,
                 move |_| {
                     sender.input(AppMsg::Database {
                         node,
@@ -845,7 +852,7 @@ impl Database {
                     });
                     popover.popdown();
                 }
-            });
+            ));
             content.append(&clear);
         }
         popover.set_child(Some(&content));
@@ -1421,8 +1428,10 @@ pub fn edit(
     content.append(&buttons);
     window.set_child(Some(&content));
 
+    // The window is held weakly by everything inside it, or it would keep
+    // itself alive after closing.
     let submit = Rc::new({
-        let (window, name, error) = (window.clone(), name.clone(), error.clone());
+        let (window, name, error) = (window.downgrade(), name.clone(), error.clone());
         let (host, socket, user, database, root, port) = (
             host.clone(),
             socket.clone(),
@@ -1432,6 +1441,9 @@ pub fn edit(
             port.clone(),
         );
         move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
             let fail = |message: &str| {
                 error.set_label(message);
                 error.set_visible(true);
@@ -1498,10 +1510,7 @@ pub fn edit(
         entry.connect_activate(move |_| submit());
     }
     port.connect_activate(move |_| submit());
-    cancel.connect_clicked({
-        let window = window.clone();
-        move |_| window.close()
-    });
+    dialogs::close_on_cancel(&window, &cancel);
     dialogs::close_on_escape(&window);
 
     window.present();

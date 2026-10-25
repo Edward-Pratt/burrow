@@ -204,8 +204,13 @@ pub fn new_host(parent_window: &impl IsA<gtk::Window>, core: Client, parent: Opt
     show_mode(&write);
     write.connect_toggled(show_mode);
 
-    choose.connect_clicked({
-        let (window, key) = (window.clone(), key.clone());
+    // The window is held weakly by everything inside it, or it would keep
+    // itself alive after closing.
+    choose.connect_clicked(glib::clone!(
+        #[weak]
+        window,
+        #[strong]
+        key,
         move |_| {
             let dialog = gtk::FileDialog::builder()
                 .title("Choose a private key")
@@ -223,10 +228,10 @@ pub fn new_host(parent_window: &impl IsA<gtk::Window>, core: Client, parent: Opt
                 }
             });
         }
-    });
+    ));
 
     let submit = Rc::new({
-        let window = window.clone();
+        let window = window.downgrade();
         let (write, alias, hostname, user, port, key) = (
             write.clone(),
             alias.clone(),
@@ -237,6 +242,9 @@ pub fn new_host(parent_window: &impl IsA<gtk::Window>, core: Client, parent: Opt
         );
         let (ok, error) = (ok.clone(), error.clone());
         move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
             if !ok.is_sensitive() {
                 return;
             }
@@ -259,8 +267,7 @@ pub fn new_host(parent_window: &impl IsA<gtk::Window>, core: Client, parent: Opt
             };
             error.set_visible(false);
             ok.set_sensitive(false);
-            let (window, core, ok, error) =
-                (window.clone(), core.clone(), ok.clone(), error.clone());
+            let (core, ok, error) = (core.clone(), ok.clone(), error.clone());
             glib::spawn_future_local(async move {
                 match create(&window, &core, parent, request).await {
                     Ok(()) => window.close(),
@@ -281,10 +288,7 @@ pub fn new_host(parent_window: &impl IsA<gtk::Window>, core: Client, parent: Opt
         let submit = submit.clone();
         entry.connect_activate(move |_| submit());
     }
-    cancel.connect_clicked({
-        let window = window.clone();
-        move |_| window.close()
-    });
+    dialogs::close_on_cancel(&window, &cancel);
     dialogs::close_on_escape(&window);
 
     window.present();

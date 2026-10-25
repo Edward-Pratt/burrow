@@ -60,9 +60,13 @@ pub fn prompt(
         move |entry| ok.set_sensitive(!entry.text().trim().is_empty())
     ));
 
-    let submit = std::rc::Rc::new({
-        let window = window.clone();
-        let entry = entry.clone();
+    // The window is held weakly by everything inside it, or it would keep
+    // itself alive after closing.
+    let submit = Rc::new(glib::clone!(
+        #[weak]
+        window,
+        #[strong]
+        entry,
         move || {
             let text = entry.text().trim().to_string();
             if !text.is_empty() {
@@ -70,16 +74,13 @@ pub fn prompt(
                 done(text);
             }
         }
-    });
+    ));
     ok.connect_clicked({
         let submit = submit.clone();
         move |_| submit()
     });
     entry.connect_activate(move |_| submit());
-    cancel.connect_clicked({
-        let window = window.clone();
-        move |_| window.close()
-    });
+    close_on_cancel(&window, &cancel);
     close_on_escape(&window);
 
     window.present();
@@ -112,8 +113,12 @@ pub fn confirm(
 
 pub fn close_on_escape(window: &gtk::Window) {
     let keys = gtk::EventControllerKey::new();
-    keys.connect_key_pressed({
-        let window = window.clone();
+    // Weak: the controller belongs to the window.
+    keys.connect_key_pressed(glib::clone!(
+        #[weak]
+        window,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
         move |_, key, _, _| {
             if key == gtk::gdk::Key::Escape {
                 window.close();
@@ -122,8 +127,17 @@ pub fn close_on_escape(window: &gtk::Window) {
                 glib::Propagation::Proceed
             }
         }
-    });
+    ));
     window.add_controller(keys);
+}
+
+/// Closes `window` when `cancel`, a button inside it, is clicked.
+pub fn close_on_cancel(window: &gtk::Window, cancel: &gtk::Button) {
+    cancel.connect_clicked(glib::clone!(
+        #[weak]
+        window,
+        move |_| window.close()
+    ));
 }
 
 type Answer = Rc<RefCell<Option<Box<dyn FnOnce(PromptAnswer)>>>>;
@@ -229,8 +243,13 @@ pub fn answer(
     content.append(&buttons);
     window.set_child(Some(&content));
 
-    let submit = Rc::new({
-        let (window, entry, finish) = (window.clone(), entry.clone(), finish.clone());
+    let submit = Rc::new(glib::clone!(
+        #[weak]
+        window,
+        #[strong]
+        entry,
+        #[strong]
+        finish,
         move || {
             let text = entry
                 .downcast_ref::<gtk::Editable>()
@@ -242,7 +261,7 @@ pub fn answer(
             });
             window.close();
         }
-    });
+    ));
     ok.connect_clicked({
         let submit = submit.clone();
         move |_| submit()
@@ -255,10 +274,7 @@ pub fn answer(
         let submit = submit.clone();
         entry.connect_activate(move |_| submit());
     }
-    cancel.connect_clicked({
-        let window = window.clone();
-        move |_| window.close()
-    });
+    close_on_cancel(&window, &cancel);
     window.connect_close_request(move |_| {
         finish(PromptAnswer::Cancel);
         glib::Propagation::Proceed
@@ -328,19 +344,17 @@ pub fn choose(
     window.set_child(Some(&content));
 
     let done = RefCell::new(Some(done));
-    save.connect_clicked({
-        let window = window.clone();
+    save.connect_clicked(glib::clone!(
+        #[weak]
+        window,
         move |_| {
             if let Some(done) = done.borrow_mut().take() {
                 done(checks.iter().map(|c| c.is_active()).collect());
             }
             window.close();
         }
-    });
-    cancel.connect_clicked({
-        let window = window.clone();
-        move |_| window.close()
-    });
+    ));
+    close_on_cancel(&window, &cancel);
     close_on_escape(&window);
     window.present();
 }

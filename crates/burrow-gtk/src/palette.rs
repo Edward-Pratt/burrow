@@ -88,8 +88,10 @@ pub fn show<M: Clone + 'static>(
         move |entry| refilter(&entry.text())
     });
 
-    let choose = Rc::new({
-        let (window, items, shown, run) = (window.clone(), items, shown, run);
+    // Weak: the list and the search box are inside the window.
+    let choose = Rc::new(glib::clone!(
+        #[weak]
+        window,
         move |row: Option<&gtk::ListBoxRow>| {
             let Some(row) = row else { return };
             let Some(&index) = shown.borrow().get(row.index() as usize) else {
@@ -98,7 +100,7 @@ pub fn show<M: Clone + 'static>(
             window.close();
             run(items[index].message.clone());
         }
-    });
+    ));
     list.connect_row_activated({
         let choose = choose.clone();
         move |_, row| choose(Some(row))

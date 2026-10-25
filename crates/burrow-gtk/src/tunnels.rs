@@ -406,14 +406,19 @@ pub fn edit(
         ok.set_sensitive(false);
     }
 
+    // The window is held weakly by everything inside it, or it would keep
+    // itself alive after closing.
     let submit = Rc::new({
-        let (window, name, error) = (window.clone(), name.clone(), error.clone());
+        let (window, name, error) = (window.downgrade(), name.clone(), error.clone());
         let (target_entry, port_entry, target_port_entry) = (
             target_entry.clone(),
             port_entry.clone(),
             target_port_entry.clone(),
         );
         move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
             let fail = |message: &str| {
                 error.set_label(message);
                 error.set_visible(true);
@@ -458,10 +463,7 @@ pub fn edit(
         let submit = submit.clone();
         entry.connect_activate(move |_| submit());
     }
-    cancel.connect_clicked({
-        let window = window.clone();
-        move |_| window.close()
-    });
+    dialogs::close_on_cancel(&window, &cancel);
     dialogs::close_on_escape(&window);
 
     window.present();
