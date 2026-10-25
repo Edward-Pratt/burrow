@@ -46,6 +46,9 @@ start)
         [ -f "$S/client_key" ] || ssh-keygen -q -t ed25519 -N '' -f "$S/client_key"
         cp "$S/client_key.pub" "$S/authorized_keys"
         chmod 600 "$S/authorized_keys"
+        # SFTP starts here rather than in your home, so the file panel and
+        # monitor installs (~/.local/share/burrow) stay inside the rig.
+        mkdir -p "$DIR/home"
         cat >"$S/sshd_config" <<EOF
 Port 2222
 ListenAddress 127.0.0.1
@@ -56,7 +59,7 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 UsePAM no
 StrictModes no
-Subsystem sftp /usr/lib/ssh/sftp-server
+Subsystem sftp /usr/lib/ssh/sftp-server -d $DIR/home
 EOF
         cat >"$S/ssh_config" <<EOF
 Host testbox
@@ -71,7 +74,7 @@ EOF
         /usr/bin/sshd -f "$S/sshd_config" -E "$S/sshd.log"
         sleep 1
         ssh -F "$S/ssh_config" -o StrictHostKeyChecking=accept-new testbox true
-        echo "sshd up: alias testbox (it logs in as you, so its home is your real home)"
+        echo "sshd up: alias testbox (it logs in as you; SFTP starts in $DIR/home, shells in your real home)"
     fi
     ;;
 app)

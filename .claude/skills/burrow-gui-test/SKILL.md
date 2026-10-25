@@ -34,7 +34,7 @@ $R/rig.sh stop                # always, at the end
 
 - **Never send input to the real display.** AT-SPI's `generate_keyboard_event` types into whatever window the user has focused. Use `x.py`, which only talks to `:99`.
 - **Never `pkill -f` a pattern** like `burrow-gtk` or `Xvfb :99`: it can match the shell running the command and kill it (exit 143/144). `rig.sh` tracks processes by pid file, and `pgrep -x` is safe.
-- **The test sshd logs in as the user,** so the file panel opens their real home folder. Only write inside `$BURROW_TEST_DIR`, by typing that path into the path bar first.
+- **The test sshd logs in as the user.** SFTP starts in `$BURROW_TEST_DIR/home`, so the file panel opens there and a monitor installs burrow-agent under it. Terminals and `exec` still start in the real home folder. Only write inside `$BURROW_TEST_DIR`.
 - **A real server needs the user's go-ahead** each time. Agree a scratch folder on it, delete the folder afterwards, and run `rig.sh app --real-ssh`, which uses `~/.ssh/config` and the agent at `/run/user/$UID/ssh-agent.socket`. Burrow can't answer passphrase or host-key prompts for you: the key must already be in the agent, and the host already in `known_hosts`.
 - **Check results outside the UI when you can:** probe a tunnel's local port with Python sockets, compare `sha256sum` on both ends of a transfer, and read `$BURROW_TEST_DIR/state/autostart.toml`.
 - **Clean up:** `rig.sh stop`, delete files you made on any server, and confirm with `ss -ltn` that no test ports are left listening.
