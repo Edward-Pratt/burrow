@@ -45,7 +45,7 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `list_sessions` | | `sessions { sessions }` |
 | `start_tunnel` | `node` | `session { session }` |
 | `list_autostart` | | `autostart { nodes }` |
-| `set_autostart` | `node`, `enabled` | `ok` |
+| `set_autostart` | `node`, `enabled`, `expect?` | `ok` |
 | `open_files` | `node` | `session { session }` |
 | `list_dir` | `session`, `path?` (empty = home) | `dir { path, entries }` |
 | `make_dir` | `session`, `path` | `ok` |
@@ -136,7 +136,7 @@ target_port = 5432           # "local" only
 - **`start_tunnel`** runs it as a session, so it reports progress and asks its questions like a terminal does. If the tunnel is already running it returns that session. `close_session` stops it.
 - **Checked before binding:** node files can come from a shared folder, so the props are checked before anything listens. A tunnel only listens on a loopback address. The port is bound before signing in, so a port in use fails at once.
 - **Edits apply on restart:** a running tunnel keeps the settings it started with.
-- **Starting with Burrow** is a choice made on this computer with `set_autostart`. It is kept in `$XDG_STATE_HOME/burrow/autostart.toml`, not in the tunnel's file, so a shared folder can't turn it on. The choice is pinned to the tunnel's settings and its host's alias, and a change to either (by hand or by a `git pull`) withdraws it. The process that hosts the core calls `Core::autostart()` once.
+- **Starting with Burrow** is a choice made on this computer with `set_autostart`. It is kept in `$XDG_STATE_HOME/burrow/autostart.toml`, not in the tunnel's file, so a shared folder can't turn it on. The choice is pinned to the tunnel's settings and its host's alias, and a change to either (by hand or by a `git pull`) withdraws it. A client should pass the props it showed the user as `expect`: if the file changed meanwhile, enabling fails instead of approving settings nobody saw. The process that hosts the core calls `Core::autostart()` once.
 
 ## Files (SFTP)
 

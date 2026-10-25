@@ -548,15 +548,41 @@ impl Inner {
             Command::ListAutostart => Ok(Response::Autostart {
                 nodes: self.autostart_nodes.lock().unwrap().clone(),
             }),
-            Command::SetAutostart { node, enabled } => {
-                let node = self.tree().get(node)?.node.clone();
+            Command::SetAutostart {
+                node,
+                enabled,
+                expect,
+            } => {
+                // The tunnel and its host are read under one lock, so the
+                // consent covers settings that existed together. Holding
+                // the lock while saving would invert the autostart lock's
+                // order, so the consent is pinned to this snapshot instead:
+                // a change after it withdraws the consent as usual.
+                let snapshot: Vec<Node> = {
+                    let tree = self.tree();
+                    let node = tree.get(node)?.node.clone();
+                    let via = node.props.get("via").and_then(|v| v.as_str());
+                    let host = via
+                        .and_then(|via| via.parse().ok())
+                        .and_then(|id| tree.get(NodeId(id)).ok())
+                        .map(|e| e.node.clone());
+                    std::iter::once(node).chain(host).collect()
+                };
+                let node = &snapshot[0];
                 if node.kind != SSH_TUNNEL_KIND {
                     return Err(Error::invalid(
                         "node",
                         format!("{} is a {}, not an SSH tunnel", node.name, node.kind),
                     ));
                 }
-                self.autostart.set(&self.lookup(), &node, enabled)?;
+                if enabled && expect.as_ref().is_some_and(|props| *props != node.props) {
+                    return Err(Error::invalid(
+                        "tunnel",
+                        "its settings changed since they were shown; look again",
+                    ));
+                }
+                let lookup = |id| snapshot.iter().find(|n| n.id == id).cloned();
+                self.autostart.set(&lookup, node, enabled)?;
                 Ok(Response::Ok)
             }
             Command::ListProblems => Ok(Response::Problems {

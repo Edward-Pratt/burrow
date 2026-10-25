@@ -536,9 +536,15 @@ impl Component for App {
             }
             AppMsg::EditTunnel(node) => self.edit_tunnel(Some(node), None, window, &sender),
             AppMsg::SetAutostart { node, enabled } => {
+                // The props the tab shows: it is redrawn on every change.
+                let expect = self.nodes.get(&node).map(|n| n.props.clone());
                 let (core, input) = (self.core.clone(), sender.input_sender().clone());
                 runtime().spawn(async move {
-                    let command = Command::SetAutostart { node, enabled };
+                    let command = Command::SetAutostart {
+                        node,
+                        enabled,
+                        expect,
+                    };
                     if let Err(e) = core.execute(command).await {
                         let error = e.to_string();
                         let _ = input.send(AppMsg::AutostartFailed { node, error });
@@ -1118,6 +1124,7 @@ impl App {
         let autostart = id.is_some_and(|id| self.autostart.contains(&id));
         let (core, input) = (self.core.clone(), sender.input_sender().clone());
         tunnels::edit(window, node, hosts, move |name, props| {
+            let saved = props.clone();
             let command = match id {
                 Some(id) => Command::UpdateNode {
                     id,
@@ -1138,10 +1145,13 @@ impl App {
             let (core, input) = (core.clone(), input.clone());
             runtime().spawn(async move {
                 let result = match core.execute(command).await {
+                    // Only the settings saved here: a file that changed
+                    // meanwhile makes this fail rather than be approved.
                     Ok(Response::Node { node }) if autostart => {
                         let command = Command::SetAutostart {
                             node: node.id,
                             enabled: true,
+                            expect: Some(saved),
                         };
                         core.execute(command).await
                     }

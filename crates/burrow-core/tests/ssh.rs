@@ -873,7 +873,24 @@ async fn autostart_is_kept_locally_and_pinned_to_the_settings() {
     let enable = Command::SetAutostart {
         node: node.id,
         enabled: true,
+        expect: None,
     };
+    // Settings other than those the user was shown are refused.
+    let mut stale = node.props.clone();
+    stale.insert("port".into(), 1.into());
+    let refused = Command::SetAutostart {
+        node: node.id,
+        enabled: true,
+        expect: Some(stale),
+    };
+    assert!(core.execute(refused).await.is_err());
+    assert!(autostart(&core).await.is_empty());
+    let shown = Command::SetAutostart {
+        node: node.id,
+        enabled: true,
+        expect: Some(node.props.clone()),
+    };
+    core.execute(shown).await.unwrap();
     core.execute(enable.clone()).await.unwrap();
     assert_eq!(autostart(&core).await, vec![node.id]);
     let tunnel_file = fs::read_to_string(server.path("burrow/tree/tunnel.toml")).unwrap();

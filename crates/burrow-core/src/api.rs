@@ -577,10 +577,15 @@ pub enum Command {
     ListAutostart,
     /// Makes a tunnel start with Burrow, or stops it doing so. The choice is
     /// kept on this computer, not in the tunnel's file, and only holds while
-    /// the tunnel's settings stay as they were.
+    /// the tunnel's settings stay as they were. `expect` is the props the
+    /// user was shown: if the tunnel's props differ (a file changed
+    /// meanwhile), enabling fails rather than consenting to settings the
+    /// user never saw.
     SetAutostart {
         node: NodeId,
         enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<toml::Table>,
     },
     /// Returns every addon as [`Response::Addons`], sorted by id.
     ListAddons,
