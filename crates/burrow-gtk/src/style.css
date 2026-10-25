@@ -44,8 +44,22 @@
   background: alpha(currentColor, 0.05);
 }
 
-.addon-view {
+.addon-view,
+.tunnel-view {
   margin: 24px;
+}
+
+.running,
+.running-badge {
+  color: #26a269;
+}
+
+.running-badge {
+  font-size: smaller;
+}
+
+.error-text {
+  color: #e01b24;
 }
 
 .warning-text {

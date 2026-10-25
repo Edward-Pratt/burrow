@@ -10,6 +10,7 @@ mod runtime;
 mod settings;
 mod sidebar;
 mod terminal;
+mod tunnels;
 
 use std::path::PathBuf;
 

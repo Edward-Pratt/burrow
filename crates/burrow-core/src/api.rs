@@ -131,8 +131,8 @@ impl Drop for SecretValue {
 
 /// Identifies a session opened with [`Command::OpenTerminal`],
 /// [`Command::StartTunnel`] or [`Command::OpenFiles`]. Unique for as long as
-/// the core runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// the core runs, and a later session has a larger id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(pub u64);
 
