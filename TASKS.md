@@ -4,6 +4,8 @@
 
 - [ ] **Get a friend testing Burrow** - send them the README's "Trying it" section. If anything fails, ask for the output of `burrow doctor` and for `~/.local/state/burrow/burrowd.log`. Their feedback sets the order of everything below.
 
+- [ ] **Point the installed Burrow back at main** - after the install-script PR merges, run `git -C ~/.local/share/burrow/src remote set-url origin https://github.com/Edward-Pratt/burrow.git` (if still the local checkout) and `burrow-update --branch main`, or every daily update fails once the branch is deleted.
+
 ## Waiting On
 
 - [ ] **Friend's first test run** - see Active.
