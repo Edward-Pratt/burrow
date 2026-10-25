@@ -14,7 +14,7 @@ use std::time::Duration;
 use burrow_core::{
     Command, Core, CoreOptions, Event, MemoryStore, Node, NodePatch, Prompt, PromptAnswer,
     PromptKind, Response, SecretValue, SessionId, SessionKind, SessionState, TransferId,
-    TransferState,
+    TransferState, TunnelShown,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -870,28 +870,27 @@ async fn autostart_is_kept_locally_and_pinned_to_the_settings() {
     let port = free_port();
     let props = format!("type = \"dynamic\"\nport = {port}");
     let node = tunnel(&core, &host, &props).await;
-    let enable = Command::SetAutostart {
+    let enable = |expect| Command::SetAutostart {
         node: node.id,
         enabled: true,
-        expect: None,
+        expect,
     };
-    // Settings other than those the user was shown are refused.
-    let mut stale = node.props.clone();
-    stale.insert("port".into(), 1.into());
-    let refused = Command::SetAutostart {
-        node: node.id,
-        enabled: true,
-        expect: Some(stale),
+    let shown = TunnelShown {
+        props: node.props.clone(),
+        host_name: host.name.clone(),
+        host_props: host.props.clone(),
     };
-    assert!(core.execute(refused).await.is_err());
+    // Enabling needs what the user was shown, and refuses anything else:
+    // the tunnel's settings, or the host's alias, changed since.
+    assert!(core.execute(enable(None)).await.is_err());
+    let mut stale = shown.clone();
+    stale.props.insert("port".into(), 1.into());
+    assert!(core.execute(enable(Some(stale))).await.is_err());
+    let mut stale = shown.clone();
+    stale.host_props.insert("alias".into(), "elsewhere".into());
+    assert!(core.execute(enable(Some(stale))).await.is_err());
     assert!(autostart(&core).await.is_empty());
-    let shown = Command::SetAutostart {
-        node: node.id,
-        enabled: true,
-        expect: Some(node.props.clone()),
-    };
-    core.execute(shown).await.unwrap();
-    core.execute(enable.clone()).await.unwrap();
+    core.execute(enable(Some(shown))).await.unwrap();
     assert_eq!(autostart(&core).await, vec![node.id]);
     let tunnel_file = fs::read_to_string(server.path("burrow/tree/tunnel.toml")).unwrap();
     assert!(!tunnel_file.contains("autostart"), "{tunnel_file}");

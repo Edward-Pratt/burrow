@@ -575,11 +575,21 @@ impl Inner {
                         format!("{} is a {}, not an SSH tunnel", node.name, node.kind),
                     ));
                 }
-                if enabled && expect.as_ref().is_some_and(|props| *props != node.props) {
-                    return Err(Error::invalid(
-                        "tunnel",
-                        "its settings changed since they were shown; look again",
-                    ));
+                if enabled {
+                    let expect = expect.ok_or_else(|| {
+                        Error::invalid("expect", "enabling needs the settings the user was shown")
+                    })?;
+                    let host = snapshot.get(1);
+                    let same = expect.props == node.props
+                        && host.is_some_and(|host| {
+                            expect.host_name == host.name && expect.host_props == host.props
+                        });
+                    if !same {
+                        return Err(Error::invalid(
+                            "tunnel",
+                            "its settings changed since they were shown; look again",
+                        ));
+                    }
                 }
                 let lookup = |id| snapshot.iter().find(|n| n.id == id).cloned();
                 self.autostart.set(&lookup, node, enabled)?;

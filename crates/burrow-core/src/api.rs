@@ -423,6 +423,17 @@ pub struct Button {
     pub label: String,
 }
 
+/// A tunnel's settings as a client showed them, for
+/// [`Command::SetAutostart`]. It covers everything an autostart consent is
+/// pinned to: the tunnel's props, and the name and props of the SSH host it
+/// goes through, whose alias falls back to its name.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TunnelShown {
+    pub props: toml::Table,
+    pub host_name: String,
+    pub host_props: toml::Table,
+}
+
 /// A config file the core could not load. The rest of the tree still loads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Problem {
@@ -577,15 +588,15 @@ pub enum Command {
     ListAutostart,
     /// Makes a tunnel start with Burrow, or stops it doing so. The choice is
     /// kept on this computer, not in the tunnel's file, and only holds while
-    /// the tunnel's settings stay as they were. `expect` is the props the
-    /// user was shown: if the tunnel's props differ (a file changed
-    /// meanwhile), enabling fails rather than consenting to settings the
-    /// user never saw.
+    /// the tunnel's settings stay as they were. Enabling needs `expect`,
+    /// what the user was shown: if the tunnel or its host differ from it (a
+    /// file changed meanwhile), it fails rather than consent to settings
+    /// the user never saw.
     SetAutostart {
         node: NodeId,
         enabled: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        expect: Option<toml::Table>,
+        expect: Option<TunnelShown>,
     },
     /// Returns every addon as [`Response::Addons`], sorted by id.
     ListAddons,

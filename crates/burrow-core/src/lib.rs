@@ -19,7 +19,7 @@ pub use api::{
     Command, Event, FOLDER_KIND, Field, FileEntry, FileKind, FormField, FormInput, FormValue, Node,
     NodeId, NodePatch, Problem, Prompt, PromptAnswer, PromptKind, Response, SSH_HOST_KIND,
     SSH_TUNNEL_KIND, SecretValue, SessionId, SessionInfo, SessionKind, SessionState, TransferId,
-    TransferState, View,
+    TransferState, TunnelShown, View,
 };
 pub use engine::{Core, CoreOptions};
 pub use error::{Error, Result};

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use burrow_core::{
     AddonInfo, Command, Core, Event, FormValue, Node, NodeId, NodePatch, Problem, Prompt, Response,
-    SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId, SessionInfo, SessionKind, SessionState, View,
-    Watcher,
+    SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId, SessionInfo, SessionKind, SessionState, TunnelShown,
+    View, Watcher,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
@@ -536,8 +536,11 @@ impl Component for App {
             }
             AppMsg::EditTunnel(node) => self.edit_tunnel(Some(node), None, window, &sender),
             AppMsg::SetAutostart { node, enabled } => {
-                // The props the tab shows: it is redrawn on every change.
-                let expect = self.nodes.get(&node).map(|n| n.props.clone());
+                // What the tab shows: it is redrawn on every change.
+                let expect = self
+                    .nodes
+                    .get(&node)
+                    .and_then(|n| shown(&self.nodes, &n.props));
                 let (core, input) = (self.core.clone(), sender.input_sender().clone());
                 runtime().spawn(async move {
                     let command = Command::SetAutostart {
@@ -1122,9 +1125,16 @@ impl App {
         // withdraws it. A change made here is the user's own, so it is
         // asked for again.
         let autostart = id.is_some_and(|id| self.autostart.contains(&id));
+        // The hosts as they were when the dialog opened.
+        let host_nodes: HashMap<NodeId, Node> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.kind == SSH_HOST_KIND)
+            .map(|(id, n)| (*id, n.clone()))
+            .collect();
         let (core, input) = (self.core.clone(), sender.input_sender().clone());
         tunnels::edit(window, node, hosts, move |name, props| {
-            let saved = props.clone();
+            let saved = shown(&host_nodes, &props);
             let command = match id {
                 Some(id) => Command::UpdateNode {
                     id,
@@ -1151,7 +1161,7 @@ impl App {
                         let command = Command::SetAutostart {
                             node: node.id,
                             enabled: true,
-                            expect: Some(saved),
+                            expect: saved,
                         };
                         core.execute(command).await
                     }
@@ -1753,6 +1763,18 @@ fn set_tab_title(label: &gtk::Label, title: &str) {
     const MAX_CHARS: usize = 24;
     label.set_label(title);
     label.set_width_chars(title.chars().count().min(MAX_CHARS) as i32);
+}
+
+/// A tunnel's settings as the window shows them, for `set_autostart`:
+/// `props` and the host they go through, as found in `nodes`.
+fn shown(nodes: &HashMap<NodeId, Node>, props: &toml::Table) -> Option<TunnelShown> {
+    let via = props.get("via")?.as_str()?.parse().ok().map(NodeId)?;
+    let host = nodes.get(&via)?;
+    Some(TunnelShown {
+        props: props.clone(),
+        host_name: host.name.clone(),
+        host_props: host.props.clone(),
+    })
 }
 
 /// The title of an SSH host's file panel tab.
