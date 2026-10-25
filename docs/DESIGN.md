@@ -33,6 +33,7 @@ Cargo workspace:
 | `burrow-gtk` | Thin GTK4 client of the core in `burrowd`. |
 | `burrowd` | The core as a process of its own, so tunnels and monitoring keep running with the window closed. Started by a client, or by a systemd user unit. |
 | `burrow-cli` | The `burrow` command-line client, and the MCP bridge (`burrow mcp serve`). |
+| `burrow-agent` | A small static program that runs on servers and reports their state over SSH. Its library is the wire format the core parses. |
 
 ### One versioned API for every client
 
@@ -72,12 +73,14 @@ All non-secret state lives as TOML files in `$XDG_CONFIG_HOME/burrow/` (default 
 - **Burrow-only extras:** colour, folder, start directory and monitoring settings go in Burrow's config, keyed by the `Host` alias.
 - **Hosts added in Burrow:** these are written to `~/.ssh/config.d/burrow.conf`, which is pulled in by an `Include` line. Burrow asks once before adding that line, so `ssh myhost` in a shell matches Burrow.
 
-### Server agent (later, as an addon)
+### Server agent
 
-`burrow-agent` is an optional small static binary (musl, x86_64 and aarch64) that runs on servers. It streams structured stats, systemd, container and PM2 state over the existing SSH connection as JSON lines.
+`burrow-agent` is an optional small static binary (musl, x86_64 and aarch64, about 500 KB) that runs on servers. It streams host stats and systemd services over the existing SSH connection as JSON lines. Containers and PM2 come later.
 
-- **Install:** Burrow offers to upload it to `~/.local/share/burrow/` on the server and checks its version and hash on every connect.
-- **Fallback:** servers without the agent fall back to plain shell commands with parsed output.
+- **Owned by the core, like Postgres:** the core uploads the agent, runs it and parses its output, and the monitor tab is built in. An addon process would need the SSH connection, which only the core holds.
+- **Install:** Burrow asks once per host, then uploads it to `~/.local/share/burrow/` on the server, and checks its hash against its own copy every time a monitor starts. The consent lives in the state folder, pinned to the host node, because a node file must never put a program on a server. The MCP bridge can read monitors with a grant, but never installs.
+- **Live only, for now:** a monitor runs while a client has it open, and keeps an hour of samples in memory. Background sampling, alerts and history on disk are later.
+- **Fallback (later):** servers without the agent will fall back to plain shell commands with parsed output.
 - **No exposed ports:** the agent never listens on the network. It only talks over SSH.
 
 ## Platform
