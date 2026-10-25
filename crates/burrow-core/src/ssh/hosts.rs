@@ -17,7 +17,7 @@ use crate::ssh::config::{self, Trace};
 use crate::tree::write_atomic_mode;
 
 const HEADER: &str = "# Hosts added in Burrow. Burrow only ever appends to this file.\n";
-const INCLUDE_COMMENT: &str = "# Added by Burrow, so ssh reads the hosts added there.\n";
+const INCLUDE_COMMENT: &str = "# Added by Burrow, so ssh reads the hosts added in Burrow.\n";
 
 /// What the user typed for a new host. Only the alias and host name are
 /// required.
@@ -119,13 +119,7 @@ impl NewHost {
     /// would allow `*`, and a `Host *` block read first would take over
     /// every host.
     pub fn check(&self) -> Result<()> {
-        config::check_alias(&self.alias).map_err(|r| Error::invalid("alias", r))?;
-        plain(
-            "alias",
-            &self.alias,
-            "letters, digits, '.', '_' and '-'",
-            |c| c.is_ascii_alphanumeric() || "._-".contains(c),
-        )?;
+        check_new_alias(&self.alias)?;
         plain(
             "host name",
             &self.hostname,
@@ -174,6 +168,13 @@ impl NewHost {
         }
         Ok(block)
     }
+}
+
+fn check_new_alias(alias: &str) -> Result<()> {
+    config::check_alias(alias).map_err(|r| Error::invalid("alias", r))?;
+    plain("alias", alias, "letters, digits, '.', '_' and '-'", |c| {
+        c.is_ascii_alphanumeric() || "._-".contains(c)
+    })
 }
 
 fn plain(field: &'static str, value: &str, allowed: &str, ok: impl Fn(char) -> bool) -> Result<()> {
@@ -227,17 +228,19 @@ fn quoted(text: &str) -> String {
     }
 }
 
-/// Reports whether `ssh` reads the hosts file when it looks up `alias`.
-/// Creates the hosts file when missing, since `ssh` only reports reading
-/// files that exist.
+/// Reports whether `ssh` reads the hosts file when it looks up `alias`,
+/// after the same checks of the alias as [`add`], so a client asks about
+/// the Include line only for a host it can add. Creates the hosts file
+/// when missing, since `ssh` only reports reading files that exist.
 pub(crate) async fn include_status(
     config_file: Option<&Path>,
     alias: &str,
 ) -> Result<IncludeStatus> {
+    check_new_alias(alias)?;
     let home = home()?;
     let files = Files::locate(config_file, &home)?;
     ensure_hosts_file(&files)?;
-    let trace = trace(alias, config_file).await?;
+    let trace = free(alias, config_file, &files, &home).await?;
     Ok(IncludeStatus {
         included: reads(&trace, &files.hosts),
         config: files.config,
@@ -260,15 +263,7 @@ pub(crate) async fn add(
     let block = host.render(&home)?;
     let before = ensure_hosts_file(&files)?;
     let alias = host.alias.as_str();
-
-    // The hosts file on its own as well, since until the Include is in
-    // place (or while it sits inside a Host block) the first trace doesn't
-    // see its blocks.
-    let everywhere = trace(alias, config_file).await?;
-    let own = trace(alias, Some(&files.hosts)).await?;
-    if let Some(found) = everywhere.naming(alias).or(own.naming(alias)) {
-        return Err(taken(alias, found, &files, &home));
-    }
+    let everywhere = free(alias, config_file, &files, &home).await?;
     if !reads(&everywhere, &files.hosts) {
         if !add_include {
             return Err(Error::invalid(
@@ -306,6 +301,24 @@ pub(crate) async fn add(
             Err(e)
         }
     }
+}
+
+/// Refuses an alias that a `Host` line already names, and returns the
+/// trace of the whole config. The hosts file is traced on its own as well,
+/// since until the Include is in place (or while it sits inside a Host
+/// block) the config's trace doesn't see its blocks.
+async fn free(
+    alias: &str,
+    config_file: Option<&Path>,
+    files: &Files,
+    home: &Path,
+) -> Result<Trace> {
+    let everywhere = trace(alias, config_file).await?;
+    let own = trace(alias, Some(&files.hosts)).await?;
+    if let Some(found) = everywhere.naming(alias).or(own.naming(alias)) {
+        return Err(taken(alias, found, files, home));
+    }
+    Ok(everywhere)
 }
 
 async fn trace(alias: &str, config_file: Option<&Path>) -> Result<Trace> {
@@ -781,7 +794,7 @@ mod tests {
         assert_eq!(resolved.user, "deploy");
         assert_eq!(resolved.port, 2222);
         assert_eq!(resolved.identity_files, [key]);
-        let status = include_status(Some(&setup.config), "web").await.unwrap();
+        let status = include_status(Some(&setup.config), "db").await.unwrap();
         assert!(status.included);
 
         // The second host needs no question, and the first stays.
@@ -802,6 +815,12 @@ mod tests {
         assert!(text.contains("ssh_config line 4"), "{text}");
         assert!(text.contains("already in your SSH config"), "{text}");
         assert_eq!(setup.hosts(), HEADER);
+        // Checking first says so too, so nobody is asked about the
+        // Include line for a host that can't be added.
+        let status = include_status(Some(&setup.config), "web").await;
+        assert_eq!(invalid_field(status), "alias");
+        let status = include_status(Some(&setup.config), "*").await;
+        assert_eq!(invalid_field(status), "alias");
     }
 
     #[tokio::test]
