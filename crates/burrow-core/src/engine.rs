@@ -12,7 +12,7 @@ use crate::db;
 use crate::error::{Error, Result};
 use crate::grants::Grants;
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
-use crate::ssh::{self, Agents, Autostart, Connections, Input, Sessions, Transfers, files};
+use crate::ssh::{self, Agents, Autostart, Connections, Input, Sessions, Transfers, files, hosts};
 use crate::tree::{Entry, Tree};
 
 /// How many events a slow subscriber can fall behind before it starts
@@ -102,6 +102,9 @@ struct Inner {
     grants_shown: Mutex<Vec<Grant>>,
     history: db::History,
     ssh_config: Option<PathBuf>,
+    /// Held while a host is added, so two never interleave their checks
+    /// and writes to the OpenSSH config.
+    adding_host: tokio::sync::Mutex<()>,
 }
 
 impl Core {
@@ -136,6 +139,7 @@ impl Core {
                 grants_shown: Mutex::default(),
                 history: db::History::new(options.state_dir.join("history")),
                 ssh_config: options.ssh_config,
+                adding_host: tokio::sync::Mutex::default(),
             }),
         };
         *core.inner.autostart_nodes.lock().unwrap() = core.inner.autostart_enabled();
@@ -414,6 +418,32 @@ impl Core {
                     .await?;
                 return Ok(Response::Invoked { message });
             }
+            Command::CheckSshInclude { alias } => {
+                let status = hosts::include_status(self.ssh_config(), &alias).await?;
+                return Ok(Response::SshInclude {
+                    included: status.included,
+                    config: status.config,
+                    line: status.line,
+                });
+            }
+            Command::AddSshHost {
+                parent,
+                alias,
+                hostname,
+                user,
+                port,
+                identity_file,
+                add_include,
+            } => {
+                let host = hosts::NewHost {
+                    alias,
+                    hostname,
+                    user,
+                    port,
+                    identity_file,
+                };
+                return self.add_ssh_host(parent, host, add_include).await;
+            }
             command => {
                 let inner = self.inner.clone();
                 return tokio::task::spawn_blocking(move || inner.execute(command))
@@ -574,6 +604,43 @@ impl Core {
 
     pub(crate) fn emit(&self, event: Event) {
         self.inner.emit(event);
+    }
+
+    /// Writes the host to the OpenSSH config, then makes its node. The
+    /// block is taken back if the node can't be made, so a failure leaves
+    /// both as they were.
+    async fn add_ssh_host(
+        &self,
+        parent: Option<NodeId>,
+        host: hosts::NewHost,
+        add_include: bool,
+    ) -> Result<Response> {
+        let _adding = self.inner.adding_host.lock().await;
+        // Checked first too, so the common mistake writes nothing.
+        if let Some(parent) = parent
+            && !self.node(parent)?.is_folder()
+        {
+            return Err(Error::NotAFolder(parent));
+        }
+        let added = hosts::add(self.ssh_config(), &host, add_include).await?;
+        let mut props = toml::Table::new();
+        props.insert("alias".into(), host.alias.clone().into());
+        let command = Command::CreateNode {
+            parent,
+            kind: SSH_HOST_KIND.into(),
+            name: host.alias,
+            color: None,
+            props,
+        };
+        let inner = self.inner.clone();
+        let result = tokio::task::spawn_blocking(move || inner.execute(command))
+            .await
+            .map_err(|e| Error::Task(e.to_string()))
+            .flatten();
+        if result.is_err() {
+            added.undo();
+        }
+        result
     }
 
     pub(crate) fn ssh_config(&self) -> Option<&Path> {
@@ -888,7 +955,9 @@ impl Inner {
             | Command::OpenView { .. }
             | Command::OpenMonitor { .. }
             | Command::MonitorHistory { .. }
-            | Command::InvokeAction { .. } => unreachable!("async command on the blocking path"),
+            | Command::InvokeAction { .. }
+            | Command::CheckSshInclude { .. }
+            | Command::AddSshHost { .. } => unreachable!("async command on the blocking path"),
         }
     }
 
@@ -1079,8 +1148,8 @@ mod tests {
         check::<Core>();
     }
 
-    #[test]
-    fn addons_may_not_reach_databases() {
+    /// A core with one addon that may read and write nodes.
+    fn core_with_addon() -> (tempfile::TempDir, Core, Manifest) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
         let folder = dir.path().join("config/addons/probe");
@@ -1103,6 +1172,12 @@ mod tests {
             ssh_config: None,
         })
         .unwrap();
+        (dir, core, manifest)
+    }
+
+    #[test]
+    fn addons_may_not_reach_databases() {
+        let (_dir, core, manifest) = core_with_addon();
         let session = SessionId(1);
         let node = NodeId::new();
         for command in [
@@ -1125,6 +1200,28 @@ mod tests {
             },
             Command::ListHistory { node },
             Command::ClearHistory { node },
+        ] {
+            let error = core.inner.permit(&manifest, &command).unwrap_err();
+            assert!(matches!(error, Error::PermissionDenied(_)), "{error}");
+        }
+    }
+
+    #[test]
+    fn addons_may_not_add_ssh_hosts() {
+        let (_dir, core, manifest) = core_with_addon();
+        for command in [
+            Command::CheckSshInclude {
+                alias: "web".into(),
+            },
+            Command::AddSshHost {
+                parent: None,
+                alias: "web".into(),
+                hostname: "10.0.0.5".into(),
+                user: None,
+                port: None,
+                identity_file: None,
+                add_include: true,
+            },
         ] {
             let error = core.inner.permit(&manifest, &command).unwrap_err();
             assert!(matches!(error, Error::PermissionDenied(_)), "{error}");

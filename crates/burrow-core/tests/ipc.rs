@@ -104,6 +104,19 @@ async fn the_mcp_bridge_reads_the_sidebar_but_changes_nothing() {
             expect: None,
         },
         Command::ListAddons,
+        // Writing to the OpenSSH config is the user's own act.
+        Command::CheckSshInclude {
+            alias: "web".into(),
+        },
+        Command::AddSshHost {
+            parent: None,
+            alias: "web".into(),
+            hostname: "10.0.0.5".into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            add_include: true,
+        },
     ];
     for command in refused {
         let error = mcp.execute(command).await.unwrap_err();
@@ -116,7 +129,7 @@ async fn the_mcp_bridge_reads_the_sidebar_but_changes_nothing() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(lines.len(), 5);
+    assert_eq!(lines.len(), 7);
     assert_eq!(lines[0]["ok"], true);
     assert_eq!(
         lines[1]["command"],

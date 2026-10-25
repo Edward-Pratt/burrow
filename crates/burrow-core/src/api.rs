@@ -707,6 +707,35 @@ pub enum Command {
     /// Re-reads the tree from disk. The file watcher does this
     /// automatically.
     ReloadConfig,
+    /// Says whether the OpenSSH config reads `config.d/burrow.conf`, where
+    /// hosts added in Burrow go, when it looks up `alias`. Refuses an alias
+    /// that [`Command::AddSshHost`] would refuse, so a client asks about
+    /// the Include line only for a host it can add. Creates that file,
+    /// with only a comment, if it is missing, since `ssh` only reports reading files that
+    /// exist. Returns [`Response::SshInclude`].
+    CheckSshInclude {
+        alias: String,
+    },
+    /// Appends a `Host` block for `alias` to `config.d/burrow.conf` beside
+    /// the OpenSSH config, then creates an SSH host node for it named after
+    /// the alias. `add_include` allows putting the `Include` line for that
+    /// file at the top of the config, which the user must have agreed to.
+    /// Refuses an alias the config already names. Returns
+    /// [`Response::Node`].
+    AddSshHost {
+        #[serde(default)]
+        parent: Option<NodeId>,
+        alias: String,
+        hostname: String,
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        port: Option<u16>,
+        #[serde(default)]
+        identity_file: Option<PathBuf>,
+        #[serde(default)]
+        add_include: bool,
+    },
     /// Connects to an SSH host node and starts a shell in a terminal of
     /// `cols` x `rows`. Returns [`Response::Session`] straight away; progress
     /// arrives as [`Event::SessionChanged`] and output on the session's
@@ -1010,6 +1039,13 @@ pub enum Response {
     /// `message` is something the addon wants shown to the user.
     Invoked {
         message: Option<String>,
+    },
+    /// Whether the OpenSSH config at `config` reads the hosts added in
+    /// Burrow, and the `line` at its top that would make it.
+    SshInclude {
+        included: bool,
+        config: PathBuf,
+        line: String,
     },
     Ok,
 }

@@ -1240,3 +1240,49 @@ async fn files_are_read_and_written_by_content() {
         .collect();
     assert_eq!(left.len(), 2, "{left:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_added_in_burrow_runs_a_shell() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    // What the fixture's `Host test` block sets that a new host can't, so
+    // the new one stays away from ~/.ssh and the user's agent too.
+    let mut config = fs::read_to_string(server.path("ssh_config")).unwrap();
+    config += &format!(
+        "Host *\n\
+         \tIdentitiesOnly yes\n\
+         \tIdentityAgent none\n\
+         \tUserKnownHostsFile {}\n\
+         \tGlobalKnownHostsFile /dev/null\n",
+        server.path("known_hosts").display()
+    );
+    fs::write(server.path("ssh_config"), config).unwrap();
+    let core = server.core();
+
+    let command = Command::AddSshHost {
+        parent: None,
+        alias: "added".into(),
+        hostname: "127.0.0.1".into(),
+        user: Some(whoami()),
+        port: Some(server.port),
+        identity_file: Some(server.path("client_key")),
+        add_include: true,
+    };
+    let node = match core.execute(command).await.unwrap() {
+        Response::Node { node } => node,
+        other => panic!("expected a node, got {other:?}"),
+    };
+    let mut events = core.subscribe();
+    let (session, mut output) = open(&core, &node).await;
+    assert_eq!(
+        expect_state(&mut events, session).await,
+        SessionState::Connected
+    );
+    write(&core, session, "echo burrow-$((40 + 2))\n").await;
+    read_until(&mut output, "burrow-42").await;
+    core.execute(Command::CloseSession { session })
+        .await
+        .unwrap();
+}

@@ -539,3 +539,133 @@ fn secret_values_are_redacted_in_debug_output() {
     };
     assert!(!format!("{command:?}").contains("hunter2"));
 }
+
+/// A core pointed at its own OpenSSH config, as `BURROW_SSH_CONFIG` does.
+fn with_ssh_config(dir: &Path) -> (Core, std::path::PathBuf) {
+    let ssh_config = dir.join("ssh/config");
+    fs::create_dir_all(ssh_config.parent().unwrap()).unwrap();
+    fs::write(&ssh_config, "Host *\n    Port 2\n").unwrap();
+    let core = Core::open(CoreOptions {
+        config_dir: dir.to_path_buf(),
+        secrets: Arc::new(MemoryStore::new()),
+        state_dir: dir.join("state"),
+        ssh_config: Some(ssh_config.clone()),
+    })
+    .unwrap();
+    (core, ssh_config)
+}
+
+fn add_host(parent: Option<NodeId>, alias: &str, add_include: bool) -> Command {
+    Command::AddSshHost {
+        parent,
+        alias: alias.into(),
+        hostname: "10.0.0.5".into(),
+        user: Some("deploy".into()),
+        port: None,
+        identity_file: None,
+        add_include,
+    }
+}
+
+#[tokio::test]
+async fn a_host_added_in_burrow_is_a_node_and_an_ssh_host() {
+    let dir = TempDir::new().unwrap();
+    let (core, ssh_config) = with_ssh_config(dir.path());
+    let hosts = dir.path().join("ssh/config.d/burrow.conf");
+    let mut events = core.subscribe();
+
+    let Response::SshInclude {
+        included,
+        config,
+        line,
+    } = core
+        .execute(Command::CheckSshInclude {
+            alias: "web".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected the include status");
+    };
+    assert!(!included);
+    assert_eq!(config, ssh_config);
+    assert_eq!(line, format!("Include {}", hosts.display()));
+
+    let folder = node(
+        core.execute(Command::CreateNode {
+            parent: None,
+            kind: "folder".into(),
+            name: "Work".into(),
+            color: None,
+            props: toml::Table::new(),
+        })
+        .await
+        .unwrap(),
+    );
+    let web = node(
+        core.execute(add_host(Some(folder.id), "web", true))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(web.kind, "ssh-host");
+    assert_eq!(web.name, "web");
+    assert_eq!(web.parent, Some(folder.id));
+    assert_eq!(web.props.get("alias").and_then(|v| v.as_str()), Some("web"));
+    let mut created = Vec::new();
+    while let Ok(Event::NodeCreated { node }) = events.try_recv() {
+        created.push(node.id);
+    }
+    assert_eq!(created, [folder.id, web.id]);
+
+    let config = fs::read_to_string(&ssh_config).unwrap();
+    assert!(config.starts_with("# Added by Burrow"), "{config}");
+    assert!(config.ends_with("Host *\n    Port 2\n"), "{config}");
+    let output = std::process::Command::new("ssh")
+        .arg("-G")
+        .arg("-F")
+        .arg(&ssh_config)
+        .arg("web")
+        .output()
+        .unwrap();
+    let output = String::from_utf8_lossy(&output.stdout);
+    for line in ["hostname 10.0.0.5", "user deploy", "port 2"] {
+        assert!(output.lines().any(|l| l == line), "{line} in {output}");
+    }
+
+    // The same alias again is refused, and the node stays the only one.
+    let error = core
+        .execute(add_host(None, "web", false))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("already added in Burrow"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_host_that_cannot_become_a_node_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let (core, ssh_config) = with_ssh_config(dir.path());
+    let leaf = node(
+        core.execute(Command::CreateNode {
+            parent: None,
+            kind: "ssh-host".into(),
+            name: "leaf".into(),
+            color: None,
+            props: toml::Table::new(),
+        })
+        .await
+        .unwrap(),
+    );
+    let error = core
+        .execute(add_host(Some(leaf.id), "web", true))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotAFolder(_)), "{error}");
+    assert_eq!(
+        fs::read_to_string(&ssh_config).unwrap(),
+        "Host *\n    Port 2\n"
+    );
+    assert!(!dir.path().join("ssh/config.d").exists());
+}

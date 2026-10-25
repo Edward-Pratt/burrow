@@ -27,6 +27,7 @@ use crate::addons;
 use crate::database::{self, Database};
 use crate::dialogs;
 use crate::files::{self, Files};
+use crate::hosts;
 use crate::monitor::{self, Monitor};
 use crate::palette::{self, Item};
 use crate::remote::{self, Remote, Unclaimed};
@@ -1694,10 +1695,7 @@ impl App {
     ) {
         let (title, label) = match &kind {
             NewKind::Folder => ("New folder".to_string(), "Folder name"),
-            NewKind::SshHost => (
-                "New SSH host".to_string(),
-                "Host alias (as in ~/.ssh/config)",
-            ),
+            NewKind::SshHost => return hosts::new_host(window, self.core.clone(), parent),
             NewKind::SshTunnel => return self.edit_tunnel(None, parent, window, sender),
             NewKind::Database => return self.edit_database(None, parent, window, sender),
             NewKind::Addon(kind) => {
@@ -1714,14 +1712,9 @@ impl App {
         dialogs::prompt(window, &title, label, "", "Create", move |name| {
             let (kind, props) = match &kind {
                 NewKind::Folder => ("folder", toml::Table::new()),
-                NewKind::SshHost => {
-                    let mut props = toml::Table::new();
-                    props.insert("alias".into(), name.clone().into());
-                    ("ssh-host", props)
-                }
                 NewKind::Addon(kind) => (kind.as_str(), toml::Table::new()),
-                NewKind::SshTunnel | NewKind::Database => {
-                    unreachable!("tunnels and databases have their own dialogs")
+                NewKind::SshHost | NewKind::SshTunnel | NewKind::Database => {
+                    unreachable!("hosts, tunnels and databases have their own dialogs")
                 }
             };
             execute(
