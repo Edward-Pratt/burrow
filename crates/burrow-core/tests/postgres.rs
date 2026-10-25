@@ -425,6 +425,35 @@ async fn a_query_with_too_many_rows_is_stopped_at_the_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_query_too_big_for_one_reply_is_stopped() {
+    let Some(postgres) = Postgres::start() else {
+        return;
+    };
+    let (_dir, core) = core();
+    let node = database(&core, &postgres.tcp()).await;
+    let session = connect(&core, &node, Some(PASSWORD)).await;
+
+    // 64 MiB under the row limit: as one reply, it would be too long a
+    // line for the socket, and the client would lose its connection.
+    let sql = "select repeat('x', 65536) from generate_series(1, 1000)";
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        query(&core, session, sql, Some(1000)),
+    )
+    .await
+    .expect("the query was not stopped");
+    assert!(result.stopped);
+    assert_eq!(result.error, None);
+    let statement = &result.statements[0];
+    assert!(statement.truncated);
+    assert!((500..1000).contains(&statement.rows.len()));
+    let reply = serde_json::to_string(&result).unwrap();
+    assert!(reply.len() < 33 << 20, "{} bytes", reply.len());
+
+    assert_eq!(values(&core, session, "select 2").await, one("2"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_running_query_can_be_cancelled() {
     let Some(postgres) = Postgres::start() else {
         return;

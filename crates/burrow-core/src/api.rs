@@ -614,8 +614,9 @@ pub struct QueryResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<QueryError>,
     /// Set when Burrow stopped the query because it returned more rows
-    /// than the limit. The statement that hit it is `truncated`, and
-    /// anything after it in the same query did not run.
+    /// than the limit, or more than 32 MiB of them as JSON. The statement
+    /// that hit it is `truncated`, and anything after it in the same query
+    /// did not run.
     #[serde(default)]
     pub stopped: bool,
     pub elapsed_ms: u64,
