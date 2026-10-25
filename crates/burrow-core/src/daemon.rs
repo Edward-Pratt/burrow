@@ -119,6 +119,7 @@ async fn serve(activated: Option<std::os::unix::net::UnixListener>) -> Result<()
         }
     };
 
+    crate::notify::spawn(&core);
     core.autostart();
     let _watcher = core
         .watch()

@@ -15,6 +15,7 @@ mod error;
 mod grants;
 pub mod ipc;
 mod net;
+mod notify;
 mod password;
 mod pins;
 mod secrets;
