@@ -3,10 +3,6 @@
 ## Active
 
 - [ ] **Get a friend testing Burrow** - send them the README's "Trying it" section. If anything fails, ask for the output of `burrow doctor` and for `~/.local/state/burrow/burrowd.log`. Their feedback sets the order of everything below.
-- [ ] **M10: hosts added in Burrow** - the biggest first-run gap. "New SSH host" in `crates/burrow-gtk/src/app.rs` (around line 1698) only takes an alias that must already exist in `~/.ssh/config`, so a tester without an ssh config can't add a server from inside Burrow.
-  - Design is already in `docs/DESIGN.md`, "OpenSSH config as source of truth": a dialog with hostname, user, port and key, written to `~/.ssh/config.d/burrow.conf`, with the `Include` line added to `~/.ssh/config` after asking once, so `ssh <alias>` in a shell matches Burrow.
-  - Nothing in the code writes to the ssh config yet (`grep config.d crates/` finds nothing). Keep `ssh -G` as the only reader.
-  - Rules that apply: config is untrusted, so the written file must never be a symlink target, and the alias must pass `ssh::config::check_alias`.
 
 ## Waiting On
 
@@ -25,4 +21,5 @@ Next milestones from `docs/DESIGN.md`, in rough order; pick by what the tester u
 
 ## Done
 
+- [x] ~~M10: hosts added in Burrow~~ (2026-10-25, PR #13 merged)
 - [x] ~~Review after M9, `burrow doctor`, start-up failure dialog, Arch package, review fixes~~ (2026-10-25, PR #10 merged)
