@@ -1423,6 +1423,14 @@ pub fn edit(
 
     let submit = Rc::new({
         let (window, name, error) = (window.clone(), name.clone(), error.clone());
+        let (host, socket, user, database, root, port) = (
+            host.clone(),
+            socket.clone(),
+            user.clone(),
+            database.clone(),
+            root.clone(),
+            port.clone(),
+        );
         move || {
             let fail = |message: &str| {
                 error.set_label(message);
@@ -1485,7 +1493,11 @@ pub fn edit(
         let submit = submit.clone();
         move |_| submit()
     });
-    name.connect_activate(move |_| submit());
+    for entry in [&name, &host, &socket, &user, &database, &root] {
+        let submit = submit.clone();
+        entry.connect_activate(move |_| submit());
+    }
+    port.connect_activate(move |_| submit());
     cancel.connect_clicked({
         let window = window.clone();
         move |_| window.close()

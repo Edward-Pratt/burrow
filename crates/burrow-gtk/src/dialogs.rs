@@ -52,6 +52,14 @@ pub fn prompt(
     content.append(&buttons);
     window.set_child(Some(&content));
 
+    // Empty text is never taken, so the button says so.
+    ok.set_sensitive(!initial.trim().is_empty());
+    entry.connect_changed(glib::clone!(
+        #[weak]
+        ok,
+        move |entry| ok.set_sensitive(!entry.text().trim().is_empty())
+    ));
+
     let submit = std::rc::Rc::new({
         let window = window.clone();
         let entry = entry.clone();

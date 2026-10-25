@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use burrow_core::ipc::{self, Client, Role};
 use burrow_core::{
-    AddonInfo, Alert, Capability, Command, Event, FormValue, Grant, GrantShown, Node, NodeId,
-    NodePatch, POSTGRES_KIND, Problem, Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId,
-    SessionInfo, SessionKind, SessionState, TunnelShown, View,
+    AddonInfo, Alert, Capability, Command, Event, FOLDER_KIND, FormValue, Grant, GrantShown, Node,
+    NodeId, NodePatch, POSTGRES_KIND, Problem, Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND,
+    SessionId, SessionInfo, SessionKind, SessionState, TunnelShown, View,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, gio, glib, graphene};
@@ -61,6 +61,15 @@ pub enum NewKind {
     /// A kind owned by an addon.
     Addon(String),
 }
+
+/// The kinds Burrow knows itself: their id, what "New …" calls them, and
+/// what it creates.
+const BUILT_IN_KINDS: [(&str, &str, NewKind); 4] = [
+    (FOLDER_KIND, "folder", NewKind::Folder),
+    (SSH_HOST_KIND, "SSH host", NewKind::SshHost),
+    (SSH_TUNNEL_KIND, "SSH tunnel", NewKind::SshTunnel),
+    (POSTGRES_KIND, "PostgreSQL database", NewKind::Database),
+];
 
 #[derive(Clone, Debug)]
 pub enum AppMsg {
@@ -1197,21 +1206,36 @@ impl App {
     /// "New …" entries for folders, SSH hosts and the kinds of approved
     /// addons. `suffix` follows each label, such as " here".
     fn new_entries(&self, parent: Option<Option<NodeId>>, suffix: &str) -> Vec<(String, AppMsg)> {
-        let mut kinds = vec![
-            ("folder".to_string(), NewKind::Folder),
-            ("SSH host".to_string(), NewKind::SshHost),
-            ("SSH tunnel".to_string(), NewKind::SshTunnel),
-            ("PostgreSQL database".to_string(), NewKind::Database),
-        ];
+        let mut kinds: Vec<(String, NewKind)> = (BUILT_IN_KINDS.iter())
+            .map(|(_, label, kind)| (label.to_string(), kind.clone()))
+            .collect();
         for addon in self.addons.iter().filter(|a| addons::usable(a)) {
             for kind in &addon.kinds {
                 kinds.push((kind.label.clone(), NewKind::Addon(kind.kind.clone())));
             }
         }
+        // Each opens a dialog.
         kinds
             .into_iter()
-            .map(|(label, kind)| (format!("New {label}{suffix}"), AppMsg::New { kind, parent }))
+            .map(|(label, kind)| {
+                (
+                    format!("New {label}{suffix}…"),
+                    AppMsg::New { kind, parent },
+                )
+            })
             .collect()
+    }
+
+    /// What to call a node's kind, such as "SSH host": the raw kind only
+    /// when no addon names it.
+    fn kind_label(&self, kind: &str) -> String {
+        let built_in = BUILT_IN_KINDS.iter().find(|(id, ..)| *id == kind);
+        let label = built_in.map(|(_, label, _)| *label).or_else(|| {
+            (self.addons.iter().flat_map(|a| &a.kinds))
+                .find(|k| k.kind == kind)
+                .map(|k| k.label.as_str())
+        });
+        label.map_or_else(|| kind.to_string(), sentence_case)
     }
 
     /// Asks the node's addon for its view, or explains why it can't.
@@ -2212,8 +2236,8 @@ impl App {
             command("Toggle sidebar", AppMsg::ToggleSidebar),
             command("Reload config", AppMsg::ReloadConfig),
             command("Open config folder", AppMsg::OpenConfigFolder),
-            command("Manage addons", AppMsg::ManageAddons),
-            command("Settings", AppMsg::ShowSettings),
+            command("Manage addons…", AppMsg::ManageAddons),
+            command("Settings…", AppMsg::ShowSettings),
         ]);
         for addon in self.addons.iter().filter(|a| addons::usable(a)) {
             items.extend(addon.commands.iter().map(|c| Item {
@@ -2257,12 +2281,14 @@ impl App {
         items.extend(nodes.into_iter().map(|node| {
             Item {
                 title: node.name.clone(),
-                subtitle: [node.kind.as_str(), &sidebar::location(&self.nodes, node)]
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(" · "),
+                subtitle: [
+                    self.kind_label(&node.kind),
+                    sidebar::location(&self.nodes, node),
+                ]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · "),
                 message: AppMsg::Open(node.id),
             }
         }));
@@ -2625,6 +2651,14 @@ fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 { one } else { many }
 }
 
+/// `text` with its first letter capitalised, as "Folder" for "folder".
+fn sentence_case(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
 /// Placeholder page for a node until its addon provides a real view.
 fn fill_page(page: &gtk::Box, node: &Node, nodes: &HashMap<NodeId, Node>) {
     while let Some(child) = page.first_child() {
@@ -2717,7 +2751,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
             ("Reload config", AppMsg::ReloadConfig),
             ("Open config folder", AppMsg::OpenConfigFolder),
             ("Addons…", AppMsg::ManageAddons),
-            ("Settings    Ctrl+,", AppMsg::ShowSettings),
+            ("Settings…    Ctrl+,", AppMsg::ShowSettings),
         ],
         sender,
     )));
@@ -2996,6 +3030,13 @@ mod tests {
             session: SessionId(7),
         };
         assert_eq!(command_name(&close), "close_session");
+    }
+
+    #[test]
+    fn kind_labels_start_with_a_capital() {
+        assert_eq!(sentence_case("folder"), "Folder");
+        assert_eq!(sentence_case("SSH host"), "SSH host");
+        assert_eq!(sentence_case(""), "");
     }
 
     #[test]

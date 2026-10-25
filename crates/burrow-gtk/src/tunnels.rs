@@ -4,11 +4,13 @@
 //! by autostart or by another client shows up the same as one started
 //! here.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use burrow_core::{Node, NodeId, SessionId, SessionState};
 use relm4::gtk;
+use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
 use crate::dialogs;
@@ -329,6 +331,47 @@ pub fn edit(
     show_target(&kind);
     kind.connect_selected_notify(show_target);
 
+    // A port forward's local port follows the destination port until the
+    // user picks one, and a proxy's is 1080. Editing a tunnel keeps the
+    // port it has.
+    let local_picked = Rc::new(Cell::new(port.is_some()));
+    let following = Rc::new(Cell::new(false));
+    let follow = Rc::new(glib::clone!(
+        #[weak]
+        kind,
+        #[weak]
+        port_entry,
+        #[weak]
+        target_port_entry,
+        #[strong]
+        local_picked,
+        #[strong]
+        following,
+        move || {
+            if local_picked.get() {
+                return;
+            }
+            let local = if kind.selected() == 0 {
+                local_port_for(target_port_entry.value() as u16)
+            } else {
+                1080
+            };
+            following.set(true);
+            port_entry.set_value(f64::from(local));
+            following.set(false);
+        }
+    ));
+    port_entry.connect_value_changed(move |_| {
+        if !following.get() {
+            local_picked.set(true);
+        }
+    });
+    target_port_entry.connect_value_changed({
+        let follow = follow.clone();
+        move |_| follow()
+    });
+    kind.connect_selected_notify(move |_| follow());
+
     let note = gtk::Label::new(Some(
         "The tunnel listens on this computer only. Programs connect to the local port, \
          and the SSH host makes the onward connection.",
@@ -365,6 +408,11 @@ pub fn edit(
 
     let submit = Rc::new({
         let (window, name, error) = (window.clone(), name.clone(), error.clone());
+        let (target_entry, port_entry, target_port_entry) = (
+            target_entry.clone(),
+            port_entry.clone(),
+            target_port_entry.clone(),
+        );
         move || {
             let fail = |message: &str| {
                 error.set_label(message);
@@ -402,7 +450,14 @@ pub fn edit(
         let submit = submit.clone();
         move |_| submit()
     });
-    name.connect_activate(move |_| submit());
+    for entry in [&name, &target_entry] {
+        let submit = submit.clone();
+        entry.connect_activate(move |_| submit());
+    }
+    for entry in [&port_entry, &target_port_entry] {
+        let submit = submit.clone();
+        entry.connect_activate(move |_| submit());
+    }
     cancel.connect_clicked({
         let window = window.clone();
         move |_| window.close()
@@ -411,6 +466,13 @@ pub fn edit(
 
     window.present();
     name.grab_focus();
+}
+
+/// The local port to suggest for forwarding `target`: the same port, so
+/// programs find the service where they expect it, except below 1024,
+/// where only root may listen, so 80 becomes 8080.
+fn local_port_for(target: u16) -> u16 {
+    if target < 1024 { target + 8000 } else { target }
 }
 
 fn port_button(value: u16) -> gtk::SpinButton {
@@ -458,6 +520,14 @@ mod tests {
             Settings::from_props(&props),
             (Some(via), Some(5433), Some(("db.internal".into(), 5432)))
         );
+    }
+
+    #[test]
+    fn forwards_suggest_the_destination_port_where_one_may_listen() {
+        assert_eq!(local_port_for(5432), 5432);
+        assert_eq!(local_port_for(1024), 1024);
+        assert_eq!(local_port_for(80), 8080);
+        assert_eq!(local_port_for(443), 8443);
     }
 
     #[test]
