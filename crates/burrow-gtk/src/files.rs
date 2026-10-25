@@ -469,106 +469,8 @@ impl Files {
                     sender,
                 );
             }
-            Msg::Download => {
-                let Some(entry) = self.selected() else { return };
-                // The server's name becomes part of a local path here.
-                let name = match checked_name(&entry.name) {
-                    Ok(name) => name.to_string(),
-                    Err(error) => return self.show_error(Some(&error)),
-                };
-                let remote = join(&self.path, &entry.name);
-                let is_dir = entry.kind == FileKind::Dir;
-                let dialog = gtk::FileDialog::builder()
-                    .title(format!("Download “{}” to", printable(&name)))
-                    .accept_label("Download here")
-                    .modal(true)
-                    .build();
-                let (window, sender) = (window.clone(), sender.clone());
-                dialog.select_folder(
-                    Some(&window.clone()),
-                    None::<&gio::Cancellable>,
-                    move |result| {
-                        let Ok(folder) = result else { return };
-                        let Some(folder) = folder.path() else {
-                            let msg = Msg::Failed("Pick a folder on this computer.".into());
-                            return sender.input(AppMsg::Files { node, msg });
-                        };
-                        let local = folder.join(&name);
-                        let exists = local.symlink_metadata().is_ok();
-                        let download = move |overwrite| {
-                            let (remote, local) = (remote.clone(), local.clone());
-                            let msg = Msg::DownloadTo {
-                                remote,
-                                local,
-                                overwrite,
-                            };
-                            sender.input(AppMsg::Files { node, msg });
-                        };
-                        if exists {
-                            let (heading, detail, confirm) =
-                                replace_question(&name, is_dir, "folder");
-                            dialogs::confirm(&window, &heading, detail, confirm, move || {
-                                download(true)
-                            });
-                        } else {
-                            download(false);
-                        }
-                    },
-                );
-            }
-            Msg::Upload { folder } => {
-                let dialog = gtk::FileDialog::builder()
-                    .title(if folder {
-                        "Upload a folder"
-                    } else {
-                        "Upload a file"
-                    })
-                    .accept_label("Upload")
-                    .modal(true)
-                    .build();
-                let (dir, sender) = (self.path.clone(), sender.clone());
-                let names: Vec<String> = self.entries.iter().map(|e| e.name.clone()).collect();
-                let picked = {
-                    let window = window.clone();
-                    move |result: Result<gio::File, glib::Error>| {
-                        let Ok(file) = result else { return };
-                        let fail = |error: &str| {
-                            let msg = Msg::Failed(error.into());
-                            sender.input(AppMsg::Files { node, msg });
-                        };
-                        let Some(local) = file.path() else {
-                            return fail("Pick a file on this computer.");
-                        };
-                        let Some(name) = upload_name(&local) else {
-                            return fail("Burrow can only upload names that are valid UTF-8.");
-                        };
-                        let remote = join(&dir, &name);
-                        let upload = move |overwrite| {
-                            let (local, remote) = (local.clone(), remote.clone());
-                            let msg = Msg::UploadFrom {
-                                local,
-                                remote,
-                                overwrite,
-                            };
-                            sender.input(AppMsg::Files { node, msg });
-                        };
-                        if names.contains(&name) {
-                            let (heading, detail, confirm) =
-                                replace_question(&name, folder, "folder on the server");
-                            dialogs::confirm(&window, &heading, detail, confirm, move || {
-                                upload(true)
-                            });
-                        } else {
-                            upload(false);
-                        }
-                    }
-                };
-                if folder {
-                    dialog.select_folder(Some(window), None::<&gio::Cancellable>, picked);
-                } else {
-                    dialog.open(Some(window), None::<&gio::Cancellable>, picked);
-                }
-            }
+            Msg::Download => self.download(window, sender),
+            Msg::Upload { folder } => self.upload(folder, window, sender),
             Msg::DownloadTo {
                 remote,
                 local,
@@ -643,6 +545,109 @@ impl Files {
     /// Whether the transfer is shown here.
     pub fn has_transfer(&self, transfer: TransferId) -> bool {
         self.transfers.contains_key(&transfer)
+    }
+
+    /// Asks where to save the selected entry, then starts the download,
+    /// asking again before replacing what is there.
+    fn download(&self, window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) {
+        let node = self.node;
+        let Some(entry) = self.selected() else { return };
+        // The server's name becomes part of a local path here.
+        let name = match checked_name(&entry.name) {
+            Ok(name) => name.to_string(),
+            Err(error) => return self.show_error(Some(&error)),
+        };
+        let remote = join(&self.path, &entry.name);
+        let is_dir = entry.kind == FileKind::Dir;
+        let dialog = gtk::FileDialog::builder()
+            .title(format!("Download “{}” to", printable(&name)))
+            .accept_label("Download here")
+            .modal(true)
+            .build();
+        let (window, sender) = (window.clone(), sender.clone());
+        dialog.select_folder(
+            Some(&window.clone()),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Ok(folder) = result else { return };
+                let Some(folder) = folder.path() else {
+                    let msg = Msg::Failed("Pick a folder on this computer.".into());
+                    return sender.input(AppMsg::Files { node, msg });
+                };
+                let local = folder.join(&name);
+                let exists = local.symlink_metadata().is_ok();
+                let download = move |overwrite| {
+                    let (remote, local) = (remote.clone(), local.clone());
+                    let msg = Msg::DownloadTo {
+                        remote,
+                        local,
+                        overwrite,
+                    };
+                    sender.input(AppMsg::Files { node, msg });
+                };
+                if exists {
+                    let (heading, detail, confirm) = replace_question(&name, is_dir, "folder");
+                    dialogs::confirm(&window, &heading, detail, confirm, move || download(true));
+                } else {
+                    download(false);
+                }
+            },
+        );
+    }
+
+    /// Asks for a file, or a folder, to put in the current folder, then
+    /// starts the upload, asking again before replacing what is there.
+    fn upload(&self, folder: bool, window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) {
+        let node = self.node;
+        let dialog = gtk::FileDialog::builder()
+            .title(if folder {
+                "Upload a folder"
+            } else {
+                "Upload a file"
+            })
+            .accept_label("Upload")
+            .modal(true)
+            .build();
+        let (dir, sender) = (self.path.clone(), sender.clone());
+        let names: Vec<String> = self.entries.iter().map(|e| e.name.clone()).collect();
+        let picked = {
+            let window = window.clone();
+            move |result: Result<gio::File, glib::Error>| {
+                let Ok(file) = result else { return };
+                let fail = |error: &str| {
+                    let msg = Msg::Failed(error.into());
+                    sender.input(AppMsg::Files { node, msg });
+                };
+                let Some(local) = file.path() else {
+                    return fail("Pick a file on this computer.");
+                };
+                let Some(name) = upload_name(&local) else {
+                    return fail("Burrow can only upload names that are valid UTF-8.");
+                };
+                let remote = join(&dir, &name);
+                let upload = move |overwrite| {
+                    let (local, remote) = (local.clone(), remote.clone());
+                    let msg = Msg::UploadFrom {
+                        local,
+                        remote,
+                        overwrite,
+                    };
+                    sender.input(AppMsg::Files { node, msg });
+                };
+                if names.contains(&name) {
+                    let (heading, detail, confirm) =
+                        replace_question(&name, folder, "folder on the server");
+                    dialogs::confirm(&window, &heading, detail, confirm, move || upload(true));
+                } else {
+                    upload(false);
+                }
+            }
+        };
+        if folder {
+            dialog.select_folder(Some(window), None::<&gio::Cancellable>, picked);
+        } else {
+            dialog.open(Some(window), None::<&gio::Cancellable>, picked);
+        }
     }
 
     /// A transfer of this panel's session moved on.
