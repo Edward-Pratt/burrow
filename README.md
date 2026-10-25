@@ -41,7 +41,7 @@ git clone https://github.com/Edward-Pratt/burrow
 burrow/dist/install.sh
 ```
 
-The script keeps its own clone in `~/.local/share/burrow/src`. Run `burrow-update` to update now, `burrow-update --branch NAME` to follow another branch, and `journalctl --user -u burrow-update` to see how the last update went. It builds and installs whatever lands on the branch without asking, so anyone who can push there can run code on your computer. To remove it, run `systemctl --user disable --now burrow-update.timer`, then delete `~/.local/bin/{burrow,burrowd,burrow-gtk,burrow-update}`, `~/.local/lib/burrow`, `~/.local/share/burrow/src` and the `burrow*` units in `~/.local/share/systemd/user`.
+The script keeps its own clone in `~/.local/share/burrow/src`. Run `burrow-update` to update now, `burrow-update --branch NAME` to follow another branch, and `journalctl --user -u burrow-update` to see how the last update went. It builds and installs whatever lands on the branch without asking, so anyone who can push there can run code on your computer. To remove it, run `systemctl --user disable --now burrow-update.timer`, then delete `~/.local/bin/{burrow,burrowd,burrow-gtk,burrow-update}`, `~/.local/lib/burrow`, `~/.local/share/burrow/src`, `~/.local/share/icons/hicolor/scalable/apps/dev.burrow.Burrow.svg` and the `burrow*` units in `~/.local/share/systemd/user`.
 
 Anywhere else, build it from the checkout. If a library is missing, `cargo build` names it.
 

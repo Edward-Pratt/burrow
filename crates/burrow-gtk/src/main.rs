@@ -39,6 +39,9 @@ fn main() {
 
     let app = relm4::RelmApp::new(APP_ID);
     relm4::set_global_css(include_str!("style.css"));
+    // Wayland shells take the icon from the desktop entry, but X11 window
+    // managers read it from the window.
+    gtk::Window::set_default_icon_name(APP_ID);
     app.run::<app::App>(app::Init { core, config_dir });
 }
 

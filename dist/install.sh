@@ -100,6 +100,7 @@ for arch in "${agents[@]}"; do
   put 755 "target/$arch-unknown-linux-musl/agent/burrow-agent" "$lib/burrow-agent-$arch"
 done
 put 755 dist/install.sh "$bin/burrow-update"
+put 644 dist/icons/dev.burrow.Burrow.svg "$data/icons/hicolor/scalable/apps/dev.burrow.Burrow.svg"
 # Launchers don't search ~/.local/bin, and neither does systemd.
 edit "s|^Exec=burrow-gtk|Exec=$bin/burrow-gtk|" \
   dist/dev.burrow.Burrow.desktop "$data/applications/dev.burrow.Burrow.desktop"
