@@ -17,16 +17,15 @@ use std::time::{Duration, Instant};
 use burrow_core::ipc::Client;
 use burrow_core::monitor::{Sample, Unit};
 use burrow_core::{
-    Alert, AlertKind, Command, MonitorHistory, NodeId, Response, SessionId, SessionState,
-    TrendRange,
+    Alert, AlertKind, Command, MonitorHistory, NodeId, Response, SessionState, TrendRange,
 };
 use relm4::gtk::prelude::*;
 use relm4::{ComponentSender, gtk};
 
 use crate::app::{App, AppMsg};
 use crate::files::{printable, size};
-use crate::remote::State;
 use crate::runtime::runtime;
+use crate::session::{self, SessionPage};
 
 /// Samples the charts show: ten minutes, at one every 2 seconds.
 const CHART_POINTS: usize = 300;
@@ -48,17 +47,14 @@ const TREND_REFRESH: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub enum Msg {
-    /// The core accepted `open_monitor`.
-    Started(SessionId),
-    /// `open_monitor` itself failed.
-    StartFailed(String),
+    /// `open_monitor` and what follows.
+    Session(session::Msg),
     /// What the monitor had seen before the tab joined it, which a
     /// background monitor has: whether systemd runs there, the latest
     /// services, and samples for the charts.
     History(MonitorHistory),
     /// The service filter or "failed only" changed.
     Filter,
-    Reconnect,
     /// The user turned "Monitor in the background" on or off. The window
     /// asks first, since it knows the host.
     SetBackground(bool),
@@ -72,10 +68,7 @@ pub enum Msg {
 pub struct Monitor {
     node: NodeId,
     pub page: gtk::Box,
-    pub state: State,
-    stack: gtk::Stack,
-    message: gtk::Label,
-    reconnect: gtk::Button,
+    pub session: SessionPage,
     summary: gtk::Label,
     cpu: Chart,
     cpu_label: gtk::Label,
@@ -233,35 +226,13 @@ impl Monitor {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
 
-        let message = gtk::Label::new(Some("Connecting…"));
-        message.set_wrap(true);
-        message.set_max_width_chars(60);
-        message.set_selectable(true);
-        let reconnect = gtk::Button::with_label("Reconnect");
-        reconnect.connect_clicked({
-            let send = send(Msg::Reconnect);
-            move |_| send()
-        });
-        reconnect.set_halign(gtk::Align::Center);
-        reconnect.set_visible(false);
-        let message_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        message_page.set_valign(gtk::Align::Center);
-        message_page.append(&message);
-        message_page.append(&reconnect);
-
-        let stack = gtk::Stack::new();
-        stack.add_named(&scroller, Some("content"));
-        stack.add_named(&message_page, Some("message"));
-        stack.set_visible_child_name("message");
-        page.append(&stack);
+        let session = SessionPage::new(&scroller, send(Msg::Session(session::Msg::Reconnect)));
+        page.append(session.widget());
 
         Monitor {
             node,
             page,
-            state: State::Starting,
-            stack,
-            message,
-            reconnect,
+            session,
             summary,
             cpu,
             cpu_label,
@@ -315,32 +286,17 @@ impl Monitor {
         self.alerts.set_visible(!alerts.is_empty());
     }
 
-    fn show_message(&self, text: &str, can_reconnect: bool) {
-        self.message.set_label(text);
-        self.reconnect.set_visible(can_reconnect);
-        self.stack.set_visible_child_name("message");
-    }
-
     pub fn session_changed(
         &mut self,
         state: &SessionState,
         core: &Client,
         sender: &ComponentSender<App>,
     ) {
-        match state {
-            SessionState::Connecting { step } => self.show_message(&format!("{step}…"), false),
-            SessionState::Connected => {
-                self.show_message("Waiting for the first sample…", false);
-                self.fetch_history(core, sender);
-            }
-            SessionState::Closed { error } => {
-                self.state = State::Closed;
-                let text = match error {
-                    Some(error) => format!("The monitor stopped: {}", printable(error)),
-                    None => "The monitor stopped.".into(),
-                };
-                self.show_message(&text, true);
-            }
+        let ended = |error: Option<&str>| session::ended("The monitor stopped", error);
+        if self.session.session_changed(state, ended) {
+            self.session
+                .show_message("Waiting for the first sample…", false);
+            self.fetch_history(core, sender);
         }
     }
 
@@ -348,7 +304,7 @@ impl Monitor {
     /// in the history, and so are the services of a monitor that was
     /// running before the tab joined it.
     pub fn fetch_history(&self, core: &Client, sender: &ComponentSender<App>) {
-        let State::Running(session) = self.state else {
+        let Some(session) = self.session.running() else {
             return;
         };
         let (core, node, input) = (core.clone(), self.node, sender.input_sender().clone());
@@ -363,7 +319,7 @@ impl Monitor {
     }
 
     pub fn sample(&mut self, sample: &Sample, core: &Client, sender: &ComponentSender<App>) {
-        self.stack.set_visible_child_name("content");
+        self.session.show_content();
         if let Some(range) = self.range
             && self
                 .trend_read
@@ -545,10 +501,12 @@ impl Monitor {
     pub fn update(&mut self, msg: Msg, core: &Client, sender: &ComponentSender<App>) {
         match msg {
             // Handled by the window, which knows the other sessions.
-            Msg::Started(_) => {}
-            Msg::StartFailed(error) => {
-                self.state = State::Closed;
-                self.show_message(&printable(&error), true);
+            Msg::Session(session::Msg::Started(_)) => {}
+            Msg::Session(session::Msg::StartFailed(error)) => self.session.start_failed(&error),
+            Msg::Session(session::Msg::Reconnect) => {
+                if self.session.reconnect() {
+                    start(core, self.node, sender);
+                }
             }
             Msg::History(history) => {
                 self.systemd = history.systemd;
@@ -585,29 +543,17 @@ impl Monitor {
                     self.show_trend(range, &points);
                 }
             }
-            Msg::Reconnect => {
-                if self.state == State::Closed {
-                    self.state = State::Starting;
-                    self.show_message("Connecting…", false);
-                    start(core, self.node, sender);
-                }
-            }
         }
     }
 }
 
-/// Asks the core for a monitor on `node`. The reply arrives as
-/// [`Msg::Started`] or [`Msg::StartFailed`].
+/// Asks the core for a monitor on `node`.
 pub fn start(core: &Client, node: NodeId, sender: &ComponentSender<App>) {
-    let (core, input) = (core.clone(), sender.input_sender().clone());
-    runtime().spawn(async move {
-        let msg = match core.execute(Command::OpenMonitor { node }).await {
-            Ok(Response::Session { session }) => Msg::Started(session),
-            Ok(other) => Msg::StartFailed(format!("unexpected reply {other:?}")),
-            Err(e) => Msg::StartFailed(e.to_string()),
-        };
-        let _ = input.send(AppMsg::Monitor { node, msg });
-    });
+    let wrap = move |msg| AppMsg::Monitor {
+        node,
+        msg: Msg::Session(msg),
+    };
+    session::start(core, Command::OpenMonitor { node }, sender, wrap);
 }
 
 fn unit_row(unit: &Unit) -> gtk::Box {

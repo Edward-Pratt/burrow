@@ -32,6 +32,7 @@ use crate::monitor::{self, Monitor};
 use crate::palette::{self, Item};
 use crate::remote::{self, Remote, Unclaimed};
 use crate::runtime::runtime;
+use crate::session;
 use crate::settings::{Theme, UiSettings};
 use crate::sidebar;
 use crate::terminal;
@@ -616,8 +617,8 @@ impl Component for App {
             AppMsg::TerminalExited(id) => self.close_tab(TabKey::Terminal(id), widgets),
             AppMsg::SessionStarted { node, session } => {
                 match self.remotes.get_mut(&node) {
-                    Some(remote) if remote.state == remote::State::Starting => {
-                        remote.state = remote::State::Running(session);
+                    Some(remote) if remote.state == session::State::Starting => {
+                        remote.state = session::State::Running(session);
                         // Sizes seen while starting had no session to go to.
                         let (cols, rows) = terminal::size(&remote.terminal);
                         execute(
@@ -640,7 +641,7 @@ impl Component for App {
             AppMsg::SessionFailed { node, error } => {
                 if let Some(remote) = self.remotes.get_mut(&node) {
                     remote.terminal.feed(remote::failure(&error).as_bytes());
-                    remote.state = remote::State::Closed;
+                    remote.state = session::State::Closed;
                 }
             }
             AppMsg::SessionOutput { session, data } => {
@@ -652,7 +653,7 @@ impl Component for App {
                 if let Some(remote) = self
                     .remotes
                     .values_mut()
-                    .find(|r| r.state == remote::State::Running(session))
+                    .find(|r| r.state == session::State::Running(session))
                 {
                     remote.ending.output_ended = true;
                     remote.finish_if_done();
@@ -663,14 +664,14 @@ impl Component for App {
                     return;
                 };
                 match remote.state {
-                    remote::State::Running(session) => execute(
+                    session::State::Running(session) => execute(
                         &self.core,
                         &sender,
                         Command::WriteTerminal { session, data },
                     ),
-                    remote::State::Closed if data.contains(&b'\r') => {
+                    session::State::Closed if data.contains(&b'\r') => {
                         remote.terminal.feed(b"\r\n");
-                        remote.state = remote::State::Starting;
+                        remote.state = session::State::Starting;
                         remote::start(&self.core, node, &remote.terminal, &sender);
                     }
                     _ => {}
@@ -678,7 +679,7 @@ impl Component for App {
             }
             AppMsg::RemoteResize { node, cols, rows } => {
                 if let Some(&Remote {
-                    state: remote::State::Running(session),
+                    state: session::State::Running(session),
                     ..
                 }) = self.remotes.get(&node)
                 {
@@ -700,10 +701,10 @@ impl Component for App {
             AppMsg::OpenFiles(id) => self.open_files(id, widgets, &sender),
             AppMsg::Files {
                 node,
-                msg: files::Msg::Started(session),
+                msg: files::Msg::Session(session::Msg::Started(session)),
             } => match self.files.get_mut(&node) {
-                Some(panel) if panel.state == remote::State::Starting => {
-                    panel.state = remote::State::Running(session);
+                Some(panel) if panel.session.state == session::State::Starting => {
+                    panel.session.state = session::State::Running(session);
                     for event in self.unclaimed.claim(session) {
                         self.session_event(event, window, &sender);
                     }
@@ -719,10 +720,10 @@ impl Component for App {
             AppMsg::OpenMonitor(id) => self.open_monitor(id, widgets, &sender),
             AppMsg::Monitor {
                 node,
-                msg: monitor::Msg::Started(session),
+                msg: monitor::Msg::Session(session::Msg::Started(session)),
             } => match self.monitors.get_mut(&node) {
-                Some(panel) if panel.state == remote::State::Starting => {
-                    panel.state = remote::State::Running(session);
+                Some(panel) if panel.session.state == session::State::Starting => {
+                    panel.session.state = session::State::Running(session);
                     // A background monitor may have connected long ago,
                     // so no "connected" event is coming.
                     panel.fetch_history(&self.core, &sender);
@@ -764,10 +765,10 @@ impl Component for App {
             AppMsg::EditTunnel(node) => self.edit_tunnel(Some(node), None, window, &sender),
             AppMsg::Database {
                 node,
-                msg: database::Msg::Started(session),
+                msg: database::Msg::Session(session::Msg::Started(session)),
             } => match self.databases.get_mut(&node) {
-                Some(panel) if panel.state == remote::State::Starting => {
-                    panel.state = remote::State::Running(session);
+                Some(panel) if panel.session.state == session::State::Starting => {
+                    panel.session.state = session::State::Running(session);
                     for event in self.unclaimed.claim(session) {
                         self.session_event(event, window, &sender);
                     }
@@ -1022,11 +1023,19 @@ impl App {
         // by the reload; the rest are only known here.
         let ended: Vec<(NodeId, SessionId)> = (self.remotes.iter())
             .map(|(node, r)| (*node, &r.state))
-            .chain(self.files.iter().map(|(node, p)| (*node, &p.state)))
-            .chain(self.monitors.iter().map(|(node, p)| (*node, &p.state)))
-            .chain(self.databases.iter().map(|(node, p)| (*node, &p.state)))
+            .chain(self.files.iter().map(|(node, p)| (*node, &p.session.state)))
+            .chain(
+                self.monitors
+                    .iter()
+                    .map(|(node, p)| (*node, &p.session.state)),
+            )
+            .chain(
+                self.databases
+                    .iter()
+                    .map(|(node, p)| (*node, &p.session.state)),
+            )
             .filter_map(|(node, state)| match state {
-                remote::State::Running(session) => Some((node, *session)),
+                session::State::Running(session) => Some((node, *session)),
                 _ => None,
             })
             .collect();
@@ -1157,14 +1166,22 @@ impl App {
             Event::MonitorSample {
                 session, sample, ..
             } => {
-                let running = remote::State::Running(session);
-                if let Some(panel) = self.monitors.values_mut().find(|p| p.state == running) {
+                let running = session::State::Running(session);
+                if let Some(panel) = self
+                    .monitors
+                    .values_mut()
+                    .find(|p| p.session.state == running)
+                {
                     panel.sample(&sample, &self.core, sender);
                 }
             }
             Event::MonitorUnits { session, units, .. } => {
-                let running = remote::State::Running(session);
-                if let Some(panel) = self.monitors.values_mut().find(|p| p.state == running) {
+                let running = session::State::Running(session);
+                if let Some(panel) = self
+                    .monitors
+                    .values_mut()
+                    .find(|p| p.session.state == running)
+                {
                     panel.set_units(units);
                 }
             }
@@ -1179,11 +1196,11 @@ impl App {
             } => {
                 // A transfer's last events can come after its session
                 // ended, so the panel showing it comes first.
-                let running = remote::State::Running(session);
+                let running = session::State::Running(session);
                 let panel = self
                     .files
                     .values_mut()
-                    .find(|p| p.has_transfer(transfer) || p.state == running);
+                    .find(|p| p.has_transfer(transfer) || p.session.state == running);
                 if let Some(panel) = panel {
                     panel.transfer_changed(transfer, &state, &self.core, sender);
                 }
@@ -1341,7 +1358,7 @@ impl App {
     fn remote_for(&self, session: SessionId) -> Option<&Remote> {
         self.remotes
             .values()
-            .find(|r| r.state == remote::State::Running(session))
+            .find(|r| r.state == session::State::Running(session))
     }
 
     fn session_event(
@@ -1373,8 +1390,12 @@ impl App {
             self.ask(session, &prompt, window, sender);
             return;
         }
-        let running = remote::State::Running(session);
-        if let Some(panel) = self.databases.values_mut().find(|p| p.state == running) {
+        let running = session::State::Running(session);
+        if let Some(panel) = self
+            .databases
+            .values_mut()
+            .find(|p| p.session.state == running)
+        {
             match event {
                 Event::SessionChanged { state, .. } => {
                     panel.session_changed(&state, &self.core, sender)
@@ -1384,7 +1405,11 @@ impl App {
             }
             return;
         }
-        if let Some(panel) = self.monitors.values_mut().find(|p| p.state == running) {
+        if let Some(panel) = self
+            .monitors
+            .values_mut()
+            .find(|p| p.session.state == running)
+        {
             match event {
                 Event::SessionChanged { state, .. } => {
                     panel.session_changed(&state, &self.core, sender)
@@ -1394,7 +1419,7 @@ impl App {
             }
             return;
         }
-        if let Some(panel) = self.files.values_mut().find(|p| p.state == running) {
+        if let Some(panel) = self.files.values_mut().find(|p| p.session.state == running) {
             match event {
                 Event::SessionChanged { state, .. } => {
                     panel.session_changed(&state, &self.core, sender)
@@ -1407,7 +1432,7 @@ impl App {
         let Some(remote) = self
             .remotes
             .values_mut()
-            .find(|r| r.state == remote::State::Running(session))
+            .find(|r| r.state == session::State::Running(session))
         else {
             // A prompt from a session nobody here started, such as a
             // tunnel that started with Burrow before its first event
@@ -1966,12 +1991,12 @@ impl App {
                 .remotes
                 .remove(&id)
                 .map(|r| r.state)
-                .or_else(|| self.databases.remove(&id).map(|d| d.state)),
-            TabKey::Files(id) => self.files.remove(&id).map(|f| f.state),
-            TabKey::Monitor(id) => self.monitors.remove(&id).map(|m| m.state),
+                .or_else(|| self.databases.remove(&id).map(|d| d.session.state)),
+            TabKey::Files(id) => self.files.remove(&id).map(|f| f.session.state),
+            TabKey::Monitor(id) => self.monitors.remove(&id).map(|m| m.session.state),
             TabKey::Terminal(_) => None,
         };
-        if let Some(remote::State::Running(session)) = state {
+        if let Some(session::State::Running(session)) = state {
             let core = self.core.clone();
             runtime().spawn(async move {
                 let _ = core.execute(Command::CloseSession { session }).await;
@@ -2356,7 +2381,7 @@ impl App {
     /// sessions when it goes.
     fn close_window(&self, window: &gtk::ApplicationWindow) {
         let remote = (self.remotes.values())
-            .filter(|r| matches!(r.state, remote::State::Running(_)))
+            .filter(|r| matches!(r.state, session::State::Running(_)))
             .count();
         let local = (self.tabs.keys())
             .filter(|key| matches!(key, TabKey::Terminal(_)))

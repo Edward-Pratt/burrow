@@ -20,8 +20,8 @@ use relm4::{ComponentSender, gtk};
 
 use crate::app::{App, AppMsg};
 use crate::dialogs;
-use crate::remote::State;
 use crate::runtime::runtime;
+use crate::session::{self, SessionPage, State};
 
 /// Rows drawn before the rest of a folder is summed up. A list of widgets
 /// gets slow long before a folder gets this big.
@@ -32,10 +32,8 @@ const DONE_TIME: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Debug)]
 pub enum Msg {
-    /// The core accepted `open_files`.
-    Started(SessionId),
-    /// `open_files` itself failed.
-    StartFailed(String),
+    /// `open_files` and what follows.
+    Session(session::Msg),
     Listed {
         path: String,
         entries: Vec<FileEntry>,
@@ -83,24 +81,20 @@ pub enum Msg {
     /// A transfer's button: cancel while it runs, dismiss once it failed.
     TransferButton(TransferId),
     Dismiss(TransferId),
-    Reconnect,
 }
 
 /// One SSH host's file panel.
 pub struct Files {
     node: NodeId,
     pub page: gtk::Box,
-    pub state: State,
+    pub session: SessionPage,
     /// The folder shown, as the server names it. Empty until the first
     /// listing arrives.
     path: String,
     /// The entries shown, in row order.
     entries: Vec<FileEntry>,
     path_entry: gtk::Entry,
-    stack: gtk::Stack,
     list: gtk::ListBox,
-    message: gtk::Label,
-    reconnect: gtk::Button,
     error: gtk::Label,
     /// Buttons that act on the selected entry.
     on_selection: Vec<gtk::Button>,
@@ -248,23 +242,8 @@ impl Files {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
 
-        let message = gtk::Label::new(Some("Connecting…"));
-        message.set_wrap(true);
-        message.set_max_width_chars(60);
-        message.set_selectable(true);
-        let reconnect = button("Reconnect", Msg::Reconnect);
-        reconnect.set_halign(gtk::Align::Center);
-        reconnect.set_visible(false);
-        let message_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        message_page.set_valign(gtk::Align::Center);
-        message_page.append(&message);
-        message_page.append(&reconnect);
-
-        let stack = gtk::Stack::new();
-        stack.add_named(&scroller, Some("list"));
-        stack.add_named(&message_page, Some("message"));
-        stack.set_visible_child_name("message");
-        page.append(&stack);
+        let session = SessionPage::new(&scroller, send(Msg::Session(session::Msg::Reconnect)));
+        page.append(session.widget());
 
         let transfers_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
         page.append(&transfers_box);
@@ -272,26 +251,16 @@ impl Files {
         Files {
             node,
             page,
-            state: State::Starting,
+            session,
             path: String::new(),
             entries: Vec::new(),
             path_entry,
-            stack,
             list,
-            message,
-            reconnect,
             error,
             on_selection,
             transfers_box,
             transfers: HashMap::new(),
         }
-    }
-
-    /// Shows a message in place of the list.
-    fn show_message(&self, text: &str, can_reconnect: bool) {
-        self.message.set_label(text);
-        self.reconnect.set_visible(can_reconnect);
-        self.stack.set_visible_child_name("message");
     }
 
     fn show_error(&self, error: Option<&str>) {
@@ -306,23 +275,17 @@ impl Files {
         core: &Client,
         sender: &ComponentSender<App>,
     ) {
-        match state {
-            SessionState::Connecting { step } => self.show_message(&format!("{step}…"), false),
-            SessionState::Connected => self.list_dir(self.path.clone(), core, sender),
-            SessionState::Closed { error } => {
-                self.state = State::Closed;
-                // The core cancels them, but their last events can arrive
-                // after this, or not at all.
-                for row in self.transfers.values_mut().filter(|row| !row.ended) {
-                    row.stop("stopped: the connection ended");
-                    row.redraw();
-                }
-                let text = match error {
-                    Some(error) => format!("The connection ended: {}", printable(error)),
-                    None => "The connection ended.".into(),
-                };
-                self.show_message(&text, true);
+        if matches!(state, SessionState::Closed { .. }) {
+            // The core cancels them, but their last events can arrive
+            // after this, or not at all.
+            for row in self.transfers.values_mut().filter(|row| !row.ended) {
+                row.stop("stopped: the connection ended");
+                row.redraw();
             }
+        }
+        let ended = |error: Option<&str>| session::ended("The connection ended", error);
+        if self.session.session_changed(state, ended) {
+            self.list_dir(self.path.clone(), core, sender);
         }
     }
 
@@ -338,10 +301,13 @@ impl Files {
         let node = self.node;
         match msg {
             // Handled by the window, which knows the other sessions.
-            Msg::Started(_) => {}
-            Msg::StartFailed(error) => {
-                self.state = State::Closed;
-                self.show_message(&printable(&error), true);
+            Msg::Session(session::Msg::Started(_)) => {}
+            Msg::Session(session::Msg::StartFailed(error)) => self.session.start_failed(&error),
+            Msg::Session(session::Msg::Reconnect) => {
+                if self.session.reconnect() {
+                    self.show_error(None);
+                    start(core, node, sender);
+                }
             }
             Msg::Listed { path, entries } => {
                 self.show_error(None);
@@ -354,7 +320,7 @@ impl Files {
                 self.path_entry.set_text(&printable(&self.path));
                 self.entries = sorted(entries);
                 self.fill_list(keep.as_deref());
-                self.stack.set_visible_child_name("list");
+                self.session.show_content();
             }
             Msg::Failed(error) => self.show_error(Some(&printable(&error))),
             Msg::GoTyped => {
@@ -506,7 +472,7 @@ impl Files {
                 session,
                 label,
             } => {
-                let gone = self.state != State::Running(session);
+                let gone = self.session.state != State::Running(session);
                 let row = self.transfer_row(transfer, sender);
                 row.what = Some(label);
                 // Its session ended before the reply came, so no more
@@ -529,14 +495,6 @@ impl Files {
             Msg::Dismiss(transfer) => {
                 if let Some(row) = self.transfers.remove(&transfer) {
                     self.transfers_box.remove(&row.row);
-                }
-            }
-            Msg::Reconnect => {
-                if self.state == State::Closed {
-                    self.state = State::Starting;
-                    self.show_error(None);
-                    self.show_message("Connecting…", false);
-                    start(core, node, sender);
                 }
             }
         }
@@ -750,7 +708,7 @@ impl Files {
 
     /// Lists `path`, or the home folder when it is empty.
     fn list_dir(&self, path: String, core: &Client, sender: &ComponentSender<App>) {
-        let State::Running(session) = self.state else {
+        let Some(session) = self.session.running() else {
             return;
         };
         let (core, input, node) = (core.clone(), sender.input_sender().clone(), self.node);
@@ -771,7 +729,7 @@ impl Files {
         core: &Client,
         sender: &ComponentSender<App>,
     ) {
-        let State::Running(session) = self.state else {
+        let Some(session) = self.session.running() else {
             return;
         };
         let command = command(session);
@@ -792,7 +750,7 @@ impl Files {
         core: &Client,
         sender: &ComponentSender<App>,
     ) {
-        let State::Running(session) = self.state else {
+        let Some(session) = self.session.running() else {
             return self.show_error(Some("Not connected."));
         };
         let command = command(session);
@@ -850,18 +808,13 @@ impl Files {
     }
 }
 
-/// Asks the core for an SFTP session on `node`. The reply arrives as
-/// [`Msg::Started`] or [`Msg::StartFailed`].
+/// Asks the core for an SFTP session on `node`.
 pub fn start(core: &Client, node: NodeId, sender: &ComponentSender<App>) {
-    let (core, input) = (core.clone(), sender.input_sender().clone());
-    runtime().spawn(async move {
-        let msg = match core.execute(Command::OpenFiles { node }).await {
-            Ok(Response::Session { session }) => Msg::Started(session),
-            Ok(other) => Msg::StartFailed(format!("unexpected reply {other:?}")),
-            Err(e) => Msg::StartFailed(e.to_string()),
-        };
-        let _ = input.send(AppMsg::Files { node, msg });
-    });
+    let wrap = move |msg| AppMsg::Files {
+        node,
+        msg: Msg::Session(msg),
+    };
+    session::start(core, Command::OpenFiles { node }, sender, wrap);
 }
 
 fn row(entry: &FileEntry) -> gtk::ListBoxRow {

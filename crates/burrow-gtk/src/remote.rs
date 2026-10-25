@@ -10,6 +10,7 @@ use vte4::TerminalExt;
 
 use crate::app::{App, AppMsg};
 use crate::runtime::runtime;
+use crate::session::State;
 use crate::terminal;
 
 /// Output is passed to the window in chunks of up to this many bytes, so a
@@ -59,15 +60,6 @@ impl Remote {
             self.ending = Ending::default();
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum State {
-    /// `open_terminal` was sent; its session id isn't known yet.
-    Starting,
-    Running(SessionId),
-    /// The last session ended. Enter starts a new one.
-    Closed,
 }
 
 /// Session events that arrived before the tab knew which session was its
