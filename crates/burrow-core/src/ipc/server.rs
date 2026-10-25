@@ -1,0 +1,332 @@
+//! The daemon's side of the socket.
+//!
+//! Each connection has a reader, which dispatches requests on tasks of
+//! their own, and a writer, the only task touching the socket's write half.
+//! The writer takes replies and events before terminal output, so a busy
+//! terminal cannot hold up the rest. Output waits instead, which slows the
+//! SSH channel rather than losing bytes.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use data_encoding::BASE64;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedWriteHalf;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{mpsc, watch};
+use tokio::task::AbortHandle;
+use zeroize::Zeroize;
+
+use super::{
+    BUILD, INVALID_PARAMS, Initialize, MAX_LINE, METHOD_NOT_FOUND, Role, SERVER_ERROR, ServerInfo,
+    read_line,
+};
+use crate::api::{API_VERSION, Command, Event, Response, SessionId};
+use crate::engine::Core;
+use crate::error::{Error, Result};
+
+/// Replies and events queued for a client before senders wait.
+const OUTBOX: usize = 64;
+
+/// Terminal output queued for a client, across all its sessions.
+const OUTPUT_QUEUE: usize = 16;
+
+/// Serves clients on `listener` until the task is dropped.
+pub async fn serve(core: Core, listener: UnixListener) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                tokio::spawn(connection(core.clone(), stream));
+            }
+            // Out of file descriptors, most likely. Waiting lets some close.
+            Err(e) => {
+                tracing::warn!("could not accept a client: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// The parts of a connection its tasks share.
+struct Conn {
+    core: Core,
+    role: OnceLock<Role>,
+    control: mpsc::Sender<String>,
+    output: mpsc::Sender<String>,
+    /// The output forwarders, by session. Aborting one drops the core's
+    /// stream, which ends the session.
+    forwarders: Mutex<HashMap<SessionId, AbortHandle>>,
+    /// Never sent on; tasks watch for it being dropped.
+    alive: watch::Receiver<()>,
+}
+
+async fn connection(core: Core, stream: UnixStream) {
+    match stream.peer_cred() {
+        Ok(peer) if peer.uid() == own_uid() => {}
+        Ok(peer) => {
+            tracing::warn!("refused a client running as uid {}", peer.uid());
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("refused a client whose user is unknown: {e}");
+            return;
+        }
+    }
+    let (read, write) = stream.into_split();
+    let (control, control_rx) = mpsc::channel(OUTBOX);
+    let (output, output_rx) = mpsc::channel(OUTPUT_QUEUE);
+    let (alive_tx, alive) = watch::channel(());
+    tokio::spawn(write_all(write, control_rx, output_rx));
+    let conn = Arc::new(Conn {
+        core,
+        role: OnceLock::new(),
+        control,
+        output,
+        forwarders: Mutex::default(),
+        alive,
+    });
+
+    let mut read = BufReader::new(read);
+    let mut line = Vec::new();
+    loop {
+        match read_line(&mut read, &mut line, MAX_LINE).await {
+            Ok(Some(())) => {}
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!("dropped a client: {e}");
+                break;
+            }
+        }
+        let message = serde_json::from_slice::<Message>(&line);
+        // Commands can carry secrets; this copy at least is not left behind.
+        line.zeroize();
+        match message {
+            Ok(message) => {
+                let conn = conn.clone();
+                // Requests run on their own task, so a slow command does not
+                // hold up the client's other requests.
+                tokio::spawn(async move { conn.handle(message).await });
+            }
+            Err(e) => tracing::warn!("ignoring a line that is not a request: {e}"),
+        }
+    }
+    for (_, forwarder) in conn.forwarders.lock().unwrap().drain() {
+        forwarder.abort();
+    }
+    drop(alive_tx);
+}
+
+#[derive(Deserialize)]
+struct Message {
+    id: Option<Value>,
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Deserialize)]
+struct SessionParams {
+    session: SessionId,
+}
+
+type Failure = (i64, String);
+
+impl Conn {
+    async fn handle(self: Arc<Self>, message: Message) {
+        let result = self.dispatch(&message.method, message.params).await;
+        // Notifications get no answer, not even an error.
+        let Some(id) = message.id else {
+            if let Err((_, error)) = result {
+                tracing::warn!("{}: {error}", message.method);
+            }
+            return;
+        };
+        let reply = match result {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Err((code, error)) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": code, "message": error},
+            }),
+        };
+        let _ = self.control.send(reply.to_string()).await;
+    }
+
+    async fn dispatch(&self, method: &str, params: Value) -> Result<Value, Failure> {
+        if method == "initialize" {
+            return self.initialize(parse(params)?);
+        }
+        let Some(&role) = self.role.get() else {
+            return Err((SERVER_ERROR, "send initialize first".to_string()));
+        };
+        match method {
+            "execute" => {
+                let command: Command = parse(params)?;
+                permit(role, &command).map_err(failed)?;
+                let response: Response = self.core.execute(command).await.map_err(failed)?;
+                Ok(serde_json::to_value(response).unwrap_or_default())
+            }
+            "take_output" => {
+                let SessionParams { session } = parse(params)?;
+                self.take_output(session).map_err(failed)?;
+                Ok(Value::Null)
+            }
+            "release_output" => {
+                let SessionParams { session } = parse(params)?;
+                if let Some(forwarder) = self.forwarders.lock().unwrap().remove(&session) {
+                    forwarder.abort();
+                }
+                Ok(Value::Null)
+            }
+            _ => Err((METHOD_NOT_FOUND, format!("unknown method {method:?}"))),
+        }
+    }
+
+    fn initialize(&self, hello: Initialize) -> Result<Value, Failure> {
+        if hello.api != API_VERSION {
+            return Err((
+                SERVER_ERROR,
+                format!(
+                    "this client needs API {}, but burrowd {BUILD} has API {API_VERSION}",
+                    hello.api
+                ),
+            ));
+        }
+        if self.role.set(hello.role).is_err() {
+            return Err((SERVER_ERROR, "already initialized".to_string()));
+        }
+        tokio::spawn(forward_events(
+            self.core.subscribe(),
+            self.control.clone(),
+            hello.role,
+            self.alive.clone(),
+        ));
+        let info = ServerInfo {
+            api: API_VERSION,
+            build: BUILD.to_string(),
+            addons_dir: self.core.addons_dir(),
+        };
+        Ok(serde_json::to_value(info).unwrap_or_default())
+    }
+
+    /// Passes a terminal's output on as `output` notifications, then
+    /// `output_ended`. Both go through the output queue so the end never
+    /// overtakes the last bytes.
+    fn take_output(&self, session: SessionId) -> Result<()> {
+        let mut stream = self.core.take_output(session)?;
+        let output = self.output.clone();
+        let mut alive = self.alive.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let message = tokio::select! {
+                    data = stream.recv() => match data {
+                        Some(data) => json!({
+                            "jsonrpc": "2.0",
+                            "method": "output",
+                            "params": {"session": session, "data": BASE64.encode(&data)},
+                        }),
+                        None => break,
+                    },
+                    _ = alive.changed() => return,
+                };
+                if output.send(message.to_string()).await.is_err() {
+                    return;
+                }
+            }
+            let ended = json!({
+                "jsonrpc": "2.0",
+                "method": "output_ended",
+                "params": {"session": session},
+            });
+            let _ = output.send(ended.to_string()).await;
+        });
+        self.forwarders
+            .lock()
+            .unwrap()
+            .insert(session, task.abort_handle());
+        Ok(())
+    }
+}
+
+/// What each role may run. The GTK window and the CLI act for the person
+/// at the keyboard and may do anything the API offers.
+fn permit(role: Role, _command: &Command) -> Result<()> {
+    match role {
+        Role::Gui | Role::Cli => Ok(()),
+        Role::Mcp => Err(Error::PermissionDenied(
+            "the MCP bridge has no grants yet".to_string(),
+        )),
+    }
+}
+
+/// Passes events on as `event` notifications. A client that falls behind
+/// is sent `resync` and should list everything again.
+async fn forward_events(
+    mut events: tokio::sync::broadcast::Receiver<Event>,
+    control: mpsc::Sender<String>,
+    role: Role,
+    mut alive: watch::Receiver<()>,
+) {
+    loop {
+        let message = tokio::select! {
+            event = events.recv() => match event {
+                Ok(event) if may_see(role, &event) => {
+                    json!({"jsonrpc": "2.0", "method": "event", "params": event})
+                }
+                Ok(_) => continue,
+                Err(RecvError::Lagged(_)) => json!({"jsonrpc": "2.0", "method": "resync"}),
+                Err(RecvError::Closed) => return,
+            },
+            _ = alive.changed() => return,
+        };
+        tokio::select! {
+            sent = control.send(message.to_string()) => if sent.is_err() { return },
+            _ = alive.changed() => return,
+        }
+    }
+}
+
+fn may_see(role: Role, _event: &Event) -> bool {
+    match role {
+        Role::Gui | Role::Cli => true,
+        Role::Mcp => false,
+    }
+}
+
+/// Writes replies and events first, and terminal output when there are
+/// none waiting.
+async fn write_all(
+    mut write: OwnedWriteHalf,
+    mut control: mpsc::Receiver<String>,
+    mut output: mpsc::Receiver<String>,
+) {
+    loop {
+        let mut line = tokio::select! {
+            biased;
+            Some(line) = control.recv() => line,
+            Some(line) = output.recv() => line,
+            else => return,
+        };
+        line.push('\n');
+        if write.write_all(line.as_bytes()).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn parse<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, Failure> {
+    serde_json::from_value(params).map_err(|e| (INVALID_PARAMS, e.to_string()))
+}
+
+fn failed(error: Error) -> Failure {
+    (SERVER_ERROR, error.to_string())
+}
+
+fn own_uid() -> u32 {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}

@@ -1,6 +1,6 @@
 # Burrow core API
 
-Every client drives `burrow-core` through one API: the GTK UI, addons, `burrow-cli` and the MCP bridge. In-process clients call `Core::execute(Command)` and `Core::subscribe()`. Out-of-process clients will use the same types as JSON-RPC over a Unix socket (milestone 8).
+Every client drives `burrow-core` through one API: the GTK UI, addons, `burrow-cli` and the MCP bridge. In-process clients call `Core::execute(Command)` and `Core::subscribe()`. Out-of-process clients use the same types as JSON-RPC over a Unix socket; see [Socket](#socket).
 
 API version: **1** (`burrow_core::API_VERSION`). Breaking changes bump it.
 
@@ -125,7 +125,7 @@ A prompt left unanswered when the session closes counts as cancelled.
 
 ### Output stream
 
-Terminal output is not sent as events: a burst of output would push every subscriber past its event buffer. In-process clients take each session's output with `Core::take_output(session)`, once. It is a bounded stream, so a slow reader slows the SSH channel down instead of losing output. Dropping the stream ends the session. Out-of-process clients will receive the same bytes as notifications (milestone 8).
+Terminal output is not sent as events: a burst of output would push every subscriber past its event buffer. In-process clients take each session's output with `Core::take_output(session)`, once. It is a bounded stream, so a slow reader slows the SSH channel down instead of losing output. Dropping the stream ends the session. Socket clients ask for it with `take_output` and receive it as `output` notifications; see [Socket](#socket).
 
 ## SSH tunnels
 
@@ -305,6 +305,34 @@ A view is a list of blocks, drawn top to bottom with native widgets:
 ```
 
 `input` is `text`, `multiline`, `check` or `choice`. Submitting a form sends its `action` with `values`: a bool for `check`, a string for the rest. Tables show their first 500 rows.
+
+## Socket
+
+`burrowd` serves the API on a Unix socket to clients in other processes: the GTK window, `burrow` (the CLI) and its MCP bridge. Only processes running as the same user may connect; the daemon checks the peer's uid with `SO_PEERCRED`.
+
+JSON-RPC 2.0, one message per line (UTF-8, `\n`-terminated), in both directions. A line over 64 MiB drops the connection.
+
+The client sends:
+
+| Method | Params | Result |
+|---|---|---|
+| `initialize` | `{ api, role, build }` | `{ api, build, addons_dir }` |
+| `execute` | a [command](#commands) | its response, or an error |
+| `take_output` | `{ session }` | null; the terminal's output follows as `output` |
+| `release_output` (notification) | `{ session }` | ends the session, as dropping the stream does in-process |
+
+The daemon sends:
+
+| Method | Params | When |
+|---|---|---|
+| `event` (notification) | an [event](#events) | Every event the client's role may see. |
+| `resync` (notification) | | The client fell behind and missed events; list again. |
+| `output` (notification) | `{ session, data }` | Terminal output, `data` in base64. |
+| `output_ended` (notification) | `{ session }` | The terminal has no more output. It always comes after the last `output`. |
+
+- **`initialize` first:** anything else before it is refused. `api` must be the daemon's `API_VERSION`. `build` is the client's version; the daemon's comes back, so a client can tell it is talking to a daemon from before an upgrade.
+- **Roles:** `role` is `gui` (the GTK window), `cli` or `mcp` (the MCP bridge). `gui` and `cli` may run every command. `mcp` is refused everything it has not been granted.
+- **Output and events:** replies and events are sent before terminal output, so a busy terminal does not hold them up. Terminal output that the client reads slowly slows the session down rather than being dropped.
 
 ## Secrets
 

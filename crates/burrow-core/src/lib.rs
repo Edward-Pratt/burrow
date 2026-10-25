@@ -10,6 +10,7 @@ mod api;
 mod db;
 mod engine;
 mod error;
+pub mod ipc;
 mod net;
 mod password;
 mod secrets;

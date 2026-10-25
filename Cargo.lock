@@ -379,6 +379,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "keyring-core",
+ "libc",
  "notify-debouncer-full",
  "rcgen",
  "russh",

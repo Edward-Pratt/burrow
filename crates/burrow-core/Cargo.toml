@@ -14,6 +14,7 @@ futures-util = "0.3.34"
 getrandom = "0.4"
 hmac = "0.13"
 keyring-core = "1.0.1"
+libc = "0.2.191"
 notify-debouncer-full = "0.7.0"
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "3.0.1"
