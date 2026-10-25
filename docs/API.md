@@ -146,6 +146,7 @@ target_port = 5432           # "local" only
 - **`rename_path`** fails if `to` exists. **`remove_path`** deletes a folder with everything in it, and removes symlinks rather than following them.
 - **`download` and `upload`** copy a file or a whole folder in the background and reply with a transfer id at once. `local` is an absolute path naming the copy itself. If the target exists they fail, unless `overwrite` is set: then files are replaced and folders merged.
 - **Transfers don't trust names.** A name inside a folder that holds `/`, or is `.` or `..`, fails the transfer rather than writing outside the folder that was picked. Symlinks inside a folder are skipped on both sides, and Burrow won't write through a symlink at the target.
+- **Modes:** a copy that replaces a file keeps that file's mode, so a private file stays private. A new copy takes its source's mode without group or other write and without set-id bits. Hidden files are created `0600` until then.
 - **No half-written files:** each file is written to a hidden file next to the target and moved into place when complete. A failed or cancelled transfer removes its partial file. Closing the session cancels its transfers. An upload cut off by a lost connection can't clean up, so its hidden `.<name>.burrow-<n>` file stays on the server.
 
 ## Addons

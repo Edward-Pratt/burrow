@@ -11,13 +11,14 @@
 //! [`Event::TransferChanged`] a few times a second.
 
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileType, OpenFlags};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
@@ -34,6 +35,20 @@ const REQUEST_TIMEOUT: u64 = 30;
 
 /// Bytes copied per read.
 const CHUNK: usize = 256 * 1024;
+
+/// Copies are written private, and only given their real mode once
+/// complete.
+const TEMP_MODE: u32 = 0o600;
+
+/// The mode a copy gets. One that replaces a file keeps that file's mode,
+/// so a private file stays private. A new one takes its source's, but never
+/// writable by group or other, and never set-id.
+fn copy_mode(replaced: Option<u32>, source: Option<u32>) -> u32 {
+    match replaced {
+        Some(mode) => mode & 0o777,
+        None => source.map_or(0o644, |mode| mode & 0o755),
+    }
+}
 
 /// The least time between two progress events for one transfer.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
@@ -471,9 +486,16 @@ async fn download_file(
     let local_error = |e: std::io::Error| format!("{}: {e}", local.display());
 
     let mut from = sftp.open(remote).await.map_err(text)?;
+    let source = from.metadata().await.ok().and_then(|m| m.permissions);
+    let replaced = tokio::fs::symlink_metadata(local)
+        .await
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| m.permissions().mode());
     let mut to = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(TEMP_MODE)
         .open(&temp)
         .await
         .map_err(local_error)?;
@@ -487,6 +509,8 @@ async fn download_file(
         progress.add(read as u64);
     }
     to.flush().await.map_err(local_error)?;
+    let mode = std::fs::Permissions::from_mode(copy_mode(replaced, source));
+    to.set_permissions(mode).await.map_err(local_error)?;
     drop(to);
     tokio::fs::rename(&temp, local).await.map_err(local_error)?;
     partial.set(None);
@@ -602,9 +626,13 @@ async fn upload_file(
     );
     let local_error = |e: std::io::Error| format!("{}: {e}", local.display());
     let mut from = tokio::fs::File::open(local).await.map_err(local_error)?;
+    let source = from.metadata().await.ok().map(|m| m.permissions().mode());
     // EXCLUDE: fail rather than follow anything already at that name.
     let flags = OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE;
-    let mut to = sftp.open_with_flags(&temp, flags).await.map_err(text)?;
+    let mut to = sftp
+        .open_with_flags_and_attributes(&temp, flags, mode_attributes(TEMP_MODE))
+        .await
+        .map_err(text)?;
     partial.set(Some(Target::Remote(temp.clone())));
     let mut buffer = vec![0; CHUNK];
     loop {
@@ -615,10 +643,18 @@ async fn upload_file(
         to.write_all(&buffer[..read]).await.map_err(text)?;
         progress.add(read as u64);
     }
-    to.shutdown().await.map_err(text)?;
 
-    // SFTP's rename won't replace a file, so the old one goes first.
-    match sftp.symlink_metadata(remote).await {
+    // SFTP's rename won't replace a file, so the old one goes first. The
+    // mode is set through the open handle, so it can only reach our file.
+    let existing = sftp.symlink_metadata(remote).await;
+    let replaced = match &existing {
+        Ok(existing) if existing.file_type() == FileType::File => existing.permissions,
+        _ => None,
+    };
+    let mode = copy_mode(replaced, source);
+    to.set_metadata(mode_attributes(mode)).await.map_err(text)?;
+    to.shutdown().await.map_err(text)?;
+    match existing {
         Ok(existing) if existing.file_type() == FileType::File => {
             sftp.remove_file(remote).await.map_err(text)?;
         }
@@ -635,9 +671,25 @@ async fn upload_file(
     Ok(())
 }
 
+/// Attributes that set only the permission bits.
+fn mode_attributes(mode: u32) -> FileAttributes {
+    FileAttributes {
+        permissions: Some(mode),
+        ..FileAttributes::empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copies_keep_a_replaced_mode_or_drop_shared_writes() {
+        assert_eq!(copy_mode(Some(0o100600), Some(0o644)), 0o600);
+        assert_eq!(copy_mode(None, Some(0o100666)), 0o644);
+        assert_eq!(copy_mode(None, Some(0o104755)), 0o755);
+        assert_eq!(copy_mode(None, None), 0o644);
+    }
 
     #[test]
     fn unsafe_names_are_refused() {

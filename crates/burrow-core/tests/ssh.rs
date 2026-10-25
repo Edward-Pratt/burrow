@@ -1255,3 +1255,69 @@ async fn a_cancelled_upload_leaves_no_partial_file() {
         .collect();
     assert!(left.is_empty(), "left behind: {left:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn copies_keep_private_files_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let mut events = core.subscribe();
+    let session = open_files(&core, &node, &mut events).await;
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let set_mode = |path: &Path, mode| {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    };
+
+    // Replacing a private file keeps it private.
+    let secret = server.path("secret.txt");
+    fs::write(&secret, "old").unwrap();
+    set_mode(&secret, 0o600);
+    let source = server.path("new.txt");
+    fs::write(&source, "new").unwrap();
+    set_mode(&source, 0o644);
+    let upload = Command::Upload {
+        session,
+        local: source.clone(),
+        remote: remote(&secret),
+        overwrite: true,
+    };
+    assert_eq!(
+        transferred(&core, &mut events, upload).await,
+        TransferState::Finished
+    );
+    assert_eq!(fs::read_to_string(&secret).unwrap(), "new");
+    assert_eq!(mode(&secret), 0o600);
+
+    // A new copy takes the source's mode, never writable by group or other.
+    set_mode(&source, 0o666);
+    let fresh = server.path("fresh.txt");
+    let upload = Command::Upload {
+        session,
+        local: source,
+        remote: remote(&fresh),
+        overwrite: false,
+    };
+    assert_eq!(
+        transferred(&core, &mut events, upload).await,
+        TransferState::Finished
+    );
+    assert_eq!(mode(&fresh), 0o644);
+
+    // A download of a private file is private too.
+    let copy = server.path("secret-copy.txt");
+    let download = Command::Download {
+        session,
+        remote: remote(&secret),
+        local: copy.clone(),
+        overwrite: false,
+    };
+    assert_eq!(
+        transferred(&core, &mut events, download).await,
+        TransferState::Finished
+    );
+    assert_eq!(mode(&copy), 0o600);
+}
