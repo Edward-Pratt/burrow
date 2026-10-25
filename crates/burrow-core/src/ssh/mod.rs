@@ -15,6 +15,7 @@ pub(crate) mod config;
 mod connection;
 pub(crate) mod exec;
 pub(crate) mod files;
+pub(crate) mod hosts;
 mod known_hosts;
 mod monitor;
 mod session;

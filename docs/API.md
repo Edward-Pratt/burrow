@@ -37,6 +37,8 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `clear_secret` | `id`, `field` | `node { node }` |
 | `list_problems` | | `problems { problems }` |
 | `reload_config` | | `ok` |
+| `check_ssh_include` | `alias` | `ssh_include { included, config, line }` |
+| `add_ssh_host` | `parent?`, `alias`, `hostname`, `user?`, `port?`, `identity_file?`, `add_include?` | `node { node }` |
 | `open_terminal` | `node`, `cols`, `rows` | `session { session }` |
 | `write_terminal` | `session`, `data` (bytes) | `ok` |
 | `resize_terminal` | `session`, `cols`, `rows` | `ok` |
@@ -121,6 +123,17 @@ Terminals, tunnels and file sessions on the same host share one SSH connection, 
 - **Signing in** tries agent keys (`IdentityAgent`, configured keys first, only those with `IdentitiesOnly`), then key files (asking for passphrases), then a password, then keyboard-interactive.
 - **Saved passwords** are kept in the keyring with the `user@host:port` they were used for (`password-target`), and are only sent there.
 - **Not yet supported:** `ProxyJump` and `ProxyCommand` make the session fail with a message, rather than being ignored.
+
+### Hosts added in Burrow
+
+`add_ssh_host` adds a host for someone without an OpenSSH config entry for it. It writes the settings where `ssh` reads them, rather than into Burrow's own config, so `ssh <alias>` in a shell connects the same way, and then creates an `ssh-host` node named after the alias.
+
+- **Where:** a `Host` block is appended to `config.d/burrow.conf` beside the OpenSSH config, so `~/.ssh/config.d/burrow.conf`, or beside the file `BURROW_SSH_CONFIG` names. Folders are created 0700 and the file 0600. Burrow only ever appends to it. Deleting the node leaves its block.
+- **The Include line:** `ssh` only reads that file through an `Include` line, and OpenSSH takes none on the command line. `check_ssh_include` says whether the config already reads the file (an `Include config.d/*` does) and gives the `line` it needs. Without it, `add_ssh_host` is refused unless `add_include` is true, which a client sends only after asking the user. The line goes at the very top of the config, since after a `Host` line it would only apply to that host. The config keeps its permissions.
+- **Fields:** only `alias` and `hostname` are required. Each field takes only the characters it needs, because a space, quote, `#`, `%` token or pattern character would change what `ssh` reads. The alias takes letters, digits, `.`, `_` and `-`, so it can never be a pattern such as `*`. `identity_file` must be an absolute path to an existing file. It is written as `~/…` under the home folder, with `%` written as `%%`.
+- **An alias already set:** `ssh -v -G <alias>` reports every `Host` line that applied. One naming the alias itself, in any file, refuses the request with that file and line. The message says whether the host was added in Burrow before. A wildcard such as `*.corp` doesn't count: the new block comes first, so its settings win and the wildcard fills in the rest. `Match` blocks aren't reported at that level, so they aren't checked. Output with no trace in it at all is an error rather than "nothing matched".
+- **Checked afterwards:** once the block is written, `ssh -v -G` must apply it from `burrow.conf`. Otherwise, for example when an existing `Include` of the file sits inside a `Host` block, the block is taken back and the error says how to fix the config. If the node can't be created, the block is taken back too.
+- **Symlinks:** Burrow refuses to write when `config.d`, `burrow.conf` or the OpenSSH config is a symlink, since renaming over a link would replace it. For a symlinked config, the error gives the line to add by hand.
 
 ### Commands without a terminal
 
@@ -395,7 +408,7 @@ The daemon sends:
 | `monitor-read` | `ssh-host` | `open_monitor` and `monitor_history`, running only an agent the user already put there |
 
 - **Always allowed:** `version`, `list_nodes`, `get_node`, `list_sessions` and `list_grants`. Nodes hold no secrets.
-- **Never allowed:** changing nodes, secrets, prompts, autostart, addons, grants, terminals and history. `download`, `upload` and `export_query` are refused because they take a local path. The bridge works with contents instead (`read_file`, `write_file`), so it can't read or overwrite the user's own files.
+- **Never allowed:** changing nodes, secrets, prompts, autostart, addons, grants, terminals and history, and adding SSH hosts (`check_ssh_include`, `add_ssh_host`). `download`, `upload` and `export_query` are refused because they take a local path. The bridge works with contents instead (`read_file`, `write_file`), so it can't read or overwrite the user's own files.
 - **Its own sessions:** session commands only work on sessions the bridge opened itself. Those sessions close when it disconnects.
 - **Monitors never install:** a monitor the bridge opens runs only the `burrow-agent` that is already on the server and matches Burrow's copy. Otherwise it fails without asking, so the user installs the agent by opening a monitor in Burrow. The bridge's `monitor` tool returns the latest sample, a summary of the history and the failed services, rather than every sample.
 - **Read-only SQL:** without `sql-write`, every query runs as one statement inside `BEGIN READ ONLY` … `ROLLBACK`. Postgres refuses to prepare more than one statement, so SQL can't change the setting or end the transaction and then write.

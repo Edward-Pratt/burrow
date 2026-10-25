@@ -467,11 +467,23 @@ fn write_entry(entry: &Entry) -> Result<()> {
 
 /// Writes to a hidden temp file in the same directory, then renames it over
 /// the target, so readers (including our own watcher) never see half a file.
+/// The new file is private to the user (0600).
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    write_atomic_mode(path, contents, 0o600)
+}
+
+/// [`write_atomic`] with the given permissions, set before the rename so
+/// the file never appears with others.
+pub(crate) fn write_atomic_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let dir = parent_dir(path);
     let mut tmp = NamedTempFile::new_in(&dir).map_err(|e| Error::io(&dir, e))?;
     tmp.write_all(contents.as_bytes())
         .and_then(|()| tmp.as_file().sync_all())
+        .and_then(|()| {
+            tmp.as_file()
+                .set_permissions(fs::Permissions::from_mode(mode))
+        })
         .map_err(|e| Error::io(tmp.path(), e))?;
     tmp.persist(path).map_err(|e| Error::io(path, e.error))?;
     Ok(())
