@@ -7,13 +7,11 @@
 //! loopback address, and it never starts by itself unless the user said so
 //! on this computer ([`Autostart`]).
 
-use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use data_encoding::HEXLOWER;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -26,7 +24,7 @@ use crate::api::{Event, Node, NodeId, SSH_HOST_KIND, SessionState};
 use crate::engine::Core;
 use crate::error::{Error, Result};
 use crate::net::check_host;
-use crate::tree::write_atomic;
+use crate::pins::{Lookup, Pinned};
 
 /// What a tunnel node's props describe.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,10 +122,6 @@ impl Spec {
         HEXLOWER.encode(&Sha256::digest(text.as_bytes()))
     }
 }
-
-/// Looks a node up by id.
-pub(crate) trait Lookup: Fn(NodeId) -> Option<Node> {}
-impl<F: Fn(NodeId) -> Option<Node>> Lookup for F {}
 
 /// The tunnel's SSH host node, which must exist and be an SSH host.
 fn host_node(lookup: &impl Lookup, spec: &Spec) -> std::result::Result<Node, String> {
@@ -253,55 +247,30 @@ async fn forward(
 /// Which tunnels start with Burrow. Kept in the state folder, apart from
 /// the tunnel files, so a tunnel that arrives with a `git pull` never starts
 /// unasked. Each consent is pinned to the tunnel's settings and its host's
-/// alias, so changing where it goes withdraws it.
-pub(crate) struct Autostart {
-    path: PathBuf,
-    consents: Mutex<Consents>,
-}
-
-/// The state file: tunnel node id to the fingerprint it was enabled for.
-#[derive(Default, Serialize, Deserialize)]
-struct Consents {
-    #[serde(default)]
-    tunnels: BTreeMap<NodeId, String>,
-}
+/// alias, so changing where it goes withdraws it. The state file's
+/// `[tunnels]` table holds the fingerprint each was enabled for.
+pub(crate) struct Autostart(Pinned<NodeId, String>);
 
 impl Autostart {
     /// Reads the state file. A broken one is logged and treated as empty
     /// until the next change rewrites it: nothing starts by itself.
     pub fn load(path: PathBuf) -> Autostart {
-        let consents = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|e: toml::de::Error| {
-                tracing::warn!("ignoring {}: {}", path.display(), e.message());
-                Consents::default()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Consents::default(),
-            Err(e) => {
-                tracing::warn!("ignoring {}: {e}", path.display());
-                Consents::default()
-            }
-        };
-        Autostart {
-            path,
-            consents: Mutex::new(consents),
-        }
+        Autostart(Pinned::load_or_warn(path, "tunnels"))
     }
 
     /// The tunnels whose consent still matches their settings.
     pub fn enabled(&self, lookup: &impl Lookup) -> Vec<NodeId> {
-        let consents = self.consents.lock().unwrap();
-        consents
-            .tunnels
-            .iter()
+        self.0
+            .entries()
+            .into_iter()
             .filter(|(id, fingerprint)| {
-                current_fingerprint(lookup, **id).as_ref() == Some(*fingerprint)
+                current_fingerprint(lookup, *id).as_ref() == Some(fingerprint)
             })
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id)
             .collect()
     }
 
     pub fn set(&self, lookup: &impl Lookup, node: &Node, enabled: bool) -> Result<()> {
-        let mut consents = self.consents.lock().unwrap();
         if enabled {
             let fingerprint = current_fingerprint(lookup, node.id).ok_or_else(|| {
                 let reason = Spec::from_node(node)
@@ -310,23 +279,15 @@ impl Autostart {
                     .unwrap_or_else(|| "its settings are incomplete".into());
                 Error::invalid("tunnel", reason)
             })?;
-            consents.tunnels.insert(node.id, fingerprint);
+            self.0.insert(node.id, fingerprint)
         } else {
-            consents.tunnels.remove(&node.id);
+            self.0.remove(&node.id)
         }
-        save(&self.path, &consents)
     }
 
     /// Drops consents for tunnels that no longer exist.
     pub fn forget(&self, nodes: &[NodeId]) {
-        let mut consents = self.consents.lock().unwrap();
-        let before = consents.tunnels.len();
-        consents.tunnels.retain(|id, _| !nodes.contains(id));
-        if consents.tunnels.len() != before
-            && let Err(e) = save(&self.path, &consents)
-        {
-            tracing::warn!("could not update {}: {e}", self.path.display());
-        }
+        self.0.forget(nodes);
     }
 }
 
@@ -337,17 +298,6 @@ fn current_fingerprint(lookup: &impl Lookup, id: NodeId) -> Option<String> {
     let spec = Spec::from_node(&node).ok()?;
     let host = host_node(lookup, &spec).ok()?;
     Some(spec.fingerprint(alias(&host)))
-}
-
-fn save(path: &Path, consents: &Consents) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
-    }
-    let text = toml::to_string_pretty(consents).map_err(|e| Error::Encode {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
-    write_atomic(path, &text)
 }
 
 #[cfg(test)]
@@ -429,5 +379,43 @@ mod tests {
             spec("db").fingerprint("web"),
             spec("db").fingerprint("evil")
         );
+    }
+
+    /// The file exactly as Burrow wrote it before the stores were shared,
+    /// for a tunnel and host with fixed ids. Every tester's autostart
+    /// tunnels are in such a file, so a change in its shape, or in what
+    /// the fingerprint covers, would stop them all starting.
+    const OLD_FILE: &str = "[tunnels]\n\
+        6f1c2d3e-0000-4000-8000-000000000002 = \
+        \"b7c88b8c37bffb92d1535a59e206354a3903646d47c2e2ed0e30da596dbc1bd0\"\n";
+
+    #[test]
+    fn reads_and_writes_consents_as_burrow_always_has() {
+        let host = Node {
+            id: NodeId("6f1c2d3e-0000-4000-8000-000000000001".parse().unwrap()),
+            kind: SSH_HOST_KIND.into(),
+            name: "web".into(),
+            ..node("alias = \"web\"")
+        };
+        let tunnel = Node {
+            id: NodeId("6f1c2d3e-0000-4000-8000-000000000002".parse().unwrap()),
+            ..node(&format!(
+                "via = \"{}\"\ntype = \"local\"\nport = 5433\n\
+                 target_host = \"db\"\ntarget_port = 5432",
+                host.id
+            ))
+        };
+        let nodes = [host, tunnel.clone()];
+        let lookup = |id| nodes.iter().find(|n| n.id == id).cloned();
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("autostart.toml");
+        std::fs::write(&path, OLD_FILE).unwrap();
+        assert_eq!(Autostart::load(path.clone()).enabled(&lookup), [tunnel.id]);
+
+        std::fs::remove_file(&path).unwrap();
+        Autostart::load(path.clone())
+            .set(&lookup, &tunnel, true)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_FILE);
     }
 }

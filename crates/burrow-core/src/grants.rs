@@ -7,9 +7,8 @@
 //! through (`props.via`), so a node file that keeps its id but points
 //! somewhere else withdraws the grant instead of carrying it along.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use data_encoding::HEXLOWER;
 use serde::{Deserialize, Serialize};
@@ -19,23 +18,10 @@ use crate::api::{
     Capability, Grant, GrantShown, Node, NodeId, POSTGRES_KIND, SSH_HOST_KIND, SSH_TUNNEL_KIND,
 };
 use crate::error::{Error, Result};
-use crate::tree::write_atomic;
+use crate::pins::{Lookup, Pinned};
 
-/// Looks a node up by id.
-pub(crate) trait Lookup: Fn(NodeId) -> Option<Node> {}
-impl<F: Fn(NodeId) -> Option<Node>> Lookup for F {}
-
-pub(crate) struct Grants {
-    path: PathBuf,
-    saved: Mutex<Saved>,
-}
-
-/// The state file.
-#[derive(Default, Serialize, Deserialize)]
-struct Saved {
-    #[serde(default)]
-    nodes: BTreeMap<NodeId, Saving>,
-}
+/// The state file's `[nodes]` table, by node id.
+pub(crate) struct Grants(Pinned<NodeId, Saving>);
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Saving {
@@ -47,35 +33,20 @@ impl Grants {
     /// Reads the state file. A broken one is logged and treated as empty:
     /// nothing is granted until the user grants it again.
     pub fn load(path: PathBuf) -> Grants {
-        let saved = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|e: toml::de::Error| {
-                tracing::warn!("ignoring {}: {}", path.display(), e.message());
-                Saved::default()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::default(),
-            Err(e) => {
-                tracing::warn!("ignoring {}: {e}", path.display());
-                Saved::default()
-            }
-        };
-        Grants {
-            path,
-            saved: Mutex::new(saved),
-        }
+        Grants(Pinned::load_or_warn(path, "nodes"))
     }
 
     /// Every grant on a node that still exists.
     pub fn list(&self, lookup: &impl Lookup) -> Vec<Grant> {
-        let saved = self.saved.lock().unwrap();
-        saved
-            .nodes
-            .iter()
+        self.0
+            .entries()
+            .into_iter()
             .filter_map(|(id, saving)| {
-                let node = lookup(*id)?;
+                let node = lookup(id)?;
                 Some(Grant {
-                    node: *id,
-                    capabilities: saving.capabilities.clone(),
+                    node: id,
                     stale: fingerprint(lookup, &node) != saving.fingerprint,
+                    capabilities: saving.capabilities,
                 })
             })
             .collect()
@@ -84,8 +55,7 @@ impl Grants {
     /// Whether `node` is granted `capability` and is still as it was when
     /// granted. A write grant covers reading too.
     pub fn allows(&self, lookup: &impl Lookup, node: NodeId, capability: Capability) -> bool {
-        let saved = self.saved.lock().unwrap();
-        let Some(saving) = saved.nodes.get(&node) else {
+        let Some(saving) = self.0.get(&node) else {
             return false;
         };
         let covered = match capability {
@@ -111,10 +81,8 @@ impl Grants {
         capabilities: BTreeSet<Capability>,
         expect: Option<&GrantShown>,
     ) -> Result<()> {
-        let mut saved = self.saved.lock().unwrap();
         if capabilities.is_empty() {
-            saved.nodes.remove(&node.id);
-            return save(&self.path, &saved);
+            return self.0.remove(&node.id);
         }
         for capability in &capabilities {
             if !capability.fits(&node.kind) {
@@ -133,14 +101,11 @@ impl Grants {
                 format!("{} changed after it was shown; show it again", node.name),
             ));
         }
-        saved.nodes.insert(
-            node.id,
-            Saving {
-                capabilities,
-                fingerprint: fingerprint(lookup, node),
-            },
-        );
-        save(&self.path, &saved)
+        let saving = Saving {
+            capabilities,
+            fingerprint: fingerprint(lookup, node),
+        };
+        self.0.insert(node.id, saving)
     }
 }
 
@@ -194,17 +159,6 @@ pub(crate) fn matches(lookup: &impl Lookup, node: &Node, shown: &GrantShown) -> 
 fn shown_fingerprint(kind: &str, shown: &GrantShown) -> String {
     let text = serde_json::json!([kind, shown]).to_string();
     HEXLOWER.encode(&Sha256::digest(text.as_bytes()))
-}
-
-fn save(path: &Path, saved: &Saved) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
-    }
-    let text = toml::to_string_pretty(saved).map_err(|e| Error::Encode {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
-    write_atomic(path, &text)
 }
 
 #[cfg(test)]
@@ -291,5 +245,67 @@ mod tests {
         grants.set(&lookup, &host, BTreeSet::new(), None).unwrap();
         assert!(!grants.allows(&lookup, host.id, Capability::FilesWrite));
         assert!(grants.list(&lookup).is_empty());
+    }
+
+    /// The file exactly as Burrow wrote it before the stores were shared,
+    /// for nodes with fixed ids. Every tester's grants are in such a file,
+    /// so a change in its shape or in the fingerprint would revoke them
+    /// all on the next update.
+    const OLD_FILE: &str = "[nodes.6f1c2d3e-0000-4000-8000-000000000001]
+capabilities = [\"exec\"]
+fingerprint = \"c84b2718c2bafbf87c17a74be79c44c6d889577395672e6a1bf597d25e32a374\"
+
+[nodes.6f1c2d3e-0000-4000-8000-000000000003]
+capabilities = [
+    \"sql-read\",
+    \"sql-write\",
+]
+fingerprint = \"fb839698daa6551f1da96fd86a96b083bba3bf37deb8afd75e7f00be4bc9a05a\"
+";
+
+    #[test]
+    fn reads_and_writes_the_file_as_burrow_always_has() {
+        let fixed = |n: u8| {
+            NodeId(
+                format!("6f1c2d3e-0000-4000-8000-00000000000{n}")
+                    .parse()
+                    .unwrap(),
+            )
+        };
+        let host = Node {
+            id: fixed(1),
+            ..node(SSH_HOST_KIND, "web", "alias = \"web\"")
+        };
+        let db = Node {
+            id: fixed(3),
+            ..node(
+                POSTGRES_KIND,
+                "app",
+                &format!(
+                    "via = \"{}\"\nhost = \"localhost\"\ndatabase = \"app\"",
+                    host.id
+                ),
+            )
+        };
+        let nodes = [host.clone(), db.clone()];
+        let lookup = |id| nodes.iter().find(|n| n.id == id).cloned();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mcp.toml");
+        std::fs::write(&path, OLD_FILE).unwrap();
+        let grants = Grants::load(path.clone());
+        assert!(grants.allows(&lookup, host.id, Capability::Exec));
+        assert!(grants.allows(&lookup, db.id, Capability::SqlWrite));
+
+        std::fs::remove_file(&path).unwrap();
+        let grants = Grants::load(path.clone());
+        let exec = caps(&[Capability::Exec]);
+        let sql = caps(&[Capability::SqlRead, Capability::SqlWrite]);
+        grants
+            .set(&lookup, &host, exec, Some(&shown(&lookup, &host)))
+            .unwrap();
+        grants
+            .set(&lookup, &db, sql, Some(&shown(&lookup, &db)))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_FILE);
     }
 }

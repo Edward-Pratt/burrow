@@ -26,8 +26,7 @@ use super::{Connection, Prompter};
 use crate::api::{Node, NodeId, PromptAnswer};
 use crate::engine::Core;
 use crate::error::Result;
-use crate::grants::Lookup;
-use crate::pins::Pins;
+use crate::pins::{Lookup, Pins};
 
 /// Where packages install the agent builds, as `burrow-agent-<arch>`.
 const INSTALLED: &str = "/usr/lib/burrow";
