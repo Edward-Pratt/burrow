@@ -354,7 +354,6 @@ pub struct App {
     /// another client answers first. A `RefCell` because prompts are asked
     /// while a tab's panel is borrowed.
     prompts: RefCell<HashMap<(SessionId, u32), dialogs::Dismiss>>,
-    sidebar_dirty: bool,
 }
 
 pub struct Widgets {
@@ -461,7 +460,6 @@ impl Component for App {
             monitoring: HashSet::new(),
             alerts: Vec::new(),
             prompts: RefCell::default(),
-            sidebar_dirty: false,
         };
         if let Some(error) = stale_daemon(&model.core) {
             model.fail(error);
@@ -876,7 +874,9 @@ impl Component for App {
             }
         }
 
-        self.rebuild_sidebar(widgets);
+        // Tunnels start and stop in many places; checking here, against
+        // what the sidebar last showed, catches them all.
+        widgets.sidebar.set_running(self.running());
         widgets
             .content
             .set_visible_child_name(if self.tabs.is_empty() {
@@ -945,7 +945,7 @@ impl App {
         for key in gone {
             self.close_tab(key, widgets);
         }
-        self.sidebar_dirty = true;
+        widgets.sidebar.replace(&self.nodes, &self.icons());
     }
 
     /// Switches to a new daemon after the old one went away. What ran in
@@ -995,31 +995,24 @@ impl App {
         sender.input(AppMsg::Notice("Connected to burrowd again".to_string()));
     }
 
-    /// Brings the sidebar up to date when something marked it dirty.
-    fn rebuild_sidebar(&mut self, widgets: &mut Widgets) {
-        if !self.sidebar_dirty {
-            return;
-        }
-        self.sidebar_dirty = false;
-        widgets.sidebar.replace(&self.nodes, &self.icons());
-        let running: HashSet<NodeId> = self
-            .tunnels
+    /// The nodes the sidebar marks as running: tunnels that are up.
+    fn running(&self) -> HashSet<NodeId> {
+        self.tunnels
             .iter()
             .filter(|(_, status)| status.is_up())
             .map(|(id, _)| *id)
-            .collect();
-        widgets.sidebar.set_running(running);
+            .collect()
     }
 
     fn apply_event(&mut self, event: Event, widgets: &Widgets, sender: &ComponentSender<Self>) {
         match event {
             Event::NodeCreated { node } => {
+                widgets.sidebar.insert(&node, &self.icons());
                 // Show where the new node went.
                 if let Some(parent) = node.parent {
                     widgets.sidebar.expand(parent);
                 }
                 self.nodes.insert(node.id, node);
-                self.sidebar_dirty = true;
             }
             Event::NodeUpdated { node } => {
                 let id = node.id;
@@ -1048,10 +1041,10 @@ impl App {
                 {
                     status.stale = true;
                 }
+                widgets.sidebar.update(&node, &self.icons());
                 self.nodes.insert(id, node);
                 // Setting the tab's title replaced its tooltip.
                 self.set_remote_tooltip(id);
-                self.sidebar_dirty = true;
                 // Tunnel pages name the host they go through.
                 self.refresh_tunnels(sender);
                 // The addon draws from the node, so ask it again.
@@ -1067,7 +1060,7 @@ impl App {
                 self.close_tab(TabKey::Node(id), widgets);
                 self.close_tab(TabKey::Files(id), widgets);
                 self.close_tab(TabKey::Monitor(id), widgets);
-                self.sidebar_dirty = true;
+                widgets.sidebar.remove(id);
                 self.refresh_tunnels(sender);
             }
             Event::ProblemsChanged { problems } => self.problems = problems,
@@ -1160,7 +1153,7 @@ impl App {
         widgets
             .new_button
             .set_popover(Some(&menu_popover(self.new_entries(None, ""), sender)));
-        self.sidebar_dirty = true;
+        widgets.sidebar.set_icons(&self.icons());
     }
 
     /// The icon for each addon kind.
@@ -1444,7 +1437,6 @@ impl App {
                 }
             }
         }
-        self.sidebar_dirty = true;
         self.refresh_tunnels(sender);
     }
 
@@ -1467,7 +1459,6 @@ impl App {
         if closed && self.restarting.remove(&node) {
             execute(&self.core, sender, Command::StartTunnel { node });
         }
-        self.sidebar_dirty = true;
         self.refresh_tunnel(node, sender);
     }
 

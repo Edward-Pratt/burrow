@@ -7,6 +7,7 @@
 //! scroll position survive them.
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -61,7 +62,11 @@ fn ancestors(id: NodeId, parent: impl Fn(NodeId) -> Option<NodeId>) -> Vec<NodeI
 
 /// `icons` maps addon kinds to the icons their addons chose.
 pub fn icon_name<'a>(node: &Node, expanded: bool, icons: &'a HashMap<String, String>) -> &'a str {
-    match node.kind.as_str() {
+    kind_icon(&node.kind, expanded, icons)
+}
+
+fn kind_icon<'a>(kind: &str, expanded: bool, icons: &'a HashMap<String, String>) -> &'a str {
+    match kind {
         "folder" if expanded => "folder-open-symbolic",
         "folder" => "folder-symbolic",
         "ssh-host" => "network-server-symbolic",
@@ -165,10 +170,42 @@ impl NodeObject {
         if self.folder() != node.is_folder() {
             self.set_folder(node.is_folder());
         }
+        self.set_icon_if_changed(icon);
+    }
+
+    fn set_icon_if_changed(&self, icon: &str) {
         if self.icon() != icon {
             self.set_icon(icon);
         }
     }
+
+    fn sort_key(&self) -> (bool, String, NodeId) {
+        sort_key(self.folder(), &self.name(), self.node_id())
+    }
+}
+
+fn compare(a: &glib::Object, b: &glib::Object) -> Ordering {
+    match (
+        a.downcast_ref::<NodeObject>(),
+        b.downcast_ref::<NodeObject>(),
+    ) {
+        (Some(a), Some(b)) => a.sort_key().cmp(&b.sort_key()),
+        _ => Ordering::Equal,
+    }
+}
+
+/// Whether the item at `position` sorts after the one before it and
+/// before the one after it.
+fn in_order(store: &gio::ListStore, position: u32) -> bool {
+    let Some(item) = store.item(position) else {
+        return true;
+    };
+    let before = position
+        .checked_sub(1)
+        .and_then(|p| store.item(p))
+        .is_none_or(|b| compare(&b, &item) == Ordering::Less);
+    let after = (store.item(position + 1)).is_none_or(|a| compare(&item, &a) == Ordering::Less);
+    before && after
 }
 
 /// What the sidebar's closures share. Each field is its own `RefCell`, and
@@ -358,6 +395,70 @@ impl Sidebar {
             self.state.expanded.borrow_mut().retain(is_folder);
         });
         self.sync_expansion();
+    }
+
+    /// Adds a node the core created.
+    pub fn insert(&self, node: &Node, icons: &HashMap<String, String>) {
+        if self.state.object(node.id).is_some() {
+            return self.update(node, icons);
+        }
+        let running = self.state.running.borrow().contains(&node.id);
+        let object = NodeObject::new(node, icon_name(node, false, icons), running);
+        self.state
+            .objects
+            .borrow_mut()
+            .insert(node.id, object.clone());
+        self.state
+            .store(node.parent)
+            .insert_sorted(&object, compare);
+    }
+
+    /// Takes a node's new fields. A node that was renamed moves to keep
+    /// its folder sorted, and one that was moved goes to its new folder.
+    pub fn update(&self, node: &Node, icons: &HashMap<String, String>) {
+        let Some(object) = self.state.object(node.id) else {
+            return self.insert(node, icons);
+        };
+        self.keep_selection(|| {
+            let (parent, folder) = (object.parent_id(), object.folder());
+            object.update(node, icon_name(node, false, icons));
+            let old = self.state.store(parent);
+            let Some(position) = old.find(&object) else {
+                return;
+            };
+            // The tree only asks whether a row has children when it adds
+            // it, so a node that became or stopped being a folder goes back
+            // in too.
+            if parent != node.parent || folder != node.is_folder() || !in_order(&old, position) {
+                old.remove(position);
+                self.state
+                    .store(node.parent)
+                    .insert_sorted(&object, compare);
+            }
+        });
+        self.sync_expansion();
+    }
+
+    /// Takes away a node the core deleted. The core deletes a folder's
+    /// contents first.
+    pub fn remove(&self, id: NodeId) {
+        let Some(object) = self.state.objects.borrow_mut().remove(&id) else {
+            return;
+        };
+        let store = self.state.store(object.parent_id());
+        if let Some(position) = store.find(&object) {
+            store.remove(position);
+        }
+        self.state.stores.borrow_mut().remove(&Some(id));
+        self.state.expanded.borrow_mut().remove(&id);
+    }
+
+    /// Takes the icons addons chose for their kinds.
+    pub fn set_icons(&self, icons: &HashMap<String, String>) {
+        let objects: Vec<NodeObject> = self.state.objects.borrow().values().cloned().collect();
+        for object in objects {
+            object.set_icon_if_changed(kind_icon(&object.kind(), false, icons));
+        }
     }
 
     /// Marks exactly these nodes as running.
@@ -707,6 +808,33 @@ mod tests {
             .map(|n| n.name.as_str())
             .collect();
         assert_eq!(names, ["alpha", "Zeta", "a-host", "b-host"]);
+    }
+
+    #[test]
+    fn stores_sort_as_children_do() {
+        let nodes = map([
+            node("b-host", "ssh-host", None),
+            node("Zeta", "folder", None),
+            node("a-host", "ssh-host", None),
+            node("alpha", "folder", None),
+            node("Alpha", "ssh-host", None),
+        ]);
+        let store = gio::ListStore::new::<NodeObject>();
+        for node in nodes.values() {
+            store.insert_sorted(&NodeObject::new(node, "", false), compare);
+        }
+        let stored: Vec<NodeId> = (0..store.n_items())
+            .filter_map(|i| store.item(i).and_downcast::<NodeObject>())
+            .map(|o| o.node_id())
+            .collect();
+        let expected: Vec<NodeId> = children(&nodes, None).iter().map(|n| n.id).collect();
+        assert_eq!(stored, expected);
+        assert!((0..store.n_items()).all(|i| in_order(&store, i)));
+
+        // A rename that changes the order is noticed.
+        let first = store.item(0).and_downcast::<NodeObject>().unwrap();
+        first.set_name("zzz");
+        assert!(!in_order(&store, 0));
     }
 
     #[test]
