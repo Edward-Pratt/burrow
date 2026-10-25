@@ -711,7 +711,7 @@ pub enum Command {
     /// hosts added in Burrow go, when it looks up `alias`. Refuses an alias
     /// that [`Command::AddSshHost`] would refuse, so a client asks about
     /// the Include line only for a host it can add. Creates that file,
-    /// empty, if it is missing, since `ssh` only reports reading files that
+    /// with only a comment, if it is missing, since `ssh` only reports reading files that
     /// exist. Returns [`Response::SshInclude`].
     CheckSshInclude {
         alias: String,

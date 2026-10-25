@@ -363,7 +363,8 @@ async fn ask_include(window: &gtk::Window, alias: &str, config: &Path, line: &st
         ))
         .buttons(["Cancel", "Add the line"])
         .cancel_button(0)
-        .default_button(1)
+        // Changing someone's SSH config takes a deliberate click.
+        .default_button(0)
         .build();
     dialog.choose_future(Some(window)).await == Ok(1)
 }

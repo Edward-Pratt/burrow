@@ -52,6 +52,8 @@ rustup target add x86_64-unknown-linux-musl
 cargo build -p burrow-agent --profile agent --target x86_64-unknown-linux-musl
 ```
 
+To add a server, pick **New** and then **SSH host**. Burrow saves the host name, user, port and key in `~/.ssh/config.d/burrow.conf`, so `ssh <alias>` in a terminal connects the same way. The first time, it asks before adding the line that reads that file to the top of `~/.ssh/config`. A host already in `~/.ssh/config` can be added by its alias instead.
+
 Burrow finds it in the workspace it runs from, in `/usr/lib/burrow/` or in `$BURROW_AGENT_DIR`. When something goes wrong, `burrowd.log` in `~/.local/state/burrow/` has the daemon's side of it.
 
 ## Running it
