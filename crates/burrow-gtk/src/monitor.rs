@@ -3,14 +3,23 @@
 //!
 //! The core already cleaned what the agent sent, but names are passed
 //! through [`printable`] anyway, as everything from a server is.
+//!
+//! A host monitored in the background also shows its alerts, and its
+//! charts can show the history the core keeps on disk instead of the last
+//! ten minutes. The daemon notifies about alerts, so the tab only lists
+//! them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use burrow_core::ipc::Client;
 use burrow_core::monitor::{Sample, Unit};
-use burrow_core::{Command, NodeId, Response, SessionId, SessionState};
+use burrow_core::{
+    Alert, AlertKind, Command, MonitorHistory, NodeId, Response, SessionId, SessionState,
+    TrendRange,
+};
 use relm4::gtk::prelude::*;
 use relm4::{ComponentSender, gtk};
 
@@ -25,17 +34,38 @@ const CHART_POINTS: usize = 300;
 /// Services drawn before the rest are summed up.
 const MAX_ROWS: usize = 2000;
 
+/// What the charts can show: the live samples, or the history on disk.
+const RANGES: [(&str, Option<TrendRange>); 4] = [
+    ("Live", None),
+    ("1 h", Some(TrendRange::Hour)),
+    ("24 h", Some(TrendRange::Day)),
+    ("7 d", Some(TrendRange::Week)),
+];
+
+/// How often a chart of the history on disk is read again. A point is
+/// written a minute.
+const TREND_REFRESH: Duration = Duration::from_secs(60);
+
 #[derive(Clone, Debug)]
 pub enum Msg {
     /// The core accepted `open_monitor`.
     Started(SessionId),
     /// `open_monitor` itself failed.
     StartFailed(String),
-    /// Whether the server runs systemd, from the monitor's history.
-    Systemd(bool),
+    /// What the monitor had seen before the tab joined it, which a
+    /// background monitor has: whether systemd runs there, the latest
+    /// services, and samples for the charts.
+    History(MonitorHistory),
     /// The service filter or "failed only" changed.
     Filter,
     Reconnect,
+    /// The user turned "Monitor in the background" on or off. The window
+    /// asks first, since it knows the host.
+    SetBackground(bool),
+    /// The user picked what the charts show.
+    Range(Option<TrendRange>),
+    /// The history on disk for `range`, from `monitor_trend`.
+    Trend(TrendRange, Vec<Sample>),
 }
 
 /// One SSH host's monitor tab.
@@ -63,6 +93,16 @@ pub struct Monitor {
     units_list: gtk::ListBox,
     systemd: bool,
     units: Option<Vec<Unit>>,
+    background: gtk::CheckButton,
+    /// Set while the checkbox is changed to match the core, so that isn't
+    /// taken for the user's choice.
+    quiet: Rc<Cell<bool>>,
+    ranges: gtk::Box,
+    range_buttons: Vec<gtk::ToggleButton>,
+    range: Option<TrendRange>,
+    trend_note: gtk::Label,
+    trend_read: Option<Instant>,
+    alerts: gtk::Box,
 }
 
 impl Monitor {
@@ -80,10 +120,61 @@ impl Monitor {
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
         page.add_css_class("monitor-view");
 
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let background = gtk::CheckButton::with_label("Monitor in the background");
+        background.set_tooltip_text(Some(
+            "Keep monitoring this host while Burrow runs, keep a week of its history, \
+             and notify when something goes wrong",
+        ));
+        let quiet = Rc::new(Cell::new(false));
+        background.connect_toggled({
+            let (quiet, sender) = (quiet.clone(), sender.clone());
+            move |check| {
+                if !quiet.get() {
+                    let msg = Msg::SetBackground(check.is_active());
+                    sender.input(AppMsg::Monitor { node, msg });
+                }
+            }
+        });
+        top.append(&background);
+        let ranges = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        ranges.add_css_class("linked");
+        ranges.set_hexpand(true);
+        ranges.set_halign(gtk::Align::End);
+        ranges.set_visible(false);
+        let mut range_buttons: Vec<gtk::ToggleButton> = Vec::new();
+        for (name, range) in RANGES {
+            let button = gtk::ToggleButton::with_label(name);
+            button.set_group(range_buttons.first());
+            button.set_active(range.is_none());
+            button.connect_toggled({
+                let sender = sender.clone();
+                move |button| {
+                    if button.is_active() {
+                        let msg = Msg::Range(range);
+                        sender.input(AppMsg::Monitor { node, msg });
+                    }
+                }
+            });
+            ranges.append(&button);
+            range_buttons.push(button);
+        }
+        top.append(&ranges);
+        page.append(&top);
+
+        let alerts = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        alerts.set_visible(false);
+        page.append(&alerts);
+
         let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
         let summary = label("");
         summary.add_css_class("dim");
         content.append(&summary);
+
+        let trend_note = label("");
+        trend_note.add_css_class("dim");
+        trend_note.set_visible(false);
+        content.append(&trend_note);
 
         let charts = gtk::Box::new(gtk::Orientation::Horizontal, 18);
         charts.set_homogeneous(true);
@@ -186,7 +277,42 @@ impl Monitor {
             units_list,
             systemd: false,
             units: None,
+            background,
+            quiet,
+            ranges,
+            range_buttons,
+            range: None,
+            trend_note,
+            trend_read: None,
+            alerts,
         }
+    }
+
+    /// Shows whether the host is monitored in the background, as the core
+    /// says. Its history is only there if it is.
+    pub fn set_background(&mut self, on: bool) {
+        self.quiet.set(true);
+        self.background.set_active(on);
+        self.quiet.set(false);
+        self.ranges.set_visible(on);
+        if !on && self.range.is_some() {
+            // Goes back to the live charts through `Msg::Range(None)`.
+            self.range_buttons[0].set_active(true);
+        }
+    }
+
+    /// Lists the host's alerts above the charts.
+    pub fn set_alerts(&self, alerts: &[&Alert]) {
+        while let Some(child) = self.alerts.first_child() {
+            self.alerts.remove(&child);
+        }
+        for alert in alerts {
+            let text = label(&alert_text(&alert.kind));
+            text.add_css_class("warning-text");
+            text.set_wrap(true);
+            self.alerts.append(&text);
+        }
+        self.alerts.set_visible(!alerts.is_empty());
     }
 
     fn show_message(&self, text: &str, can_reconnect: bool) {
@@ -218,8 +344,10 @@ impl Monitor {
         }
     }
 
-    /// Asks whether systemd runs there, which only the history says.
-    fn fetch_history(&self, core: &Client, sender: &ComponentSender<App>) {
+    /// Asks what the monitor has seen. Whether systemd runs there is only
+    /// in the history, and so are the services of a monitor that was
+    /// running before the tab joined it.
+    pub fn fetch_history(&self, core: &Client, sender: &ComponentSender<App>) {
         let State::Running(session) = self.state else {
             return;
         };
@@ -228,14 +356,21 @@ impl Monitor {
             if let Ok(Response::Monitor { history }) =
                 core.execute(Command::MonitorHistory { session }).await
             {
-                let msg = Msg::Systemd(history.systemd);
+                let msg = Msg::History(history);
                 let _ = input.send(AppMsg::Monitor { node, msg });
             }
         });
     }
 
-    pub fn sample(&mut self, sample: &Sample) {
+    pub fn sample(&mut self, sample: &Sample, core: &Client, sender: &ComponentSender<App>) {
         self.stack.set_visible_child_name("content");
+        if let Some(range) = self.range
+            && self
+                .trend_read
+                .is_none_or(|read| read.elapsed() >= TREND_REFRESH)
+        {
+            self.read_trend(range, core, sender);
+        }
         self.summary.set_label(&format!(
             "Up {} · load {:.2} {:.2} {:.2} · {} cores",
             duration(sample.uptime),
@@ -247,16 +382,14 @@ impl Monitor {
 
         self.cpu.push(&[sample.cpu.percent]);
         self.cpu.set_max(100.0);
+        self.scale_net();
         self.cpu_label
             .set_label(&format!("CPU {:.0}%", sample.cpu.percent));
 
         let rx: f64 = sample.net.iter().map(|i| i.rx).sum();
         let tx: f64 = sample.net.iter().map(|i| i.tx).sum();
         self.net.push(&[rx, tx]);
-        // Rounded up to a size that reads well, so the scale doesn't creep.
-        let peak = self.net.peak().max(1024.0);
-        let scale = 2f64.powf(peak.log2().ceil());
-        self.net.set_max(scale);
+        let scale = self.scale_net();
         self.net_label.set_label(&format!(
             "Network: in {}/s, out {}/s (scale {}/s)",
             size(rx as u64),
@@ -297,6 +430,58 @@ impl Monitor {
         for ((_, meter), disk) in self.disk_rows.iter().zip(&sample.disks) {
             meter.set(disk.total - disk.available, disk.total);
         }
+    }
+
+    /// Scales the network chart to what it shows, rounded up to a size
+    /// that reads well so the scale doesn't creep, and returns the scale.
+    fn scale_net(&self) -> f64 {
+        let peak = self.net.peak().max(1024.0);
+        let scale = 2f64.powf(peak.log2().ceil());
+        self.net.set_max(scale);
+        scale
+    }
+
+    /// Asks the core for the history on disk over `range`. The reply
+    /// arrives as [`Msg::Trend`].
+    fn read_trend(&mut self, range: TrendRange, core: &Client, sender: &ComponentSender<App>) {
+        self.trend_read = Some(Instant::now());
+        let (core, node, input) = (core.clone(), self.node, sender.input_sender().clone());
+        runtime().spawn(async move {
+            if let Ok(Response::Trend { points }) =
+                core.execute(Command::MonitorTrend { node, range }).await
+            {
+                let msg = Msg::Trend(range, points);
+                let _ = input.send(AppMsg::Monitor { node, msg });
+            }
+        });
+    }
+
+    fn show_trend(&mut self, range: TrendRange, points: &[Sample]) {
+        // The range's whole length, so a short history fills in from the
+        // right as the live charts do. Gaps while Burrow was off close up.
+        let width = match range {
+            TrendRange::Hour => 60,
+            TrendRange::Day => 24 * 60,
+            TrendRange::Week => 7 * 24 * 12,
+        };
+        let cpu = points.iter().map(|p| p.cpu.percent).collect();
+        let rx = points
+            .iter()
+            .map(|p| p.net.iter().map(|i| i.rx).sum())
+            .collect();
+        let tx = points
+            .iter()
+            .map(|p| p.net.iter().map(|i| i.tx).sum())
+            .collect();
+        self.cpu.show(Some((vec![cpu], width)));
+        self.net.show(Some((vec![rx, tx], width)));
+        self.scale_net();
+        self.trend_note.set_label(if points.len() < 2 {
+            "Not enough history yet. Burrow keeps a point a minute while it monitors this host."
+        } else {
+            "Averaged history from this computer. The figures above are live."
+        });
+        self.trend_note.set_visible(true);
     }
 
     pub fn set_units(&mut self, units: Vec<Unit>) {
@@ -365,11 +550,41 @@ impl Monitor {
                 self.state = State::Closed;
                 self.show_message(&printable(&error), true);
             }
-            Msg::Systemd(systemd) => {
-                self.systemd = systemd;
+            Msg::History(history) => {
+                self.systemd = history.systemd;
+                if history.units.is_some() {
+                    self.units = history.units;
+                }
                 self.fill_units();
+                let recent = history.samples.len().saturating_sub(CHART_POINTS);
+                for sample in &history.samples[recent..] {
+                    self.cpu.push(&[sample.cpu.percent]);
+                    let rx = sample.net.iter().map(|i| i.rx).sum();
+                    let tx = sample.net.iter().map(|i| i.tx).sum();
+                    self.net.push(&[rx, tx]);
+                }
+                self.scale_net();
             }
             Msg::Filter => self.fill_units(),
+            // Handled by the window, which asks first.
+            Msg::SetBackground(_) => {}
+            Msg::Range(range) => {
+                self.range = range;
+                match range {
+                    Some(range) => self.read_trend(range, core, sender),
+                    None => {
+                        self.cpu.show(None);
+                        self.net.show(None);
+                        self.scale_net();
+                        self.trend_note.set_visible(false);
+                    }
+                }
+            }
+            Msg::Trend(range, points) => {
+                if self.range == Some(range) {
+                    self.show_trend(range, &points);
+                }
+            }
             Msg::Reconnect => {
                 if self.state == State::Closed {
                     self.state = State::Starting;
@@ -501,14 +716,34 @@ struct Chart {
 
 struct ChartData {
     series: Vec<VecDeque<f64>>,
+    /// Drawn instead of `series` while set: the history on disk, and how
+    /// many points the width stands for.
+    fixed: Option<(Vec<Vec<f64>>, usize)>,
     colors: Vec<gtk::gdk::RGBA>,
     max: f64,
+}
+
+impl ChartData {
+    /// What is drawn, and how many points the width stands for.
+    fn shown(&self) -> (Vec<Vec<f64>>, usize) {
+        match &self.fixed {
+            Some((fixed, points)) => (fixed.clone(), (*points).max(2)),
+            None => (
+                self.series
+                    .iter()
+                    .map(|s| s.iter().copied().collect())
+                    .collect(),
+                CHART_POINTS,
+            ),
+        }
+    }
 }
 
 impl Chart {
     fn new(colors: &[&str]) -> Chart {
         let data = Rc::new(RefCell::new(ChartData {
             series: vec![VecDeque::new(); colors.len()],
+            fixed: None,
             colors: colors
                 .iter()
                 .map(|c| gtk::gdk::RGBA::parse(*c).expect("a valid colour"))
@@ -535,10 +770,17 @@ impl Chart {
         }
     }
 
+    /// Draws `fixed` instead of the live values, as the newest of `points`
+    /// across the width, or the live values again.
+    fn show(&self, fixed: Option<(Vec<Vec<f64>>, usize)>) {
+        self.data.borrow_mut().fixed = fixed;
+        self.area.queue_draw();
+    }
+
     /// The highest value shown.
     fn peak(&self) -> f64 {
-        let data = self.data.borrow();
-        data.series.iter().flatten().copied().fold(0.0, f64::max)
+        let (series, _) = self.data.borrow().shown();
+        series.iter().flatten().copied().fold(0.0, f64::max)
     }
 
     fn set_max(&self, max: f64) {
@@ -572,10 +814,11 @@ fn draw(
     }
     let _ = cr.stroke();
 
-    let step = width / (CHART_POINTS - 1) as f64;
-    for (series, color) in data.series.iter().zip(&data.colors) {
+    let (shown, points) = data.shown();
+    let step = width / (points - 1) as f64;
+    for (series, color) in shown.iter().zip(&data.colors) {
         // The newest point is at the right edge.
-        let offset = CHART_POINTS - series.len();
+        let offset = points.saturating_sub(series.len());
         for (i, value) in series.iter().enumerate() {
             let x = (offset + i) as f64 * step;
             let y = height - (value / data.max).clamp(0.0, 1.0) * (height - 2.0) - 1.0;
@@ -593,6 +836,20 @@ fn draw(
         );
         cr.set_line_width(1.5);
         let _ = cr.stroke();
+    }
+}
+
+/// One line about an alert. Names come from the server.
+fn alert_text(kind: &AlertKind) -> String {
+    match kind {
+        AlertKind::UnitFailed { unit } => format!("{} failed", printable(unit)),
+        AlertKind::DiskFull { mount, percent } => {
+            format!("{} is {percent:.0}% full", printable(mount))
+        }
+        AlertKind::MemoryLow { percent } => {
+            format!("Only {percent:.0}% of memory is available")
+        }
+        AlertKind::Unreachable { error } => format!("Not answering: {}", printable(error)),
     }
 }
 
