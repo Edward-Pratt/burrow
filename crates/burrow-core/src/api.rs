@@ -565,7 +565,7 @@ pub struct StatementResult {
 }
 
 /// An error the database server reported.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

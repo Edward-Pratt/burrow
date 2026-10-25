@@ -724,12 +724,20 @@ async fn mcp(client: &Client, action: McpCmd) -> Result<ExitCode> {
 fn describe(kind: &str, shown: &GrantShown) -> String {
     let mut text = format!("{} ({kind})\n", clean(&shown.name));
     for (key, value) in &shown.props {
-        text.push_str(&format!("  {key} = {}\n", clean(&value.to_string())));
+        text.push_str(&format!(
+            "  {} = {}\n",
+            clean(key),
+            clean(&value.to_string())
+        ));
     }
     if let Some(via) = &shown.via {
         text.push_str(&format!("  through {}\n", clean(&via.name)));
         for (key, value) in &via.props {
-            text.push_str(&format!("    {key} = {}\n", clean(&value.to_string())));
+            text.push_str(&format!(
+                "    {} = {}\n",
+                clean(key),
+                clean(&value.to_string())
+            ));
         }
     }
     text
@@ -803,6 +811,19 @@ mod tests {
         assert_eq!(field(None), "\\N");
         assert_eq!(field(Some("a\tb\nc\\d")), "a\\tb\\nc\\\\d");
         assert_eq!(field(Some("\u{1b}[31m")), "\\u{1b}[31m");
+    }
+
+    #[test]
+    fn what_a_grant_shows_is_escaped_keys_too() {
+        let mut props = toml::Table::new();
+        props.insert("alias\u{1b}[2K".into(), "web\u{1b}[2K".into());
+        let shown = GrantShown {
+            name: "web".into(),
+            props,
+            via: None,
+        };
+        let text = describe("ssh-host", &shown);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
     }
 
     #[test]

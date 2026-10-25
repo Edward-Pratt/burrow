@@ -1738,7 +1738,8 @@ impl App {
         );
         for (key, value) in &shown.props {
             details.push_str(&format!(
-                "\n{key} = {}",
+                "\n{} = {}",
+                files::printable(key),
                 files::printable(&value.to_string())
             ));
         }
@@ -1746,7 +1747,8 @@ impl App {
             details.push_str(&format!("\n\nThrough {}:", files::printable(&via.name)));
             for (key, value) in &via.props {
                 details.push_str(&format!(
-                    "\n{key} = {}",
+                    "\n{} = {}",
+                    files::printable(key),
                     files::printable(&value.to_string())
                 ));
             }
@@ -1762,6 +1764,13 @@ impl App {
             Some(grant) => grant.capabilities.clone(),
             None => Default::default(),
         };
+        if node.kind == POSTGRES_KIND {
+            details.push_str(
+                "\n\nRead-only SQL is refused for a superuser, or a role that may write \
+                 files or run programs on the server, since Burrow can't keep those \
+                 read-only. For full safety, connect as a role that can only read.",
+            );
+        }
         let offered = capabilities(&node.kind);
         let options = offered
             .iter()

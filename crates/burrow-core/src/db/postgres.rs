@@ -389,6 +389,13 @@ fn cell(text: &str) -> String {
     format!("{}…", &text[..end])
 }
 
+/// Whether the session's role can act on the server beyond its data,
+/// which a read-only transaction doesn't stop.
+const POWERFUL: &str = "SELECT pg_catalog.current_setting('is_superuser') = 'on' OR EXISTS ( \
+     SELECT 1 FROM pg_catalog.pg_roles r \
+     WHERE r.rolname IN ('pg_execute_server_program', 'pg_write_server_files') \
+     AND pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER'))";
+
 impl Handle {
     /// Runs `sql`, keeping at most `limit` rows of each statement. A
     /// statement with more makes Burrow cancel the query: a result the
@@ -406,6 +413,11 @@ impl Handle {
     /// end the transaction (`COMMIT; DELETE …`). Preparing the SQL first
     /// makes the server refuse more than one statement, and one statement
     /// can't both leave the transaction and write.
+    ///
+    /// A read-only transaction still lets `COPY … TO` write files on the
+    /// server and `COPY … TO PROGRAM` run commands there, also from inside
+    /// a `DO` block. So a role that may do either, or a superuser, is
+    /// refused: Burrow can't keep it read-only.
     pub async fn query_read_only(self: &Arc<Self>, sql: &str, limit: usize) -> QueryResult {
         let _busy = self.busy.lock().await;
         let started = Instant::now();
@@ -417,8 +429,22 @@ impl Handle {
         if let Err(e) = self.client.batch_execute("BEGIN READ ONLY").await {
             return failed(&e);
         }
-        let result = match self.client.prepare(sql).await {
-            Ok(_) => self.query_locked(sql, limit).await,
+        let powerful = self.client.query_one(POWERFUL, &[]).await;
+        let result = match powerful.map(|row| row.get::<_, bool>(0)) {
+            Ok(true) => QueryResult {
+                error: Some(QueryError {
+                    message: "Burrow can't keep this role read-only: it is a superuser, or \
+                              may write files or run programs on the server. Connect as a \
+                              role without those rights, or allow writing."
+                        .to_string(),
+                    ..QueryError::default()
+                }),
+                ..QueryResult::default()
+            },
+            Ok(false) => match self.client.prepare(sql).await {
+                Ok(_) => self.query_locked(sql, limit).await,
+                Err(e) => failed(&e),
+            },
             Err(e) => failed(&e),
         };
         let _ = self.client.batch_execute("ROLLBACK").await;

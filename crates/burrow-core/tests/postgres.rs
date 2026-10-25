@@ -727,22 +727,33 @@ async fn the_mcp_bridge_cannot_write_without_a_write_grant() {
         return;
     };
     let (dir, core) = core();
-    let props = format!(
+    // The test user is a superuser: it makes a role that can only read.
+    let admin = format!(
         "socket = \"{}\"\nport = {}\nuser = \"{}\"\ndatabase = \"postgres\"",
         postgres.socket_dir(),
         postgres.port,
         whoami()
     );
-    let node = database(&core, &props).await;
+    let admin = database(&core, &admin).await;
+    let session = connect(&core, &admin, None).await;
+    writable(&core, session).await;
+    let setup = "create role reader login password 'secret'; \
+                 grant pg_read_all_data to reader; grant create on schema public to reader";
+    assert_eq!(query(&core, session, setup, None).await.error, None);
+    let props = postgres.tcp().replace(&whoami(), "reader");
+    let reader = database(&core, &props).await;
+    // Its password is saved, so the bridge's sessions ask nothing.
+    let session = connect(&core, &reader, Some(PASSWORD)).await;
+    core.execute(Command::CloseSession { session })
+        .await
+        .unwrap();
+
     let socket = serve(core, dir.path());
     let gui = Client::connect(&socket, Role::Gui).await.unwrap();
     let mcp = Client::connect(&socket, Role::Mcp).await.unwrap();
-    let open = || Command::OpenDatabase { node: node.id };
-    assert!(mcp.execute(open()).await.is_err());
-
-    grant(&gui, &node, &[SqlRead]).await;
-    let session = open_and_wait(&mcp, open()).await;
-    let run = async |sql: &str| match mcp
+    let open = |node: &Node| Command::OpenDatabase { node: node.id };
+    assert!(mcp.execute(open(&reader)).await.is_err());
+    let run = async |session, sql: &str| match mcp
         .execute(Command::RunQuery {
             session,
             sql: sql.into(),
@@ -755,7 +766,16 @@ async fn the_mcp_bridge_cannot_write_without_a_write_grant() {
         other => panic!("expected a result, got {other:?}"),
     };
 
-    assert_eq!(run("select 1").await.error, None);
+    // A superuser can write files and run programs from a read-only
+    // transaction, so it gets nothing read-only.
+    grant(&gui, &admin, &[SqlRead]).await;
+    let session = open_and_wait(&mcp, open(&admin)).await;
+    let refused = run(session, "select 1").await.error.unwrap();
+    assert!(refused.message.contains("can't keep this role read-only"));
+
+    grant(&gui, &reader, &[SqlRead]).await;
+    let session = open_and_wait(&mcp, open(&reader)).await;
+    assert_eq!(run(session, "select 1").await.error, None);
     // Each way out of read-only: plainly, by changing the setting, and by
     // ending the transaction. The last two are refused as two statements.
     for sql in [
@@ -763,7 +783,7 @@ async fn the_mcp_bridge_cannot_write_without_a_write_grant() {
         "set default_transaction_read_only = off; create table t (n int)",
         "commit; create table t (n int)",
     ] {
-        assert!(run(sql).await.error.is_some(), "{sql} ran");
+        assert!(run(session, sql).await.error.is_some(), "{sql} ran");
     }
     let error = mcp
         .execute(Command::SetReadOnly {
@@ -773,16 +793,16 @@ async fn the_mcp_bridge_cannot_write_without_a_write_grant() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("sql-write"), "{error}");
-    let missing = run("select to_regclass('t') is null").await;
+    let missing = run(session, "select to_regclass('t') is null").await;
     assert_eq!(missing.statements[0].rows, one("t"));
 
     // With a write grant it may make the session writable.
-    grant(&gui, &node, &[SqlWrite]).await;
+    grant(&gui, &reader, &[SqlWrite]).await;
     mcp.execute(Command::SetReadOnly {
         session,
         read_only: false,
     })
     .await
     .unwrap();
-    assert_eq!(run("create table t (n int)").await.error, None);
+    assert_eq!(run(session, "create table t (n int)").await.error, None);
 }
