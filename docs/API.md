@@ -102,7 +102,7 @@ Every subscriber receives events. They are sent for changes made through command
 | `monitor_sample` | `session`, `node`, `sample` | A monitor's server sent new stats, every 2 s. |
 | `monitor_units` | `session`, `node`, `units` | A monitor's server listed its services, and they differ from the last list. |
 | `autostart_changed` | `nodes` | The tunnels that start with Burrow changed. |
-| `prompt_requested` | `session`, `prompt { id, kind, title, message }` | A session waits for `answer_prompt`. |
+| `prompt_requested` | `session`, `prompt { id, kind, title, message, action? }` | A session waits for `answer_prompt`. |
 | `prompt_closed` | `session`, `prompt` (the id) | A prompt stopped waiting: a client answered it, or its session ended. A client still showing it should close it. |
 | `grants_changed` | `grants` | What the MCP bridge may do changed, including a grant going stale because its node changed. |
 | `addons_changed` | `addons` | An addon was added, removed, changed, approved, revoked, started or stopped. |
@@ -199,7 +199,7 @@ target_port = 5432           # "local" only
 - **The agent:** `burrow-agent` is a static program, built for x86_64 and aarch64 Linux servers, that only reads. It never listens on the network, and it stops when Burrow closes the session. Burrow puts it at `~/.local/share/burrow/burrow-agent-<version>` over SFTP on the host's shared connection, and removes other versions it finds there.
 - **Asked once per host:** before the first upload, the session asks a `confirm` prompt naming the host, the path and the program's SHA-256. The answer is kept in `$XDG_STATE_HOME/burrow/agent.toml`, pinned to the host node like a grant, so a node file can't approve it. Uploads after that, such as a new version, don't ask.
 - **Checked every time:** each `open_monitor` reads the file back and compares its hash with Burrow's copy, and replaces it if they differ. A symlink at the path, or on the way to it, fails the session: Burrow won't run or write through one.
-- **The server is not trusted:** a line from the agent over 1 MiB, or one that doesn't parse, ends the session, and so does an agent that doesn't say hello first or speaks another protocol version. Names lose control characters and are cut at 256 characters. Lists are cut (256 disks and interfaces, 4096 units), and numbers that no stat can have become 0.
+- **The server is not trusted:** a line from the agent over 1 MiB, or one that doesn't parse, ends the session, and so does an agent that doesn't say hello first or speaks another protocol version. Names lose control characters and are cut at 256 characters. Lists are cut (256 disks and interfaces, 4096 units), and numbers that no stat can have become 0. A sample still over 16 KiB as JSON ends the session too, so an hour of history stays under 30 MiB and fits one reply.
 - **Where Burrow finds the agent:** the builds are named `burrow-agent-<arch>` and read from `$BURROW_AGENT_DIR`, then `/usr/lib/burrow/`, then the cargo target folder Burrow was built in (`target/<arch>-unknown-linux-musl/agent/`). Build them with `cargo build -p burrow-agent --profile agent --target x86_64-unknown-linux-musl` (or `aarch64-unknown-linux-musl`).
 
 ## Databases

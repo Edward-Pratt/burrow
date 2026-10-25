@@ -85,7 +85,9 @@ pub fn uptime(text: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Bytes received and sent by each interface but loopback.
+/// Bytes received and sent by each interface but loopback and container
+/// veth pairs. A veth's traffic also crosses its bridge, and a host with
+/// many containers would otherwise send hundreds of them.
 pub fn net_dev(text: &str) -> BTreeMap<String, (u64, u64)> {
     let mut counters = BTreeMap::new();
     // Two header lines, then `name: rx_bytes … (8 rx fields) tx_bytes …`.
@@ -94,7 +96,7 @@ pub fn net_dev(text: &str) -> BTreeMap<String, (u64, u64)> {
             continue;
         };
         let name = name.trim();
-        if name == "lo" {
+        if name == "lo" || name.starts_with("veth") {
             continue;
         }
         let fields: Vec<u64> = rest
@@ -218,10 +220,11 @@ mod tests {
     }
 
     #[test]
-    fn net_dev_skips_loopback() {
+    fn net_dev_skips_loopback_and_veths() {
         let text = "Inter-|   Receive                                                |  Transmit\n \
              face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    \
              lo: 1000 10 0 0 0 0 0 0 1000 10 0 0 0 0 0 0\n  \
+             veth1a2b: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n  \
              eth0: 5000 50 0 0 0 0 0 0 7000 70 0 0 0 0 0 0\n";
         let counters = net_dev(text);
         assert_eq!(counters.len(), 1);

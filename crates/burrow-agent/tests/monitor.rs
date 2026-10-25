@@ -336,3 +336,39 @@ async fn the_mcp_bridge_monitors_only_with_a_grant_and_never_installs() {
         .unwrap_err();
     assert!(error.to_string().contains("did not open"), "{error}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changing_the_host_asks_again() {
+    let Some(mut rig) = Rig::start().await else {
+        return;
+    };
+    let first = rig.open_and_install().await;
+    rig.core
+        .execute(Command::CloseSession { session: first })
+        .await
+        .unwrap();
+    expect_state(&mut rig.events, first).await;
+    // Make an upload necessary, so consent is what decides.
+    fs::remove_file(rig.remote()).unwrap();
+
+    // The same node, now a different host as far as consent goes. Its
+    // alias still reaches the test server through the name.
+    let mut props = rig.node.props.clone();
+    props.remove("alias");
+    let patch = burrow_core::NodePatch {
+        name: Some("test".into()),
+        props: Some(props),
+        ..Default::default()
+    };
+    rig.core
+        .execute(Command::UpdateNode {
+            id: rig.node.id,
+            patch,
+        })
+        .await
+        .unwrap();
+
+    let second = rig.open().await;
+    let prompt = expect_prompt(&mut rig.events, second).await;
+    assert_eq!(prompt.title, "Install burrow-agent?");
+}

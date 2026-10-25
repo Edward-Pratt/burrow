@@ -29,6 +29,15 @@ const HISTORY: usize = 3600 / INTERVAL as usize;
 /// The longest line the agent may send. A few thousand services fit.
 const MAX_LINE: usize = 1 << 20;
 
+/// The most a sample may take once cleaned, as JSON. A real one is about
+/// a kilobyte; this bounds the history a server can make the daemon keep
+/// at [`HISTORY`] times this, about 29 MiB, so it still fits one reply.
+const MAX_SAMPLE: usize = 16 << 10;
+
+// A full history, with the latest units (no longer than a line), fits one
+// reply with room to spare.
+const _: () = assert!(HISTORY * MAX_SAMPLE + MAX_LINE < crate::ipc::MAX_LINE / 2);
+
 /// How long the agent gets to say hello, and then between lines.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const QUIET_TIMEOUT: Duration = Duration::from_secs(30);
@@ -138,7 +147,7 @@ pub(super) async fn run(
                                 return Err("burrow-agent sent something unexpected".into());
                             }
                             (Message::Sample(sample), true) => {
-                                let sample = clean_sample(sample);
+                                let sample = clean_sample(sample)?;
                                 let mut history = monitor.history.lock().unwrap();
                                 if history.samples.len() == HISTORY {
                                     history.samples.pop_front();
@@ -249,7 +258,8 @@ fn clean_number(number: &mut f64) {
     }
 }
 
-fn clean_sample(mut sample: Sample) -> Sample {
+/// `sample` in bounds, or an error if it is too big to keep.
+fn clean_sample(mut sample: Sample) -> Result<Sample, String> {
     clean_number(&mut sample.uptime);
     sample.load.iter_mut().for_each(clean_number);
     clean_number(&mut sample.cpu.percent);
@@ -269,7 +279,13 @@ fn clean_sample(mut sample: Sample) -> Sample {
     let memory = &mut sample.memory;
     memory.available = memory.available.min(memory.total);
     memory.swap_free = memory.swap_free.min(memory.swap_total);
-    sample
+    let size = serde_json::to_vec(&sample).map_or(usize::MAX, |json| json.len());
+    if size > MAX_SAMPLE {
+        return Err(format!(
+            "burrow-agent sent a sample of {size} bytes, over the limit of {MAX_SAMPLE}"
+        ));
+    }
+    Ok(sample)
 }
 
 fn clean_units(mut units: Vec<Unit>) -> Vec<Unit> {
@@ -318,6 +334,20 @@ mod tests {
     }
 
     #[test]
+    fn samples_over_the_budget_are_refused() {
+        let disk = Disk {
+            mount: "é".repeat(MAX_TEXT),
+            ..Disk::default()
+        };
+        let sample = Sample {
+            disks: vec![disk; MAX_ITEMS],
+            ..Sample::default()
+        };
+        let error = clean_sample(sample).unwrap_err();
+        assert!(error.contains("over the limit"), "{error}");
+    }
+
+    #[test]
     fn samples_are_kept_in_bounds() {
         let sample = clean_sample(Sample {
             uptime: -1.0,
@@ -340,7 +370,8 @@ mod tests {
                 tx: 5.0,
             }],
             ..Sample::default()
-        });
+        })
+        .unwrap();
         assert_eq!(sample.uptime, 0.0);
         assert_eq!(sample.cpu.percent, 100.0);
         assert_eq!(sample.disks.len(), MAX_ITEMS);
