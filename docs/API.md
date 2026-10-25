@@ -1,6 +1,6 @@
 # Burrow core API
 
-Every client drives `burrow-core` through one API: the GTK UI, addons, `burrow-cli` and the MCP bridge. In-process clients call `Core::execute(Command)` and `Core::subscribe()`. Out-of-process clients will use the same types as JSON-RPC over a Unix socket (milestone 8).
+Every client drives `burrow-core` through one API: the GTK UI, addons, `burrow-cli` and the MCP bridge. In-process clients call `Core::execute(Command)` and `Core::subscribe()`. Out-of-process clients use the same types as JSON-RPC over a Unix socket; see [Socket](#socket).
 
 API version: **1** (`burrow_core::API_VERSION`). Breaking changes bump it.
 
@@ -46,8 +46,11 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `start_tunnel` | `node` | `session { session }` |
 | `list_autostart` | | `autostart { nodes }` |
 | `set_autostart` | `node`, `enabled`, `expect?` | `ok` |
+| `exec` | `node`, `command`, `timeout?` | `exec { result }` |
 | `open_files` | `node` | `session { session }` |
 | `list_dir` | `session`, `path?` (empty = home) | `dir { path, entries }` |
+| `read_file` | `session`, `path`, `limit?` | `file { data, size }` |
+| `write_file` | `session`, `path`, `data`, `overwrite?` | `ok` |
 | `make_dir` | `session`, `path` | `ok` |
 | `rename_path` | `session`, `from`, `to` | `ok` |
 | `remove_path` | `session`, `path` | `ok` |
@@ -62,6 +65,8 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `export_query` | `session`, `sql`, `path` | `exported { rows }` |
 | `list_history` | `node` | `history { entries }`, oldest first |
 | `clear_history` | `node` | `ok` |
+| `list_grants` | | `grants { grants }` |
+| `set_grant` | `node`, `capabilities`, `expect?` | `ok` |
 | `list_addons` | | `addons { addons }`, sorted by id |
 | `approve_addon` | `id`, `fingerprint` | `ok` |
 | `revoke_addon` | `id` | `ok` |
@@ -94,6 +99,8 @@ Every subscriber receives events. They are sent for changes made through command
 | `transfer_changed` | `transfer`, `session`, `state` | A download or upload moved on: `running { done, total }` (at most a few times a second), `finished`, `failed { error }` or `cancelled`. |
 | `autostart_changed` | `nodes` | The tunnels that start with Burrow changed. |
 | `prompt_requested` | `session`, `prompt { id, kind, title, message }` | A session waits for `answer_prompt`. |
+| `prompt_closed` | `session`, `prompt` (the id) | A prompt stopped waiting: a client answered it, or its session ended. A client still showing it should close it. |
+| `grants_changed` | `grants` | What the MCP bridge may do changed, including a grant going stale because its node changed. |
 | `addons_changed` | `addons` | An addon was added, removed, changed, approved, revoked, started or stopped. |
 | `view_changed` | `node`, `view` | The addon that owns `node` redrew its view. |
 
@@ -103,13 +110,25 @@ A subscriber that falls more than 256 events behind gets a "lagged" error and sh
 
 `open_terminal` on an `ssh-host` node replies at once with a session id. The session then connects in the background and reports each step as `session_changed`.
 
-Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files` or `database`) and `state`.
+Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files`, `database` or `exec`) and `state`.
 
 - **Host settings** come from `ssh -G <alias>`, so `Include`, `Match`, `Host` patterns and defaults apply exactly as for `ssh <alias>`. `props.alias` is the alias (the node's name when missing). An alias that is empty, starts with `-`, or has spaces or control characters is refused, because node files can come from a shared folder.
 - **Host keys** are checked against the `UserKnownHostsFile` and `GlobalKnownHostsFile` files, following `StrictHostKeyChecking`. A changed or `@revoked` key is always refused. A new key is asked about (`ask`) or added (`accept-new`/`no`), except when the host has known keys of another type, which is always asked about. New keys go into the first user file, hashed if `HashKnownHosts` is on.
 - **Signing in** tries agent keys (`IdentityAgent`, configured keys first, only those with `IdentitiesOnly`), then key files (asking for passphrases), then a password, then keyboard-interactive.
 - **Saved passwords** are kept in the keyring with the `user@host:port` they were used for (`password-target`), and are only sent there.
 - **Not yet supported:** `ProxyJump` and `ProxyCommand` make the session fail with a message, rather than being ignored.
+
+### Commands without a terminal
+
+`exec` runs one command on an `ssh-host` node, as `ssh host command` does, and replies when it has finished:
+
+```json
+{"type": "exec", "result": {"status": 0, "signal": null, "stdout": "…", "stderr": "", "truncated": false, "timed_out": false}}
+```
+
+- **Session:** it runs as a session of kind `exec`, on the host's shared connection, so connecting reports `session_changed` and can ask questions like any session. The reply only comes at the end, so a client that wants to answer those prompts watches for `prompt_requested` from a session on that node.
+- **Timeout:** `timeout` is in seconds, 60 when missing and at most 3600, and covers connecting too. A command still running then is sent SIGTERM (on servers that take signals), and the reply has `timed_out` and the output so far.
+- **Output:** each stream is decoded as UTF-8, with invalid bytes replaced, and cut at 1 MiB (`truncated`).
 
 ### Prompts
 
@@ -121,11 +140,11 @@ Terminals, tunnels and file sessions on the same host share one SSH connection, 
 | `secret` (`can_save`) | `{"type": "text", "value": "…", "save": false}`, or `cancel` |
 | `text` | `{"type": "text", "value": "…"}`, or `cancel` |
 
-A prompt left unanswered when the session closes counts as cancelled.
+A prompt left unanswered when the session closes counts as cancelled. Any client that may run `answer_prompt` can answer any session's prompt, and the first answer wins. Every prompt ends with `prompt_closed`, so the others can close their dialogs.
 
 ### Output stream
 
-Terminal output is not sent as events: a burst of output would push every subscriber past its event buffer. In-process clients take each session's output with `Core::take_output(session)`, once. It is a bounded stream, so a slow reader slows the SSH channel down instead of losing output. Dropping the stream ends the session. Out-of-process clients will receive the same bytes as notifications (milestone 8).
+Terminal output is not sent as events: a burst of output would push every subscriber past its event buffer. In-process clients take each session's output with `Core::take_output(session)`, once. It is a bounded stream, so a slow reader slows the SSH channel down instead of losing output. Dropping the stream ends the session. Socket clients ask for it with `take_output` and receive it as `output` notifications; see [Socket](#socket).
 
 ## SSH tunnels
 
@@ -305,6 +324,59 @@ A view is a list of blocks, drawn top to bottom with native widgets:
 ```
 
 `input` is `text`, `multiline`, `check` or `choice`. Submitting a form sends its `action` with `values`: a bool for `check`, a string for the rest. Tables show their first 500 rows.
+
+## Socket
+
+`burrowd` serves the API on a Unix socket to clients in other processes: the GTK window, `burrow` (the CLI) and its MCP bridge. Only processes running as the same user may connect; the daemon checks the peer's uid with `SO_PEERCRED`.
+
+JSON-RPC 2.0, one message per line (UTF-8, `\n`-terminated), in both directions. A line over 64 MiB drops the connection.
+
+The client sends:
+
+| Method | Params | Result |
+|---|---|---|
+| `initialize` | `{ api, role, build }` | `{ api, build, addons_dir }` |
+| `execute` | a [command](#commands) | its response, or an error |
+| `take_output` | `{ session }` | null; the terminal's output follows as `output` |
+| `release_output` (notification) | `{ session }` | ends the session, as dropping the stream does in-process |
+
+The daemon sends:
+
+| Method | Params | When |
+|---|---|---|
+| `event` (notification) | an [event](#events) | Every event the client's role may see. |
+| `resync` (notification) | | The client fell behind and missed events; list again. |
+| `output` (notification) | `{ session, data }` | Terminal output, `data` in base64. |
+| `output_ended` (notification) | `{ session }` | The terminal has no more output. It always comes after the last `output`. |
+
+- **`initialize` first:** anything else before it is refused. `api` must be the daemon's `API_VERSION`. `build` is the client's version; the daemon's comes back, so a client can tell it is talking to a daemon from before an upgrade.
+- **Roles:** `role` is `gui` (the GTK window), `cli` or `mcp` (the MCP bridge). `gui` and `cli` may run every command. `mcp` may only do what the user granted; see [MCP bridge](#mcp-bridge).
+- **Sessions belong to their client:** terminals, file sessions and database sessions close when the client that opened them disconnects. Tunnels belong to the daemon and keep running.
+- **Output and events:** replies and events are sent before terminal output, so a busy terminal does not hold them up. Terminal output that the client reads slowly slows the session down rather than being dropped.
+
+## MCP bridge
+
+`burrow mcp serve` lets an AI assistant such as Claude use Burrow, as a client with the `mcp` role. It may only do what the user granted, node by node.
+
+| Capability | On | Allows |
+|---|---|---|
+| `sql-read` | `postgres` | `open_database`, `list_schema`, `cancel_query`, and `run_query` that cannot write |
+| `sql-write` | `postgres` | the above, `run_query` that writes, and `set_read_only` |
+| `exec` | `ssh-host` | `exec` |
+| `files-read` | `ssh-host` | `open_files`, `list_dir`, `read_file` |
+| `files-write` | `ssh-host` | the above, `write_file`, `make_dir`, `rename_path`, `remove_path` |
+| `tunnel` | `ssh-tunnel` | `start_tunnel`, and `close_session` on that tunnel |
+
+- **Always allowed:** `version`, `list_nodes`, `get_node`, `list_sessions` and `list_grants`. Nodes hold no secrets.
+- **Never allowed:** changing nodes, secrets, prompts, autostart, addons, grants, terminals and history. `download`, `upload` and `export_query` are refused because they take a local path. The bridge works with contents instead (`read_file`, `write_file`), so it can't read or overwrite the user's own files.
+- **Its own sessions:** session commands only work on sessions the bridge opened itself. Those sessions close when it disconnects.
+- **Read-only SQL:** without `sql-write`, every query runs as one statement inside `BEGIN READ ONLY` … `ROLLBACK`. Postgres refuses to prepare more than one statement, so SQL can't change the setting or end the transaction and then write.
+  - A read-only transaction still allows `COPY … TO` a file and `COPY … TO PROGRAM`, which runs a command on the database server, also from inside a `DO` block. So read-only SQL is refused when the role is, or is a member of, a superuser role, `pg_write_server_files` or `pg_execute_server_program`, since a member can `SET ROLE` into them from a `DO` block.
+  - Some functions still have effects, such as `pg_terminate_backend` for a role allowed to use it. For full safety, give the node a database role that can only read, such as one granted `pg_read_all_data`.
+- **Grants are pinned:** `set_grant` needs `expect`, the node as the user saw it (`name`, `props`, and the same for the node in `props.via`). A grant is kept in `$XDG_STATE_HOME/burrow/mcp.toml` with a fingerprint of those settings. If a node file changes, the grant goes stale (`stale` in `list_grants`) and allows nothing until it is granted again. An empty `capabilities` revokes.
+- **Audit log:** every command the bridge sends goes on a line of `$XDG_STATE_HOME/burrow/mcp-audit.log`, with whether it ran and why not. A refused command is logged by its type only, and file contents by their size.
+- **Events:** the bridge only hears `node_*` events and `grants_changed`. It follows its own sessions by listing them.
+- **Not a wall against the user's own programs:** grants limit what the assistant can do through the bridge. Any process running as the user can connect with another role, so an assistant that can also run shell commands could use `burrow` directly.
 
 ## Secrets
 

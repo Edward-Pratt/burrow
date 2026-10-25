@@ -30,9 +30,9 @@ Cargo workspace:
 | Crate | Role |
 |---|---|
 | `burrow-core` | Connections, secrets, sessions, addon host, config. No UI code. |
-| `burrow-gtk` | Thin GTK4 client on top of the core. |
-| `burrowd` (later) | The core as a user systemd service, so tunnels and monitoring keep running with the window closed. |
-| `burrow-cli` (later) | A command-line client. |
+| `burrow-gtk` | Thin GTK4 client of the core in `burrowd`. |
+| `burrowd` | The core as a process of its own, so tunnels and monitoring keep running with the window closed. Started by a client, or by a systemd user unit. |
+| `burrow-cli` | The `burrow` command-line client, and the MCP bridge (`burrow mcp serve`). |
 
 ### One versioned API for every client
 
@@ -40,7 +40,7 @@ The core is driven only through a single command and event API, defined in one p
 
 - **Commands** are requests (`connect`, `open_terminal`, `run_query`) and return a result.
 - **Events** are what the core pushes to subscribers (`session_state_changed`, `query_progress`, `alert_raised`).
-- **Clients:** the GTK UI, addons, `burrow-cli` and the MCP bridge for Claude are all clients of this API. None of them use a private shortcut into the core. In-process, the UI calls it directly; out-of-process clients use JSON-RPC over a Unix socket.
+- **Clients:** the GTK UI, addons, `burrow-cli` and the MCP bridge for Claude are all clients of this API. None of them use a private shortcut into the core. Addons speak JSON-RPC over stdio; the UI, the CLI and the MCP bridge speak it over the daemon's Unix socket, each in a role that limits what it may do.
 - **Addon protocol:** the addon protocol is a permission-filtered subset of the same API.
 - **Testing:** the core is tested headless against Docker containers running `sshd` and Postgres.
 
@@ -141,5 +141,5 @@ Built-in features use the same addon API as third-party ones.
 5. Addon protocol v1: manifest, loader, declarative UI, permissions
 6. SSH tunnels + SFTP file panel
 7. Postgres client in the core, since addons never see secrets (GtkSourceView editor, GtkColumnView grid), then the rest
-8. `burrowd` + `burrow-cli` + MCP bridge
+8. `burrowd` + `burrow-cli` + MCP bridge, with per-node grants for what an assistant may do
 9. `burrow-agent` + monitoring addon

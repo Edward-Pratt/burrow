@@ -9,8 +9,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use burrow_core::ipc::Client;
 use burrow_core::{
-    Command, Core, FileEntry, FileKind, NodeId, Response, SessionId, SessionState, TransferId,
+    Command, FileEntry, FileKind, NodeId, Response, SessionId, SessionState, TransferId,
     TransferState,
 };
 use relm4::gtk::prelude::*;
@@ -302,7 +303,7 @@ impl Files {
     pub fn session_changed(
         &mut self,
         state: &SessionState,
-        core: &Core,
+        core: &Client,
         sender: &ComponentSender<App>,
     ) {
         match state {
@@ -330,7 +331,7 @@ impl Files {
     pub fn update(
         &mut self,
         msg: Msg,
-        core: &Core,
+        core: &Client,
         window: &gtk::ApplicationWindow,
         sender: &ComponentSender<App>,
     ) {
@@ -649,7 +650,7 @@ impl Files {
         &mut self,
         transfer: TransferId,
         state: &TransferState,
-        core: &Core,
+        core: &Client,
         sender: &ComponentSender<App>,
     ) {
         let node = self.node;
@@ -743,7 +744,7 @@ impl Files {
     }
 
     /// Lists `path`, or the home folder when it is empty.
-    fn list_dir(&self, path: String, core: &Core, sender: &ComponentSender<App>) {
+    fn list_dir(&self, path: String, core: &Client, sender: &ComponentSender<App>) {
         let State::Running(session) = self.state else {
             return;
         };
@@ -762,7 +763,7 @@ impl Files {
     fn change(
         &self,
         command: impl FnOnce(SessionId) -> Command,
-        core: &Core,
+        core: &Client,
         sender: &ComponentSender<App>,
     ) {
         let State::Running(session) = self.state else {
@@ -783,7 +784,7 @@ impl Files {
         &self,
         label: String,
         command: impl FnOnce(SessionId) -> Command,
-        core: &Core,
+        core: &Client,
         sender: &ComponentSender<App>,
     ) {
         let State::Running(session) = self.state else {
@@ -846,7 +847,7 @@ impl Files {
 
 /// Asks the core for an SFTP session on `node`. The reply arrives as
 /// [`Msg::Started`] or [`Msg::StartFailed`].
-pub fn start(core: &Core, node: NodeId, sender: &ComponentSender<App>) {
+pub fn start(core: &Client, node: NodeId, sender: &ComponentSender<App>) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
         let msg = match core.execute(Command::OpenFiles { node }).await {
@@ -961,7 +962,7 @@ fn parent(path: &str) -> Option<String> {
 
 /// A name or error from the server, with control characters replaced so
 /// they can't change what is around them.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { '\u{fffd}' } else { c })
         .collect()

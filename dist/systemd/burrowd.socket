@@ -1,0 +1,10 @@
+[Unit]
+Description=Burrow core socket
+
+[Socket]
+ListenStream=%t/burrow/burrowd.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

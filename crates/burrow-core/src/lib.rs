@@ -7,9 +7,12 @@
 
 mod addon;
 mod api;
+pub mod daemon;
 mod db;
 mod engine;
 mod error;
+mod grants;
+pub mod ipc;
 mod net;
 mod password;
 mod secrets;
@@ -19,13 +22,13 @@ mod watch;
 
 pub use api::{
     API_VERSION, AddonAction, AddonCommand, AddonInfo, AddonKind, AddonState, Block, Button,
-    Command, DbColumn, DbSchema, DbTable, DbTableKind, Event, FOLDER_KIND, Field, FileEntry,
-    FileKind, FormField, FormInput, FormValue, HistoryEntry, Node, NodeId, NodePatch,
-    POSTGRES_KIND, Problem, Prompt, PromptAnswer, PromptKind, QueryError, QueryResult, Response,
-    SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionInfo, SessionKind, SessionState,
-    StatementResult, TransferId, TransferState, TunnelShown, View,
+    Capability, Command, DbColumn, DbSchema, DbTable, DbTableKind, Event, ExecResult, FOLDER_KIND,
+    Field, FileEntry, FileKind, FormField, FormInput, FormValue, Grant, GrantShown, HistoryEntry,
+    Node, NodeId, NodePatch, POSTGRES_KIND, Problem, Prompt, PromptAnswer, PromptKind, QueryError,
+    QueryResult, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionInfo,
+    SessionKind, SessionState, StatementResult, TransferId, TransferState, TunnelShown, View,
 };
-pub use engine::{Core, CoreOptions};
+pub use engine::{Core, CoreOptions, Paths};
 pub use error::{Error, Result};
 pub use secrets::{KeyringStore, MemoryStore, SecretKey, SecretStore};
 pub use watch::Watcher;

@@ -717,3 +717,108 @@ async fn query_error(core: &Core, session: SessionId) -> String {
     };
     core.execute(command).await.unwrap_err().to_string()
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mcp_bridge_cannot_write_without_a_write_grant() {
+    use burrow_core::Capability::{SqlRead, SqlWrite};
+    use burrow_core::ipc::{Client, Role};
+
+    let Some(postgres) = Postgres::start() else {
+        return;
+    };
+    let (dir, core) = core();
+    // The test user is a superuser: it makes a role that can only read.
+    let admin = format!(
+        "socket = \"{}\"\nport = {}\nuser = \"{}\"\ndatabase = \"postgres\"",
+        postgres.socket_dir(),
+        postgres.port,
+        whoami()
+    );
+    let admin = database(&core, &admin).await;
+    let session = connect(&core, &admin, None).await;
+    writable(&core, session).await;
+    let setup = format!(
+        "create role reader login password 'secret'; \
+         grant pg_read_all_data to reader; grant create on schema public to reader; \
+         create role climber login password 'secret'; grant \"{}\" to climber",
+        whoami()
+    );
+    assert_eq!(query(&core, session, &setup, None).await.error, None);
+    let props = postgres.tcp().replace(&whoami(), "reader");
+    let reader = database(&core, &props).await;
+    // Its password is saved, so the bridge's sessions ask nothing.
+    let session = connect(&core, &reader, Some(PASSWORD)).await;
+    core.execute(Command::CloseSession { session })
+        .await
+        .unwrap();
+
+    // Not a superuser, but it can become one with SET ROLE.
+    let props = postgres.tcp().replace(&whoami(), "climber");
+    let climber = database(&core, &props).await;
+    let session = connect(&core, &climber, Some(PASSWORD)).await;
+    core.execute(Command::CloseSession { session })
+        .await
+        .unwrap();
+
+    let socket = serve(core, dir.path());
+    let gui = Client::connect(&socket, Role::Gui).await.unwrap();
+    let mcp = Client::connect(&socket, Role::Mcp).await.unwrap();
+    let open = |node: &Node| Command::OpenDatabase { node: node.id };
+    assert!(mcp.execute(open(&reader)).await.is_err());
+    let run = async |session, sql: &str| match mcp
+        .execute(Command::RunQuery {
+            session,
+            sql: sql.into(),
+            limit: None,
+        })
+        .await
+        .unwrap()
+    {
+        Response::Query { result } => result,
+        other => panic!("expected a result, got {other:?}"),
+    };
+
+    // A superuser can write files and run programs from a read-only
+    // transaction, so it gets nothing read-only.
+    grant(&gui, &admin, &[SqlRead]).await;
+    let session = open_and_wait(&mcp, open(&admin)).await;
+    let refused = run(session, "select 1").await.error.unwrap();
+    assert!(refused.message.contains("can't keep this role read-only"));
+    grant(&gui, &climber, &[SqlRead]).await;
+    let session = open_and_wait(&mcp, open(&climber)).await;
+    let refused = run(session, "select 1").await.error.unwrap();
+    assert!(refused.message.contains("can't keep this role read-only"));
+
+    grant(&gui, &reader, &[SqlRead]).await;
+    let session = open_and_wait(&mcp, open(&reader)).await;
+    assert_eq!(run(session, "select 1").await.error, None);
+    // Each way out of read-only: plainly, by changing the setting, and by
+    // ending the transaction. The last two are refused as two statements.
+    for sql in [
+        "create table t (n int)",
+        "set default_transaction_read_only = off; create table t (n int)",
+        "commit; create table t (n int)",
+    ] {
+        assert!(run(session, sql).await.error.is_some(), "{sql} ran");
+    }
+    let error = mcp
+        .execute(Command::SetReadOnly {
+            session,
+            read_only: false,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("sql-write"), "{error}");
+    let missing = run(session, "select to_regclass('t') is null").await;
+    assert_eq!(missing.statements[0].rows, one("t"));
+
+    // With a write grant it may make the session writable.
+    grant(&gui, &reader, &[SqlWrite]).await;
+    mcp.execute(Command::SetReadOnly {
+        session,
+        read_only: false,
+    })
+    .await
+    .unwrap();
+    assert_eq!(run(session, "create table t (n int)").await.error, None);
+}

@@ -5,15 +5,17 @@
 //! it. The UI never edits its node list directly, so it always matches the
 //! core, including after edits made outside Burrow.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
+use burrow_core::ipc::{self, Client, Role};
 use burrow_core::{
-    AddonInfo, Command, Core, Event, FormValue, Node, NodeId, NodePatch, POSTGRES_KIND, Problem,
-    Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId, SessionInfo, SessionKind,
-    SessionState, TunnelShown, View, Watcher,
+    AddonInfo, Capability, Command, Event, FormValue, Grant, GrantShown, Node, NodeId, NodePatch,
+    POSTGRES_KIND, Problem, Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId,
+    SessionInfo, SessionKind, SessionState, TunnelShown, View,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
@@ -34,9 +36,12 @@ use crate::terminal;
 use crate::tunnels;
 
 pub struct Init {
-    pub core: Core,
+    pub core: Client,
     pub config_dir: PathBuf,
 }
+
+/// How long to wait between attempts to reach a daemon that went away.
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// How long a message from an addon stays in the status bar.
 const NOTICE_TIME: Duration = Duration::from_secs(6);
@@ -67,6 +72,10 @@ pub enum AppMsg {
     SessionsListed(Vec<SessionInfo>),
     /// We missed events; reload everything.
     Resync,
+    /// The daemon went away; [`AppMsg::Reconnected`] follows once a new
+    /// connection is up.
+    Disconnected,
+    Reconnected(Client),
     Failed(String),
 
     // From the user.
@@ -142,6 +151,12 @@ pub enum AppMsg {
         msg: database::Msg,
     },
     EditDatabase(NodeId),
+    /// Asks what the MCP bridge may do on a node.
+    EditGrant(NodeId),
+    GrantLoaded {
+        node: NodeId,
+        grant: Option<Grant>,
+    },
     SetAutostart {
         node: NodeId,
         enabled: bool,
@@ -205,7 +220,7 @@ struct Tab {
 }
 
 pub struct App {
-    core: Core,
+    core: Client,
     config_dir: PathBuf,
     settings: UiSettings,
     nodes: HashMap<NodeId, Node>,
@@ -239,8 +254,10 @@ pub struct App {
     restarting: HashSet<NodeId>,
     /// Tunnels that start with Burrow.
     autostart: HashSet<NodeId>,
-    /// Watches the config folder while the window is open.
-    _watcher: Option<Watcher>,
+    /// Prompt dialogs on screen, by session and prompt id, to close when
+    /// another client answers first. A `RefCell` because prompts are asked
+    /// while a tab's panel is borrowed.
+    prompts: RefCell<HashMap<(SessionId, u32), dialogs::Dismiss>>,
     sidebar_dirty: bool,
 }
 
@@ -283,18 +300,8 @@ impl Component for App {
         // missed.
         listen(&core, &sender);
         load(&core, &sender);
-        {
-            let _runtime = runtime().enter();
-            core.autostart();
-        }
-        let (watcher, error) = {
-            let _runtime = runtime().enter();
-            match core.watch() {
-                Ok(watcher) => (Some(watcher), None),
-                Err(e) => (None, Some(format!("Live reload is off: {e}"))),
-            }
-        };
 
+        let error = stale_daemon(&core);
         let widgets = build(&window, &sender);
         widgets.sidebar_pane.set_visible(settings.sidebar_visible);
         add_shortcuts(&window, &sender);
@@ -322,7 +329,7 @@ impl Component for App {
             tunnel_pages: HashMap::new(),
             restarting: HashSet::new(),
             autostart: HashSet::new(),
-            _watcher: watcher,
+            prompts: RefCell::default(),
             sidebar_dirty: false,
         };
         model.apply_theme();
@@ -379,6 +386,41 @@ impl Component for App {
                 self.take_sessions(sessions, window, &sender);
             }
             AppMsg::Resync => load(&self.core, &sender),
+            AppMsg::Disconnected => {
+                self.error = Some("Lost the connection to burrowd. Reconnecting…".to_string());
+            }
+            AppMsg::Reconnected(client) => {
+                self.core = client;
+                self.error = stale_daemon(&self.core);
+                // Their sessions are gone, and no answer could reach them.
+                for (_, dialog) in self.prompts.get_mut().drain() {
+                    dialog.dismiss();
+                }
+                // Sessions ended with the daemon that ran them. Tunnels are
+                // settled by the reload; the rest are only known here.
+                let ended: Vec<(NodeId, SessionId)> = (self.remotes.iter())
+                    .map(|(node, r)| (*node, &r.state))
+                    .chain(self.files.iter().map(|(node, p)| (*node, &p.state)))
+                    .chain(self.databases.iter().map(|(node, p)| (*node, &p.state)))
+                    .filter_map(|(node, state)| match state {
+                        remote::State::Running(session) => Some((node, *session)),
+                        _ => None,
+                    })
+                    .collect();
+                for (node, session) in ended {
+                    let state = SessionState::Closed {
+                        error: Some("Burrow's core stopped".to_string()),
+                    };
+                    let event = Event::SessionChanged {
+                        session,
+                        node,
+                        state,
+                    };
+                    self.session_event(event, window, &sender);
+                }
+                listen(&self.core, &sender);
+                load(&self.core, &sender);
+            }
             AppMsg::Failed(error) => self.error = Some(error),
 
             AppMsg::RowActivated(index) => {
@@ -567,6 +609,21 @@ impl Component for App {
                 }
             }
             AppMsg::EditDatabase(node) => self.edit_database(Some(node), None, window, &sender),
+            AppMsg::EditGrant(node) => {
+                let (core, input) = (self.core.clone(), sender.input_sender().clone());
+                runtime().spawn(async move {
+                    let message = match core.execute(Command::ListGrants).await {
+                        Ok(Response::Grants { grants }) => AppMsg::GrantLoaded {
+                            node,
+                            grant: grants.into_iter().find(|g| g.node == node),
+                        },
+                        Ok(_) => return,
+                        Err(e) => AppMsg::Failed(e.to_string()),
+                    };
+                    let _ = input.send(message);
+                });
+            }
+            AppMsg::GrantLoaded { node, grant } => self.edit_grant(node, grant, window, &sender),
             AppMsg::SetAutostart { node, enabled } => {
                 // What the tab shows: it is redrawn on every change.
                 let expect = self
@@ -661,7 +718,7 @@ impl Component for App {
                 execute(&self.core, &sender, Command::RevokeAddon { id });
             }
             AppMsg::OpenAddonsFolder => {
-                let folder = gio::File::for_path(self.core.addons_dir());
+                let folder = gio::File::for_path(&self.core.info().addons_dir);
                 gtk::FileLauncher::new(Some(&folder)).launch(
                     Some(window),
                     None::<&gio::Cancellable>,
@@ -790,7 +847,15 @@ impl App {
             }
             Event::ProblemsChanged { problems } => self.problems = problems,
             // Handled by `session_event`, which needs the window.
-            Event::SessionChanged { .. } | Event::PromptRequested { .. } => {}
+            // The grant dialog lists grants when it opens.
+            Event::SessionChanged { .. }
+            | Event::PromptRequested { .. }
+            | Event::GrantsChanged { .. } => {}
+            Event::PromptClosed { session, prompt } => {
+                if let Some(dialog) = self.prompts.get_mut().remove(&(session, prompt)) {
+                    dialog.dismiss();
+                }
+            }
             Event::AddonsChanged { addons } => self.set_addons(addons, widgets, sender),
             Event::ViewChanged { node, view } => self.show_view(node, Ok(view), sender),
             Event::AutostartChanged { nodes } => {
@@ -1030,7 +1095,7 @@ impl App {
     ) {
         let (core, sender) = (self.core.clone(), sender.clone());
         let id = prompt.id;
-        dialogs::answer(window, prompt, move |answer| {
+        let dialog = dialogs::answer(window, prompt, move |answer| {
             let command = Command::AnswerPrompt {
                 session,
                 prompt: id,
@@ -1038,6 +1103,7 @@ impl App {
             };
             execute(&core, &sender, command);
         });
+        self.prompts.borrow_mut().insert((session, id), dialog);
     }
 
     fn tunnel_of(&self, session: SessionId) -> Option<NodeId> {
@@ -1617,6 +1683,9 @@ impl App {
                 if node.kind == POSTGRES_KIND {
                     entries.push(("Edit…".into(), AppMsg::EditDatabase(node.id)));
                 }
+                if !capabilities(&node.kind).is_empty() {
+                    entries.push(("Claude access…".into(), AppMsg::EditGrant(node.id)));
+                }
                 for addon in self.addons.iter().filter(|a| addons::usable(a)) {
                     let actions = addon.actions.iter();
                     for action in actions.filter(|a| a.kinds.contains(&node.kind)) {
@@ -1647,6 +1716,83 @@ impl App {
             glib::idle_add_local_once(move || popover.unparent());
         });
         popover.popup();
+    }
+
+    /// The grant dialog. The grant is pinned to the node as the dialog
+    /// shows it, so a change made meanwhile makes saving fail instead.
+    fn edit_grant(
+        &self,
+        id: NodeId,
+        grant: Option<Grant>,
+        window: &gtk::ApplicationWindow,
+        sender: &ComponentSender<Self>,
+    ) {
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        let nodes: Vec<Node> = self.nodes.values().cloned().collect();
+        let shown = GrantShown::of(node, &nodes);
+        let mut details = format!(
+            "What Claude may do on {} through Burrow's MCP bridge (burrow mcp serve). \
+             It holds only while these settings stay as they are:\n",
+            files::printable(&node.name)
+        );
+        for (key, value) in &shown.props {
+            details.push_str(&format!(
+                "\n{} = {}",
+                files::printable(key),
+                files::printable(&value.to_string())
+            ));
+        }
+        if let Some(via) = &shown.via {
+            details.push_str(&format!("\n\nThrough {}:", files::printable(&via.name)));
+            for (key, value) in &via.props {
+                details.push_str(&format!(
+                    "\n{} = {}",
+                    files::printable(key),
+                    files::printable(&value.to_string())
+                ));
+            }
+        }
+        let granted = match &grant {
+            Some(grant) if grant.stale => {
+                details.push_str(
+                    "\n\nThese changed since access was given, so nothing is allowed \
+                     until you save again.",
+                );
+                Default::default()
+            }
+            Some(grant) => grant.capabilities.clone(),
+            None => Default::default(),
+        };
+        if node.kind == POSTGRES_KIND {
+            details.push_str(
+                "\n\nRead-only SQL is refused for a superuser, or a role that may write \
+                 files or run programs on the server, since Burrow can't keep those \
+                 read-only. For full safety, connect as a role that can only read. \
+                 Allowing SQL that writes as a superuser also lets Claude run \
+                 programs on the database server.",
+            );
+        }
+        let offered = capabilities(&node.kind);
+        let options = offered
+            .iter()
+            .map(|c| (capability_label(*c).to_string(), granted.contains(c)))
+            .collect();
+        let (core, sender) = (self.core.clone(), sender.clone());
+        dialogs::choose(window, "Claude access", &details, options, move |ticked| {
+            let capabilities = offered
+                .iter()
+                .zip(ticked)
+                .filter_map(|(c, on)| on.then_some(*c))
+                .collect();
+            let command = Command::SetGrant {
+                node: id,
+                capabilities,
+                expect: Some(shown),
+            };
+            execute(&core, &sender, command);
+        });
     }
 
     fn show_palette(&self, window: &gtk::ApplicationWindow, sender: &ComponentSender<Self>) {
@@ -1777,7 +1923,7 @@ impl App {
 
 /// Runs a command on the core's runtime. Successful results arrive as
 /// events, so only failures are reported back here.
-fn execute(core: &Core, sender: &ComponentSender<App>, command: Command) {
+fn execute(core: &Client, sender: &ComponentSender<App>, command: Command) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
         if let Err(e) = core.execute(command).await {
@@ -1788,7 +1934,7 @@ fn execute(core: &Core, sender: &ComponentSender<App>, command: Command) {
 
 /// Loads the full node list, problems, addons, sessions and autostart
 /// tunnels.
-fn load(core: &Core, sender: &ComponentSender<App>) {
+fn load(core: &Client, sender: &ComponentSender<App>) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
         let result = async {
@@ -1826,7 +1972,7 @@ fn load(core: &Core, sender: &ComponentSender<App>) {
 }
 
 /// Looks up every running session, for [`AppMsg::SessionsListed`].
-fn list_sessions(core: &Core, sender: &ComponentSender<App>) {
+fn list_sessions(core: &Client, sender: &ComponentSender<App>) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
         let sessions = match core.execute(Command::ListSessions).await {
@@ -1837,8 +1983,9 @@ fn list_sessions(core: &Core, sender: &ComponentSender<App>) {
     });
 }
 
-/// Forwards core events to the window until it closes.
-fn listen(core: &Core, sender: &ComponentSender<App>) {
+/// Forwards core events to the window until it closes. If the daemon goes
+/// away, connects again, which starts a new one.
+fn listen(core: &Client, sender: &ComponentSender<App>) {
     let mut events = core.subscribe();
     let input = sender.input_sender().clone();
     runtime().spawn(async move {
@@ -1849,10 +1996,63 @@ fn listen(core: &Core, sender: &ComponentSender<App>) {
                 Err(RecvError::Closed) => break,
             };
             if input.send(message).is_err() {
-                break; // The window is gone.
+                return; // The window is gone.
+            }
+        }
+        if input.send(AppMsg::Disconnected).is_err() {
+            return;
+        }
+        loop {
+            match ipc::connect(Role::Gui).await {
+                Ok(client) => {
+                    let _ = input.send(AppMsg::Reconnected(client));
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("burrow: could not reach burrowd: {e}");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                }
             }
         }
     });
+}
+
+/// What to say when the daemon is from another build: one that kept
+/// running through an upgrade because tunnels or terminals run in it.
+fn stale_daemon(core: &Client) -> Option<String> {
+    let build = &core.info().build;
+    (*build != ipc::BUILD).then(|| {
+        format!(
+            "Burrow's core ({}) is from before an update. Stop what runs in it, \
+             then run \"burrow daemon stop\".",
+            files::printable(build)
+        )
+    })
+}
+
+/// What the MCP bridge may be granted on a node of `kind`.
+fn capabilities(kind: &str) -> Vec<Capability> {
+    match kind {
+        POSTGRES_KIND => vec![Capability::SqlRead, Capability::SqlWrite],
+        SSH_HOST_KIND => vec![
+            Capability::Exec,
+            Capability::FilesRead,
+            Capability::FilesWrite,
+        ],
+        SSH_TUNNEL_KIND => vec![Capability::Tunnel],
+        _ => Vec::new(),
+    }
+}
+
+fn capability_label(capability: Capability) -> &'static str {
+    match capability {
+        Capability::SqlRead => "Run read-only SQL",
+        Capability::SqlWrite => "Run SQL that writes",
+        Capability::Exec => "Run commands",
+        Capability::FilesRead => "List and read files",
+        Capability::FilesWrite => "Create, change and delete files",
+        Capability::Tunnel => "Start and stop the tunnel",
+    }
 }
 
 fn selected(widgets: &Widgets) -> Option<NodeId> {

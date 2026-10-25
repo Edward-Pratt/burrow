@@ -11,8 +11,8 @@ use std::process::{Child, Command as Process, Stdio};
 use std::time::Duration;
 
 use burrow_core::{
-    Command, Core, Event, Node, NodePatch, PromptAnswer, PromptKind, Response, SecretValue,
-    SessionId, SessionKind, SessionState, TransferId, TransferState, TunnelShown,
+    Command, Core, Event, ExecResult, Node, NodePatch, PromptAnswer, PromptKind, Response,
+    SecretValue, SessionId, SessionKind, SessionState, TransferId, TransferState, TunnelShown,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1104,4 +1104,137 @@ async fn copies_keep_private_files_private() {
         TransferState::Finished
     );
     assert_eq!(mode(&copy), 0o600);
+}
+
+async fn exec(core: &Core, node: &Node, command: &str, timeout: Option<u32>) -> ExecResult {
+    let command = Command::Exec {
+        node: node.id,
+        command: command.into(),
+        timeout,
+    };
+    match core.execute(command).await.unwrap() {
+        Response::Exec { result } => result,
+        other => panic!("expected an exec result, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_returns_output_and_status() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+
+    let mut events = core.subscribe();
+    let result = exec(&core, &node, "echo out; echo err >&2; exit 3", None).await;
+    assert_eq!(result.stdout, "out\n");
+    assert_eq!(result.stderr, "err\n");
+    assert_eq!(result.status, Some(3));
+    assert!(!result.truncated && !result.timed_out);
+    // It ran as a session, which closes once it has answered.
+    let session = loop {
+        if let Event::SessionChanged { session, .. } = events.recv().await.unwrap() {
+            break session;
+        }
+    };
+    assert_eq!(
+        expect_state(&mut events, session).await,
+        SessionState::Connected
+    );
+    assert_eq!(closed_error(expect_state(&mut events, session).await), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_cuts_long_output_and_stops_at_the_timeout() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+
+    let result = exec(&core, &node, "head -c 3000000 /dev/zero | tr '\\0' x", None).await;
+    assert!(result.truncated);
+    assert_eq!(result.stdout.len(), 1 << 20);
+    assert_eq!(result.status, Some(0));
+
+    let result = exec(&core, &node, "echo started; sleep 30", Some(1)).await;
+    assert!(result.timed_out);
+    assert_eq!(result.stdout, "started\n");
+
+    let error = core
+        .execute(Command::Exec {
+            node: node.id,
+            command: "true".into(),
+            timeout: Some(0),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timeout"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_are_read_and_written_by_content() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+    let mut events = core.subscribe();
+    let session = open_files(&core, &node, &mut events).await;
+    let root = server.path("remote");
+    fs::create_dir(&root).unwrap();
+    let path = remote(&root.join("note.txt"));
+    let write = |data: &str, overwrite| Command::WriteFile {
+        session,
+        path: path.clone(),
+        data: data.as_bytes().to_vec(),
+        overwrite,
+    };
+
+    core.execute(write("first", false)).await.unwrap();
+    assert_eq!(fs::read_to_string(root.join("note.txt")).unwrap(), "first");
+    // New files are private.
+    let mode = fs::metadata(root.join("note.txt"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(core.execute(write("second", false)).await.is_err());
+    core.execute(write("second", true)).await.unwrap();
+
+    let read = Command::ReadFile {
+        session,
+        path: path.clone(),
+        limit: Some(3),
+    };
+    match core.execute(read).await.unwrap() {
+        Response::File { data, size } => {
+            assert_eq!(data, b"sec");
+            assert_eq!(size, 6);
+        }
+        other => panic!("expected a file, got {other:?}"),
+    }
+
+    // Never through a symlink, and nothing left behind.
+    let target = server.path("outside.txt");
+    fs::write(&target, "keep").unwrap();
+    std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+    let through = Command::WriteFile {
+        session,
+        path: remote(&root.join("link")),
+        data: b"owned".to_vec(),
+        overwrite: true,
+    };
+    assert!(core.execute(through).await.is_err());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+    let left: Vec<_> = fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left.len(), 2, "{left:?}");
 }

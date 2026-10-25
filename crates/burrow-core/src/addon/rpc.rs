@@ -15,13 +15,14 @@ use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::manifest::{Manifest, Permission};
 use crate::api::{API_VERSION, Command, Event, NodeId, Response, View};
 use crate::engine::{Core, WeakCore};
+use crate::ipc::read_line;
 
 /// The longest line accepted from an addon. A longer one stops it: a
 /// runaway addon must not make the core buffer without limit.
@@ -409,56 +410,5 @@ fn may_see(manifest: &Manifest, event: &Event) -> bool {
             manifest.has(Permission::NodesRead)
         }
         _ => false,
-    }
-}
-
-/// Reads one line, without its `\n`, into `line`. `Ok(None)` at the end of
-/// input. A line longer than `max` is an error, found before it is all
-/// buffered.
-async fn read_line<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    line: &mut Vec<u8>,
-    max: usize,
-) -> Result<Option<()>, String> {
-    line.clear();
-    loop {
-        let available = reader
-            .fill_buf()
-            .await
-            .map_err(|e| format!("reading from it failed: {e}"))?;
-        if available.is_empty() {
-            return Ok(if line.is_empty() { None } else { Some(()) });
-        }
-        let (taken, done) = match available.iter().position(|&b| b == b'\n') {
-            Some(i) => (i, true),
-            None => (available.len(), false),
-        };
-        if line.len() + taken > max {
-            return Err(format!("it sent a message over {} bytes", max));
-        }
-        line.extend_from_slice(&available[..taken]);
-        reader.consume(if done { taken + 1 } else { taken });
-        if done {
-            return Ok(Some(()));
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn reads_lines_up_to_the_limit() {
-        let mut input: &[u8] = b"one\ntwo\nthree";
-        let mut line = Vec::new();
-        for expected in ["one", "two", "three"] {
-            assert_eq!(read_line(&mut input, &mut line, 8).await, Ok(Some(())));
-            assert_eq!(line, expected.as_bytes());
-        }
-        assert_eq!(read_line(&mut input, &mut line, 8).await, Ok(None));
-
-        let mut input: &[u8] = b"123456789\n";
-        assert!(read_line(&mut input, &mut line, 8).await.is_err());
     }
 }

@@ -118,6 +118,22 @@ pub fn close_on_escape(window: &gtk::Window) {
     window.add_controller(keys);
 }
 
+type Answer = Rc<RefCell<Option<Box<dyn FnOnce(PromptAnswer)>>>>;
+
+/// An open prompt dialog, which can be closed without answering: another
+/// client answered the prompt, or its session ended.
+pub struct Dismiss {
+    done: Answer,
+    close: Box<dyn Fn()>,
+}
+
+impl Dismiss {
+    pub fn dismiss(self) {
+        self.done.borrow_mut().take();
+        (self.close)();
+    }
+}
+
 /// Asks a session's question ([`Prompt`]) and calls `done` exactly once:
 /// with the answer, or with [`PromptAnswer::Cancel`] if the dialog is
 /// dismissed.
@@ -125,8 +141,21 @@ pub fn answer(
     parent: &impl IsA<gtk::Window>,
     prompt: &Prompt,
     done: impl FnOnce(PromptAnswer) + 'static,
-) {
+) -> Dismiss {
+    // Every way out of the dialog goes through `finish`, which answers
+    // once. Dismissing takes `done` first, so closing answers nothing.
+    let done: Answer = Rc::new(RefCell::new(Some(Box::new(done))));
+    let finish = {
+        let done = done.clone();
+        move |answer: PromptAnswer| {
+            if let Some(done) = done.borrow_mut().take() {
+                done(answer);
+            }
+        }
+    };
+
     if prompt.kind == PromptKind::Confirm {
+        let cancellable = gio::Cancellable::new();
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
             .message(&prompt.title)
@@ -135,14 +164,17 @@ pub fn answer(
             .cancel_button(0)
             .default_button(0)
             .build();
-        dialog.choose(Some(parent), None::<&gio::Cancellable>, move |choice| {
-            done(if choice == Ok(1) {
+        dialog.choose(Some(parent), Some(&cancellable), move |choice| {
+            finish(if choice == Ok(1) {
                 PromptAnswer::Confirm
             } else {
                 PromptAnswer::Cancel
             });
         });
-        return;
+        return Dismiss {
+            done,
+            close: Box::new(move || cancellable.cancel()),
+        };
     }
 
     let window = gtk::Window::builder()
@@ -189,17 +221,6 @@ pub fn answer(
     content.append(&buttons);
     window.set_child(Some(&content));
 
-    // Every way out of the dialog goes through `finish`, which answers
-    // once.
-    let done = Rc::new(RefCell::new(Some(done)));
-    let finish = {
-        let done = done.clone();
-        move |answer: PromptAnswer| {
-            if let Some(done) = done.borrow_mut().take() {
-                done(answer);
-            }
-        }
-    };
     let submit = Rc::new({
         let (window, entry, finish) = (window.clone(), entry.clone(), finish.clone());
         move || {
@@ -238,4 +259,80 @@ pub fn answer(
 
     window.present();
     entry.grab_focus();
+    let window = window.downgrade();
+    Dismiss {
+        done,
+        close: Box::new(move || {
+            if let Some(window) = window.upgrade() {
+                window.close();
+            }
+        }),
+    }
+}
+
+/// Asks which of `options` to allow, showing `details` above them, and
+/// calls `done` with the ticked ones on save. Nothing is called on cancel.
+pub fn choose(
+    parent: &impl IsA<gtk::Window>,
+    title: &str,
+    details: &str,
+    options: Vec<(String, bool)>,
+    done: impl FnOnce(Vec<bool>) + 'static,
+) {
+    let window = gtk::Window::builder()
+        .title(title)
+        .modal(true)
+        .transient_for(parent)
+        .resizable(false)
+        .default_width(420)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+
+    let message = gtk::Label::new(Some(details));
+    message.set_xalign(0.0);
+    message.set_wrap(true);
+    message.set_max_width_chars(56);
+    content.append(&message);
+
+    let checks: Vec<gtk::CheckButton> = options
+        .into_iter()
+        .map(|(label, active)| {
+            let check = gtk::CheckButton::with_label(&label);
+            check.set_active(active);
+            content.append(&check);
+            check
+        })
+        .collect();
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    buttons.set_margin_top(6);
+    let cancel = gtk::Button::with_label("Cancel");
+    let save = gtk::Button::with_label("Save");
+    save.add_css_class("suggested-action");
+    buttons.append(&cancel);
+    buttons.append(&save);
+    content.append(&buttons);
+    window.set_child(Some(&content));
+
+    let done = RefCell::new(Some(done));
+    save.connect_clicked({
+        let window = window.clone();
+        move |_| {
+            if let Some(done) = done.borrow_mut().take() {
+                done(checks.iter().map(|c| c.is_active()).collect());
+            }
+            window.close();
+        }
+    });
+    cancel.connect_clicked({
+        let window = window.clone();
+        move |_| window.close()
+    });
+    close_on_escape(&window);
+    window.present();
 }
