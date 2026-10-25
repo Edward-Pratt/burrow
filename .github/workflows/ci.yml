@@ -13,31 +13,38 @@ jobs:
   check:
     runs-on: ubuntu-latest
     # Arch, so the GTK, VTE and GtkSourceView versions match what Burrow
-    # targets. openssh provides `ssh -G` and the sshd the SSH tests run.
+    # targets. openssh provides `ssh -G` and the sshd the SSH tests run, and
+    # postgresql the server the database tests run.
     container: archlinux:latest
     steps:
       - name: Install system packages
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rustup gtk4 vte4 gtksourceview5 libsecret openssh
-          rustup default stable
-          rustup component add rustfmt clippy
+          pacman -Syu --noconfirm --needed base-devel git rustup gtk4 vte4 gtksourceview5 libsecret openssh postgresql
+          # initdb refuses to run as root, and the database tests would
+          # quietly skip, so the checks run as a normal user.
+          useradd --create-home builder
 
       - uses: actions/checkout@v4
 
       - uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /home/builder/.cargo/registry
+            /home/builder/.cargo/git
             target
           key: cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-
 
+      - name: Set up Rust
+        run: |
+          chown -R builder "$GITHUB_WORKSPACE" /home/builder
+          su builder -c 'rustup default stable && rustup component add rustfmt clippy'
+
       - name: Format
-        run: cargo fmt --all --check
+        run: su builder -c 'cargo fmt --all --check'
 
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: su builder -c 'cargo clippy --workspace --all-targets -- -D warnings'
 
       - name: Test
-        run: cargo test --workspace
+        run: su builder -c 'cargo test --workspace'
