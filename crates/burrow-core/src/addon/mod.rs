@@ -34,6 +34,8 @@ use crate::engine::Core;
 use crate::error::{Error, Result};
 use crate::tree::write_atomic;
 
+#[cfg(test)]
+pub(crate) use manifest::load as load_manifest;
 pub(crate) use manifest::{Manifest, Permission};
 use rpc::Process;
 

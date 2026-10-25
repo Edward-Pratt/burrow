@@ -10,12 +10,15 @@ repository.workspace = true
 [dependencies]
 data-encoding = "2.11"
 directories = "6.0.0"
+futures-util = "0.3.34"
 getrandom = "0.4"
 hmac = "0.13"
 keyring-core = "1.0.1"
 notify-debouncer-full = "0.7.0"
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "3.0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha1 = "0.11"
@@ -23,6 +26,8 @@ sha2 = "0.11"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt", "sync", "macros", "net", "io-util", "process", "time", "fs"] }
+tokio-postgres = { version = "0.7.18", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 toml = "1.1.8"
 tracing = "0.1.44"
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
@@ -30,6 +35,7 @@ zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-i
 zeroize = "1.9.1"
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
 toml = "1.1.8"

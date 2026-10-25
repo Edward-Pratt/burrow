@@ -54,6 +54,14 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `download` | `session`, `remote`, `local`, `overwrite?` | `transfer { transfer }` |
 | `upload` | `session`, `local`, `remote`, `overwrite?` | `transfer { transfer }` |
 | `cancel_transfer` | `transfer` | `ok` |
+| `open_database` | `node` | `session { session }` |
+| `run_query` | `session`, `sql`, `limit?` | `query { result }` |
+| `cancel_query` | `session` | `ok` |
+| `set_read_only` | `session`, `read_only` | `ok` |
+| `list_schema` | `session` | `schema { schemas }` |
+| `export_query` | `session`, `sql`, `path` | `exported { rows }` |
+| `list_history` | `node` | `history { entries }`, oldest first |
+| `clear_history` | `node` | `ok` |
 | `list_addons` | | `addons { addons }`, sorted by id |
 | `approve_addon` | `id`, `fingerprint` | `ok` |
 | `revoke_addon` | `id` | `ok` |
@@ -82,7 +90,7 @@ Every subscriber receives events. They are sent for changes made through command
 | `node_updated` | `node` | A node changed, including a move to another folder. |
 | `node_deleted` | `id` | A node was removed. Children are announced before their parents. |
 | `problems_changed` | `problems` | The set of config files that fail to load changed. |
-| `session_changed` | `session`, `node`, `state` | A session moved on: `connecting { step }`, `connected`, or `closed { error }` (`error` is null when the shell ended normally). `node` is the SSH host of a terminal or file session, and the tunnel node of a tunnel. |
+| `session_changed` | `session`, `node`, `state` | A session moved on: `connecting { step }`, `connected`, or `closed { error }` (`error` is null when the shell ended normally). `node` is the SSH host of a terminal or file session, the tunnel node of a tunnel, and the database node of a database session. |
 | `transfer_changed` | `transfer`, `session`, `state` | A download or upload moved on: `running { done, total }` (at most a few times a second), `finished`, `failed { error }` or `cancelled`. |
 | `autostart_changed` | `nodes` | The tunnels that start with Burrow changed. |
 | `prompt_requested` | `session`, `prompt { id, kind, title, message }` | A session waits for `answer_prompt`. |
@@ -95,7 +103,7 @@ A subscriber that falls more than 256 events behind gets a "lagged" error and sh
 
 `open_terminal` on an `ssh-host` node replies at once with a session id. The session then connects in the background and reports each step as `session_changed`.
 
-Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel` or `files`) and `state`.
+Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files` or `database`) and `state`.
 
 - **Host settings** come from `ssh -G <alias>`, so `Include`, `Match`, `Host` patterns and defaults apply exactly as for `ssh <alias>`. `props.alias` is the alias (the node's name when missing). An alias that is empty, starts with `-`, or has spaces or control characters is refused, because node files can come from a shared folder.
 - **Host keys** are checked against the `UserKnownHostsFile` and `GlobalKnownHostsFile` files, following `StrictHostKeyChecking`. A changed or `@revoked` key is always refused. A new key is asked about (`ask`) or added (`accept-new`/`no`), except when the host has known keys of another type, which is always asked about. New keys go into the first user file, hashed if `HashKnownHosts` is on.
@@ -149,6 +157,37 @@ target_port = 5432           # "local" only
 - **Modes:** a copy that replaces a file keeps that file's mode, so a private file stays private. A new copy takes its source's mode without group or other write and without set-id bits. Hidden files are created `0600` until then.
 - **No half-written files:** each file is written to a hidden file next to the target and moved into place when complete. A failed or cancelled transfer removes its partial file. Closing the session cancels its transfers. An upload cut off by a lost connection can't clean up, so its hidden `.<name>.burrow-<n>` file stays on the server.
 
+## Databases
+
+A `postgres` node is a PostgreSQL connection. Its props say where the server is and how to reach it:
+
+```toml
+[props]
+via = "6f1c…"                # optional: id of the ssh-host node to go through
+host = "db.internal"         # TCP, as this computer (or the SSH host) sees it
+socket = "/run/postgresql"   # or, without host, the socket's folder
+port = 5432                  # optional
+user = "app"
+database = "app"             # optional; the user's name when missing
+sslmode = "verify-full"      # optional: disable, require, verify-ca or verify-full
+sslrootcert = "/path/ca.pem" # optional; replaces the system's trusted CAs
+```
+
+- **Routes:** a server is reached over TCP or through its Unix socket, either from this computer or through an SSH host. Through a host, Burrow opens a channel on the host's shared connection, so nothing listens on this computer. A socket through a host signs in as the SSH user when the server allows peer sign-in.
+- **Checked before dialing:** node files can come from a shared folder, so the props are checked first. A socket is named by its folder and port (`<socket>/.s.PGSQL.<port>`), as libpq does, so a file can't aim Burrow at another socket, such as the SSH agent's. Paths must be absolute, without `..` or control characters.
+- **TLS:** `sslmode` defaults to `verify-full` for a server reached straight over the network, and to `disable` through an SSH host or a socket, which are private already. `prefer` and `allow` are refused: they quietly fall back to plain text. `verify-ca` checks the chain but not the name, for a server reached by an address its certificate doesn't list. `require` encrypts, but anyone could be at the other end. TLS isn't used over a socket.
+- **Saved passwords** are kept in the keyring with the target they were typed for: user, address, database, the SSH host it went through, `sslmode` and `sslrootcert`. A server may ask for the password in clear text, so if any of those change (by hand or by a `git pull`), Burrow asks again instead of sending it.
+
+`open_database` runs as a session, so it reports progress and asks its questions like a terminal does. Once it reports `connected`, the query commands work. A session runs one request at a time; the others wait their turn.
+
+- **Read-only to start with:** a session starts with `default_transaction_read_only` on, so a slip can't change anything. `set_read_only` turns it off or on again. It is a guard against mistakes, not a boundary: a query can run `SET` itself.
+- **`run_query`** runs SQL with the simple query protocol and waits for it. Several statements can be sent at once; `result.statements` has one entry per statement that finished, with its `columns`, its `rows` (each value as the server prints it, `null` for NULL) and its `count`. Values longer than 64 KiB are cut short and end with `…`. Values can hold any character, so clients must clean them before showing them. If a statement fails, `result.error` has the server's `message`, `detail`, `hint`, `code` (SQLSTATE) and `position` (in characters from 1), and the statements after it did not run.
+- **Row limit:** each statement keeps at most `limit` rows (1000 by default, at most 100 000). Rows nobody reads would still be sent in full, so a statement that returns more is `truncated` and Burrow cancels the query: `result.stopped` is set, and the statements after it did not run. Several statements sent together run as one transaction unless they say otherwise, so stopping one also undoes the others' changes.
+- **`cancel_query`** asks the server to stop whatever the session is running, over a second connection along the same route. The query then fails with code `57014`.
+- **`list_schema`** returns each schema the user made (not `pg_*` or `information_schema`), with its tables, views, materialized views, foreign and partitioned tables (`kind`), and their columns' `name`, `data_type` and `nullable`.
+- **`export_query`** writes every row to `path` as CSV, with a header row for each result. A NULL is an empty field and an empty string is `""`. It runs in a read-only transaction of its own, even on a writable session, and refuses to start while the session has a transaction open, since rolling back at the end would throw that one's work away. The file is written next to `path` under a hidden name and moved into place when complete, so it is private (`0600`) and never half-written.
+- **History:** every query run with `run_query` is kept, newest last, up to 200 per node, in `$XDG_STATE_HOME/burrow/history/<node>.json` (`0600`). It stays on this computer because queries can hold data. Queries over 64 KiB are not kept. `clear_history` forgets a node's, and so does deleting the node.
+
 ## Addons
 
 An addon is a folder in `$XDG_CONFIG_HOME/burrow/addons/` holding an `addon.toml` and a program. Burrow starts the program when the addon is first used and talks to it over stdin and stdout. The `notes` example in `crates/burrow-addon-notes` is a complete addon in about 200 lines. To try it:
@@ -191,7 +230,7 @@ kinds = ["ssh-host"]
 A manifest that fails a check is reported in `list_problems`, and the addon is left out. The checks:
 - **Fields:** the `id` matches the folder name. The `api` major is this Burrow's. Every permission is known.
 - **Program:** `command` is a relative path to an executable file inside the folder. It is never looked up on `PATH`, and neither `..` nor a symlink may lead out of the folder.
-- **Kinds:** `folder` and `ssh-host` belong to Burrow. When two addons claim the same kind, the one whose id sorts first keeps it. The other is left out and reported.
+- **Kinds:** `folder`, `ssh-host`, `ssh-tunnel` and `postgres` belong to Burrow. When two addons claim the same kind, the one whose id sorts first keeps it. The other is left out and reported.
 
 ### Approval
 
@@ -211,7 +250,7 @@ An addon never runs until the user approves it. The addons folder can arrive wit
 
 ### Permissions
 
-Each command an addon sends is checked against this table. Anything not listed is refused, including secrets, sessions, problems and managing addons.
+Each command an addon sends is checked against this table. Anything not listed is refused, including secrets, sessions, databases, problems and managing addons.
 
 | Command | Needs |
 |---|---|

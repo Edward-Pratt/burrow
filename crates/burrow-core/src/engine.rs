@@ -5,9 +5,10 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::addon::{Host, Manifest, Permission};
 use crate::api::{
-    API_VERSION, Command, Event, Node, NodeId, Problem, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND,
-    SecretValue, SessionId, SessionKind, View,
+    API_VERSION, Command, Event, Node, NodeId, POSTGRES_KIND, Problem, Response, SSH_HOST_KIND,
+    SSH_TUNNEL_KIND, SecretValue, SessionId, SessionKind, View,
 };
+use crate::db;
 use crate::error::{Error, Result};
 use crate::secrets::{KeyringStore, SecretKey, SecretStore};
 use crate::ssh::{self, Autostart, Connections, Input, Sessions, Transfers, files};
@@ -69,6 +70,7 @@ struct Inner {
     autostart: Autostart,
     /// The tunnels starting with Burrow, as last announced.
     autostart_nodes: Mutex<Vec<NodeId>>,
+    history: db::History,
     ssh_config: Option<PathBuf>,
 }
 
@@ -98,6 +100,7 @@ impl Core {
                 transfers: Transfers::default(),
                 autostart: Autostart::load(options.state_dir.join("autostart.toml")),
                 autostart_nodes: Mutex::default(),
+                history: db::History::new(options.state_dir.join("history")),
                 ssh_config: options.ssh_config,
             }),
         };
@@ -225,6 +228,57 @@ impl Core {
             Command::CancelTransfer { transfer } => {
                 self.inner.transfers.cancel(transfer)?;
                 return Ok(Response::Ok);
+            }
+            Command::OpenDatabase { node } => {
+                let node = self.node(node)?;
+                if node.kind != POSTGRES_KIND {
+                    return Err(Error::invalid(
+                        "node",
+                        format!("{} is a {}, not a database", node.name, node.kind),
+                    ));
+                }
+                let session = db::open(self, node);
+                return Ok(Response::Session { session });
+            }
+            Command::RunQuery {
+                session,
+                sql,
+                limit,
+            } => {
+                let (handle, node) = sessions.database(session)?;
+                let limit = limit.unwrap_or(db::DEFAULT_LIMIT).clamp(1, db::MAX_LIMIT);
+                let result = handle.query(&sql, limit as usize).await;
+                let inner = self.inner.clone();
+                let ok = result.error.is_none();
+                let recorded =
+                    tokio::task::spawn_blocking(move || inner.history.record(node, &sql, ok)).await;
+                if let Ok(Err(e)) = recorded {
+                    tracing::warn!("could not keep the query in the history: {e}");
+                }
+                return Ok(Response::Query { result });
+            }
+            Command::CancelQuery { session } => {
+                let (handle, _) = sessions.database(session)?;
+                handle.cancel().await.map_err(Error::Remote)?;
+                return Ok(Response::Ok);
+            }
+            Command::SetReadOnly { session, read_only } => {
+                let (handle, _) = sessions.database(session)?;
+                handle
+                    .set_read_only(read_only)
+                    .await
+                    .map_err(Error::Remote)?;
+                return Ok(Response::Ok);
+            }
+            Command::ListSchema { session } => {
+                let (handle, _) = sessions.database(session)?;
+                let schemas = handle.schema().await.map_err(Error::Remote)?;
+                return Ok(Response::Schema { schemas });
+            }
+            Command::ExportQuery { session, sql, path } => {
+                let (handle, _) = sessions.database(session)?;
+                let rows = handle.export(&sql, &path).await.map_err(Error::Remote)?;
+                return Ok(Response::Exported { rows });
             }
             Command::ListSessions => {
                 return Ok(Response::Sessions {
@@ -489,6 +543,7 @@ impl Inner {
                 self.forget_secrets(&removed);
                 let ids: Vec<NodeId> = removed.iter().map(|e| e.node.id).collect();
                 self.autostart.forget(&ids);
+                self.history.forget(&ids);
                 Ok(Response::Ok)
             }
             Command::SetSecret { id, field, value } => {
@@ -602,6 +657,17 @@ impl Inner {
                 self.reload()?;
                 Ok(Response::Ok)
             }
+            Command::ListHistory { node } => {
+                self.database_node(node)?;
+                Ok(Response::History {
+                    entries: self.history.list(node),
+                })
+            }
+            Command::ClearHistory { node } => {
+                self.database_node(node)?;
+                self.history.forget(&[node]);
+                Ok(Response::Ok)
+            }
             // Handled by `Core::execute` before it gets here.
             Command::OpenTerminal { .. }
             | Command::WriteTerminal { .. }
@@ -618,6 +684,12 @@ impl Inner {
             | Command::Download { .. }
             | Command::Upload { .. }
             | Command::CancelTransfer { .. }
+            | Command::OpenDatabase { .. }
+            | Command::RunQuery { .. }
+            | Command::CancelQuery { .. }
+            | Command::SetReadOnly { .. }
+            | Command::ListSchema { .. }
+            | Command::ExportQuery { .. }
             | Command::OpenView { .. }
             | Command::InvokeAction { .. } => unreachable!("async command on the blocking path"),
         }
@@ -664,6 +736,19 @@ impl Inner {
                 command_name(command)
             ))),
         }
+    }
+
+    /// Checks that `id` is a database node.
+    fn database_node(&self, id: NodeId) -> Result<()> {
+        let tree = self.tree();
+        let node = &tree.get(id)?.node;
+        if node.kind != POSTGRES_KIND {
+            return Err(Error::invalid(
+                "node",
+                format!("{} is a {}, not a database", node.name, node.kind),
+            ));
+        }
+        Ok(())
     }
 
     fn resolve_secret(&self, id: NodeId, field: &str) -> Result<Option<SecretValue>> {
@@ -794,5 +879,57 @@ mod tests {
     fn core_is_send_and_sync() {
         fn check<T: Send + Sync + 'static>() {}
         check::<Core>();
+    }
+
+    #[test]
+    fn addons_may_not_reach_databases() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let folder = dir.path().join("config/addons/probe");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("addon.toml"),
+            "id = \"probe\"\nname = \"Probe\"\nversion = \"0.1.0\"\napi = \"1\"\n\
+             permissions = [\"nodes:read\", \"nodes:write\"]\n\
+             [backend]\ncommand = \"probe\"\nprotocol = \"jsonrpc-stdio\"\n",
+        )
+        .unwrap();
+        std::fs::write(folder.join("probe"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(folder.join("probe"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let manifest = crate::addon::load_manifest(&folder).unwrap();
+        let core = Core::open(CoreOptions {
+            config_dir: dir.path().join("config"),
+            state_dir: dir.path().join("state"),
+            secrets: Arc::new(crate::secrets::MemoryStore::new()),
+            ssh_config: None,
+        })
+        .unwrap();
+        let session = SessionId(1);
+        let node = NodeId::new();
+        for command in [
+            Command::OpenDatabase { node },
+            Command::RunQuery {
+                session,
+                sql: "select 1".into(),
+                limit: None,
+            },
+            Command::CancelQuery { session },
+            Command::SetReadOnly {
+                session,
+                read_only: false,
+            },
+            Command::ListSchema { session },
+            Command::ExportQuery {
+                session,
+                sql: "select 1".into(),
+                path: "/tmp/out.csv".into(),
+            },
+            Command::ListHistory { node },
+            Command::ClearHistory { node },
+        ] {
+            let error = core.inner.permit(&manifest, &command).unwrap_err();
+            assert!(matches!(error, Error::PermissionDenied(_)), "{error}");
+        }
     }
 }

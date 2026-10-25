@@ -18,7 +18,7 @@ mod session;
 mod socks;
 mod tunnel;
 
-pub(crate) use connection::Connections;
+pub(crate) use connection::{Connection, Connections, alias};
 pub(crate) use files::Transfers;
 pub(crate) use tunnel::Autostart;
 
@@ -30,9 +30,10 @@ use russh_sftp::client::SftpSession;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::api::{
-    Event, Node, Prompt, PromptAnswer, PromptKind, SessionId, SessionInfo, SessionKind,
+    Event, Node, NodeId, Prompt, PromptAnswer, PromptKind, SessionId, SessionInfo, SessionKind,
     SessionState,
 };
+use crate::db;
 use crate::engine::Core;
 use crate::error::{Error, Result};
 
@@ -55,7 +56,7 @@ pub(crate) struct Sessions {
 }
 
 struct Entry {
-    node: crate::api::NodeId,
+    node: NodeId,
     kind: SessionKind,
     /// As last announced.
     state: SessionState,
@@ -64,8 +65,15 @@ struct Entry {
     prompts: Pending,
     /// Until a client takes it with [`Core::take_output`].
     output: Option<mpsc::Receiver<Vec<u8>>>,
-    /// A file session's SFTP client, once it has connected.
-    sftp: Option<Arc<SftpSession>>,
+    /// What a connected file or database session serves requests with.
+    attached: Option<Attached>,
+}
+
+/// A connected session's client, which commands on it use.
+#[derive(Clone)]
+pub(crate) enum Attached {
+    Sftp(Arc<SftpSession>),
+    Database(Arc<db::Handle>),
 }
 
 /// Prompts waiting for an answer, by prompt id.
@@ -119,35 +127,55 @@ impl Sessions {
     }
 
     /// The running session of `kind` on `node`, if there is one.
-    pub fn find(&self, node: crate::api::NodeId, kind: SessionKind) -> Option<SessionId> {
+    pub fn find(&self, node: NodeId, kind: SessionKind) -> Option<SessionId> {
         self.list()
             .into_iter()
             .find(|s| s.node == node && s.kind == kind)
             .map(|s| s.session)
     }
 
-    /// The SFTP client of a connected file session.
-    pub fn sftp(&self, id: SessionId) -> Result<Arc<SftpSession>> {
+    /// The client of a connected session of `kind`, and the session's node.
+    fn attached(&self, id: SessionId, kind: SessionKind) -> Result<(Attached, NodeId)> {
         let map = self.map.lock().unwrap();
         let entry = map
             .get(&id)
             .filter(|e| e.input.is_some())
             .ok_or(Error::SessionNotFound(id))?;
-        if entry.kind != SessionKind::Files {
-            return Err(Error::invalid(
-                "session",
-                format!("{id} is not a file session"),
-            ));
+        if entry.kind != kind {
+            let what = match kind {
+                SessionKind::Files => "a file session",
+                SessionKind::Database => "a database session",
+                SessionKind::Terminal => "a terminal",
+                SessionKind::Tunnel => "a tunnel",
+            };
+            return Err(Error::invalid("session", format!("{id} is not {what}")));
         }
-        entry
-            .sftp
+        let attached = entry
+            .attached
             .clone()
-            .ok_or_else(|| Error::invalid("session", format!("{id} has not connected yet")))
+            .ok_or_else(|| Error::invalid("session", format!("{id} has not connected yet")))?;
+        Ok((attached, entry.node))
     }
 
-    fn set_sftp(&self, id: SessionId, sftp: Arc<SftpSession>) {
+    /// The SFTP client of a connected file session.
+    pub fn sftp(&self, id: SessionId) -> Result<Arc<SftpSession>> {
+        match self.attached(id, SessionKind::Files)? {
+            (Attached::Sftp(sftp), _) => Ok(sftp),
+            _ => unreachable!("file sessions attach SFTP"),
+        }
+    }
+
+    /// The client of a connected database session, and its node.
+    pub fn database(&self, id: SessionId) -> Result<(Arc<db::Handle>, NodeId)> {
+        match self.attached(id, SessionKind::Database)? {
+            (Attached::Database(handle), node) => Ok((handle, node)),
+            _ => unreachable!("database sessions attach a database"),
+        }
+    }
+
+    pub(crate) fn attach(&self, id: SessionId, attached: Attached) {
         if let Some(entry) = self.map.lock().unwrap().get_mut(&id) {
-            entry.sftp = Some(sftp);
+            entry.attached = Some(attached);
         }
     }
 
@@ -159,7 +187,7 @@ impl Sessions {
     }
 
     /// Closes every session on `node`, as when the node is deleted.
-    pub fn close_node(&self, node: crate::api::NodeId) {
+    pub fn close_node(&self, node: NodeId) {
         for entry in self.map.lock().unwrap().values() {
             if entry.node == node
                 && let Some(input) = &entry.input
@@ -194,7 +222,7 @@ impl Sessions {
         match map.get_mut(&id) {
             Some(entry) if entry.output.is_some() => {
                 entry.input = None;
-                entry.sftp = None;
+                entry.attached = None;
                 entry.prompts.lock().unwrap().clear();
             }
             _ => {
@@ -246,7 +274,7 @@ pub(crate) fn open_files(core: &Core, node: Node) -> SessionId {
 
 /// Registers a session and runs `body` as its task. Whatever `body`
 /// returns becomes the session's [`SessionState::Closed`].
-fn spawn<F, Fut>(
+pub(crate) fn spawn<F, Fut>(
     core: &Core,
     node: Node,
     kind: SessionKind,
@@ -271,7 +299,7 @@ where
             input: Some(input_tx),
             prompts: prompts.clone(),
             output,
-            sftp: None,
+            attached: None,
         },
     );
     let prompter = Prompter {
@@ -307,6 +335,11 @@ pub(crate) struct Prompter {
 }
 
 impl Prompter {
+    /// The session questions go to.
+    pub fn session(&self) -> SessionId {
+        self.session
+    }
+
     /// [`PromptAnswer::Cancel`] if the session closes first.
     pub async fn ask(&self, kind: PromptKind, title: &str, message: &str) -> PromptAnswer {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;

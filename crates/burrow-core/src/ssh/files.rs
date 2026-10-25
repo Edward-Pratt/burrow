@@ -100,7 +100,8 @@ pub(super) async fn run(
         result = setup => result?,
         () = closed => return Ok(()),
     };
-    core.sessions().set_sftp(prompter.session, Arc::new(sftp));
+    core.sessions()
+        .attach(prompter.session, super::Attached::Sftp(Arc::new(sftp)));
     core.emit(Event::SessionChanged {
         session: prompter.session,
         node: node.id,
