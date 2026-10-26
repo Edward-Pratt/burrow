@@ -4,6 +4,7 @@
 mod addons;
 mod app;
 mod database;
+mod desktop;
 mod dialogs;
 mod files;
 mod hosts;

@@ -188,7 +188,7 @@ async fn run(
     loop {
         tokio::select! {
             read = link.read(&mut buffer) => match read {
-                Ok(0) => return Err("the desktop closed the connection".into()),
+                Ok(0) => return Err("the VNC server closed the connection".into()),
                 Ok(n) => {
                     // The client stopped reading: nobody is watching.
                     if output.send(buffer[..n].to_vec()).await.is_err() {
