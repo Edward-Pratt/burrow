@@ -4,7 +4,7 @@
 
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use relm4::gtk;
@@ -71,7 +71,7 @@ pub fn shell_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// A terminal running `shell` in the home folder.
+/// A terminal running `shell` in `folder`, or in the home folder.
 ///
 /// `on_title` gets the title the shell sets (usually the current command or
 /// folder), and `on_exit` runs when the shell exits. Neither may hold the
@@ -79,16 +79,17 @@ pub fn shell_name(path: &str) -> &str {
 /// is a reference cycle, and the shell would outlive its tab.
 pub fn new(
     shell: &str,
+    folder: Option<&Path>,
     on_title: impl Fn(String) + 'static,
     on_exit: impl Fn() + 'static,
 ) -> vte4::Terminal {
     let terminal = base(on_title);
     terminal.connect_child_exited(move |_, _status| on_exit());
 
-    let home = glib::home_dir();
+    let folder = folder.map_or_else(glib::home_dir, Path::to_path_buf);
     terminal.spawn_async(
         vte4::PtyFlags::DEFAULT,
-        home.to_str(),
+        folder.to_str(),
         &[shell],
         // Added to Burrow's own environment, not a replacement for it.
         &[],
@@ -143,6 +144,14 @@ pub fn remote(
         glib::ControlFlow::Continue
     });
     terminal
+}
+
+/// The folder the shell is in, when it says. Shells set up for VTE report
+/// it after each command (OSC 7), and others never do.
+pub fn folder(terminal: &vte4::Terminal) -> Option<PathBuf> {
+    let uri = terminal.current_directory_uri()?;
+    let (path, _host) = glib::filename_from_uri(&uri).ok()?;
+    Some(path)
 }
 
 /// Columns and rows.
