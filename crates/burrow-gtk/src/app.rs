@@ -299,6 +299,9 @@ pub enum AppMsg {
     ToggleSidebar,
     ShowSettings,
     CheckForUpdates,
+    /// Closes the window the usual way, then starts this program, the
+    /// updated window, in its place.
+    Restart(PathBuf),
     SetTheme(Theme),
     /// `None` goes back to the system's monospace font.
     SetTerminalFont(Option<String>),
@@ -357,6 +360,7 @@ impl AppMsg {
                 | AppMsg::ToggleSidebar
                 | AppMsg::ShowSettings
                 | AppMsg::CheckForUpdates
+                | AppMsg::Restart(_)
                 | AppMsg::SetTheme(_)
                 | AppMsg::SetTerminalFont(_)
                 | AppMsg::ReloadConfig
@@ -1020,7 +1024,7 @@ impl Component for App {
             AppMsg::CloseRequested => {
                 // Where the shells are now, which no other save sees.
                 self.save_tabs(widgets);
-                self.close_window(window);
+                self.close_window(window, None);
             }
             AppMsg::TabsMoved => self.save_tabs(widgets),
             AppMsg::Control {
@@ -1146,7 +1150,16 @@ impl Component for App {
                 self.save_settings();
             }
             AppMsg::ShowSettings => show_settings(window, &self.settings, &sender),
-            AppMsg::CheckForUpdates => update::show(window),
+            AppMsg::CheckForUpdates => {
+                let sender = sender.clone();
+                update::show(window, move |program| {
+                    sender.input(AppMsg::Restart(program))
+                });
+            }
+            AppMsg::Restart(program) => {
+                self.save_tabs(widgets);
+                self.close_window(window, Some(program));
+            }
             AppMsg::SetTheme(theme) => {
                 self.settings.theme = theme;
                 self.apply_theme();
@@ -2854,7 +2867,15 @@ impl App {
     /// Closes the window, first asking when that would end terminals: local
     /// shells end with the window, and burrowd closes this client's SSH
     /// sessions when it goes.
-    fn close_window(&self, window: &gtk::ApplicationWindow) {
+    /// Closes the window, asking first if terminals would end. `restart`
+    /// is started in its place once it has closed.
+    fn close_window(&self, window: &gtk::ApplicationWindow, restart: Option<PathBuf>) {
+        let close = move |window: &gtk::ApplicationWindow| {
+            if let Some(program) = restart {
+                update::restart_into(program);
+            }
+            window.destroy();
+        };
         let open = (self.tabs.values())
             .filter(|tab| match &tab.panel {
                 Panel::Shell(remote) => matches!(remote.state, session::State::Running(_)),
@@ -2863,8 +2884,7 @@ impl App {
             })
             .count();
         if open == 0 {
-            window.destroy();
-            return;
+            return close(window);
         }
         let detail = if open == 1 {
             "A terminal is open. Closing Burrow ends it.".to_string()
@@ -2873,7 +2893,7 @@ impl App {
         };
         let target = window.clone();
         dialogs::confirm(window, "Close Burrow?", &detail, "Close", move || {
-            target.destroy()
+            close(&target)
         });
     }
 

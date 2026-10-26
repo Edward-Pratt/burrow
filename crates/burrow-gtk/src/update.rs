@@ -18,6 +18,14 @@ use crate::files;
 /// The binary to start in place of this one when the window has closed.
 static RESTART: OnceLock<PathBuf> = OnceLock::new();
 
+/// Starts `program` once the app has quit. Called as the window goes, so
+/// a close the user cancelled restarts nothing.
+pub fn restart_into(program: PathBuf) {
+    let _ = RESTART.set(program);
+}
+
+type Restart = Rc<dyn Fn(PathBuf)>;
+
 /// After the app quits: starts the updated window, if the user asked. The
 /// old process is replaced rather than followed, so its D-Bus name is
 /// gone before the new window asks for it.
@@ -112,7 +120,9 @@ impl Dialog {
     }
 }
 
-pub fn show(parent: &gtk::ApplicationWindow) {
+/// Opens the dialog. `restart` closes the window the usual way, then
+/// starts the program it's given.
+pub fn show(parent: &gtk::ApplicationWindow, restart: impl Fn(PathBuf) + 'static) {
     let window = gtk::Window::builder()
         .title("Updates")
         .modal(true)
@@ -175,6 +185,17 @@ pub fn show(parent: &gtk::ApplicationWindow) {
         action,
         clicked: RefCell::new(None),
     });
+    // What the action button runs holds the dialog, which holds the
+    // button, so it goes when the window closes, and the dialog with it.
+    let weak = Rc::downgrade(&dialog);
+    window.connect_close_request(move |_| {
+        if let Some(dialog) = weak.upgrade()
+            && let Some(handler) = dialog.clicked.take()
+        {
+            dialog.action.disconnect(handler);
+        }
+        glib::Propagation::Proceed
+    });
     window.present();
 
     // Only the install script's own install can update itself. A pacman
@@ -190,11 +211,10 @@ pub fn show(parent: &gtk::ApplicationWindow) {
         );
         return;
     };
-    let parent = parent.clone();
-    glib::spawn_future_local(check(dialog, script, parent));
+    glib::spawn_future_local(check(dialog, script, Rc::new(restart)));
 }
 
-async fn check(dialog: Rc<Dialog>, script: PathBuf, parent: gtk::ApplicationWindow) {
+async fn check(dialog: Rc<Dialog>, script: PathBuf, restart: Restart) {
     dialog.busy("Checking for updates…");
     let (ok, output) = run(&script, &["--check"], |_| {}).await;
     let Some(check) = parse_check(&output).filter(|_| ok) else {
@@ -225,11 +245,11 @@ async fn check(dialog: Rc<Dialog>, script: PathBuf, parent: gtk::ApplicationWind
     dialog.done("An update is ready.", &detail);
     let again = dialog.clone();
     dialog.offer("Update", move || {
-        glib::spawn_future_local(update(again.clone(), script.clone(), parent.clone()));
+        glib::spawn_future_local(update(again.clone(), script.clone(), restart.clone()));
     });
 }
 
-async fn update(dialog: Rc<Dialog>, script: PathBuf, parent: gtk::ApplicationWindow) {
+async fn update(dialog: Rc<Dialog>, script: PathBuf, restart: Restart) {
     dialog.busy("Updating…");
     let shown = dialog.detail.clone();
     let (ok, output) = run(&script, &[], move |line| {
@@ -245,13 +265,10 @@ async fn update(dialog: Rc<Dialog>, script: PathBuf, parent: gtk::ApplicationWin
     let Some(window) = bin_dir().map(|dir| dir.join("burrow-gtk")) else {
         return;
     };
-    let this = dialog.window.clone();
+    let this = dialog.clone();
     dialog.offer("Restart", move || {
-        let _ = RESTART.set(window.clone());
-        this.close();
-        // The usual way out, so open tabs are saved and unsaved files asked
-        // about.
-        parent.close();
+        this.window.close();
+        restart(window.clone());
     });
 }
 
