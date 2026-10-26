@@ -360,7 +360,8 @@ enum Panel {
     /// An SSH host's shell.
     Shell(Remote),
     Files(Files),
-    Monitor(Monitor),
+    /// Boxed, being much bigger than the other panels.
+    Monitor(Box<Monitor>),
     Database(Database),
     Tunnel(Rc<tunnels::TunnelPage>),
     /// The box an addon draws its view in.
@@ -1332,6 +1333,16 @@ impl App {
                     panel.set_units(units);
                 }
             }
+            Event::MonitorApps { session, apps, .. } => {
+                let tab = self.tab_of(session).and_then(|key| self.tabs.get(&key));
+                if let Some(Tab {
+                    panel: Panel::Monitor(panel),
+                    ..
+                }) = tab
+                {
+                    panel.set_apps(&apps);
+                }
+            }
             Event::AutostartChanged { nodes } => {
                 self.autostart = nodes.into_iter().collect();
                 self.refresh_tunnels(sender);
@@ -2035,7 +2046,7 @@ impl App {
         self.add_tab(
             key,
             page,
-            Panel::Monitor(panel),
+            Panel::Monitor(Box::new(panel)),
             icon,
             &title,
             widgets,

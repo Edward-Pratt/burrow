@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use burrow_agent::{Sample, Unit};
+use burrow_agent::{Apps, Sample, Unit};
 
 use crate::api::{Alert, AlertId, AlertKind, Event, NodeId};
 
@@ -34,6 +34,7 @@ pub(crate) enum Rule {
     Disks,
     Memory,
     Reachable,
+    Apps,
 }
 
 impl Rule {
@@ -43,6 +44,7 @@ impl Rule {
             AlertKind::DiskFull { .. } => Rule::Disks,
             AlertKind::MemoryLow { .. } => Rule::Memory,
             AlertKind::Unreachable { .. } => Rule::Reachable,
+            AlertKind::ContainerFailed { .. } | AlertKind::AppFailed { .. } => Rule::Apps,
         }
     }
 }
@@ -164,11 +166,34 @@ pub(crate) fn failed_units(units: &[Unit]) -> Vec<AlertKind> {
         .collect()
 }
 
+/// The containers and PM2 apps that failed.
+pub(crate) fn failed_apps(apps: &Apps) -> Vec<AlertKind> {
+    let containers = apps.containers.iter().flat_map(|c| &c.list);
+    let containers = containers
+        .filter(|c| c.failed())
+        .map(|c| AlertKind::ContainerFailed {
+            container: c.name.clone(),
+            status: c.status.clone(),
+        });
+    let pm2 = apps.pm2.iter().flat_map(|p| &p.apps);
+    let pm2 = pm2
+        .filter(|app| app.failed())
+        .map(|app| AlertKind::AppFailed {
+            app: app.name.clone(),
+        });
+    containers.chain(pm2).collect()
+}
+
 /// Whether two alerts are about the same thing, whatever their numbers.
 fn same(a: &AlertKind, b: &AlertKind) -> bool {
     match (a, b) {
         (AlertKind::UnitFailed { unit: a }, AlertKind::UnitFailed { unit: b }) => a == b,
         (AlertKind::DiskFull { mount: a, .. }, AlertKind::DiskFull { mount: b, .. }) => a == b,
+        (
+            AlertKind::ContainerFailed { container: a, .. },
+            AlertKind::ContainerFailed { container: b, .. },
+        ) => a == b,
+        (AlertKind::AppFailed { app: a }, AlertKind::AppFailed { app: b }) => a == b,
         (AlertKind::MemoryLow { .. }, AlertKind::MemoryLow { .. })
         | (AlertKind::Unreachable { .. }, AlertKind::Unreachable { .. }) => true,
         _ => false,
@@ -270,5 +295,64 @@ mod tests {
         assert_eq!(alerts.list().len(), 1);
         assert_eq!(cleared(&alerts.clear(db)), 1);
         assert!(alerts.list().is_empty());
+    }
+
+    #[test]
+    fn containers_and_pm2_apps_alert_when_they_fail() {
+        use burrow_agent::{Container, Containers, Pm2, Pm2App};
+        let container = |name: &str, state: &str, status: &str| Container {
+            name: name.into(),
+            state: state.into(),
+            status: status.into(),
+            ..Container::default()
+        };
+        let app = |name: &str, status: &str| Pm2App {
+            name: name.into(),
+            status: status.into(),
+            ..Pm2App::default()
+        };
+        let apps = Apps {
+            containers: Some(Containers {
+                runtime: "docker".into(),
+                error: None,
+                list: vec![
+                    container("web", "running", "Up 3 hours"),
+                    container("job", "exited", "Exited (0) 1 hour ago"),
+                    container("api", "exited", "Exited (137) 2 minutes ago"),
+                    container("loop", "restarting", "Restarting (1) 5 seconds ago"),
+                    container("gone", "dead", "Dead"),
+                ],
+            }),
+            pm2: Some(Pm2 {
+                error: None,
+                apps: vec![
+                    app("site", "online"),
+                    app("paused", "stopped"),
+                    app("bot", "errored"),
+                ],
+            }),
+        };
+        let failed = failed_apps(&apps);
+        let names: Vec<&str> = failed
+            .iter()
+            .map(|kind| match kind {
+                AlertKind::ContainerFailed { container, .. } => container.as_str(),
+                AlertKind::AppFailed { app } => app.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(names, ["api", "loop", "gone", "bot"]);
+
+        // A container whose status text changes is still the same alert.
+        let alerts = Alerts::default();
+        let node = NodeId::new();
+        assert_eq!(raised(&alerts.set(node, Rule::Apps, failed, 1)), 4);
+        let later = vec![AlertKind::ContainerFailed {
+            container: "api".into(),
+            status: "Exited (137) 3 minutes ago".into(),
+        }];
+        let events = alerts.set(node, Rule::Apps, later, 2);
+        assert_eq!((raised(&events), cleared(&events)), (0, 3));
+        assert_eq!(failed_apps(&Apps::default()), Vec::new());
     }
 }

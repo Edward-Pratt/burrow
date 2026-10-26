@@ -574,6 +574,11 @@ pub enum AlertKind {
     /// The host or its agent stopped answering for a minute, after the
     /// monitor had connected.
     Unreachable { error: String },
+    /// A container exited with an error, died or keeps restarting.
+    /// `status` is what `docker ps` says, such as "Exited (1) 2 minutes ago".
+    ContainerFailed { container: String, status: String },
+    /// A PM2 app errored: PM2 gave up restarting it.
+    AppFailed { app: String },
 }
 
 /// How far back [`Command::MonitorTrend`] looks.
@@ -594,6 +599,9 @@ pub struct MonitorHistory {
     pub samples: Vec<monitor::Sample>,
     /// The services, as last listed.
     pub units: Option<Vec<monitor::Unit>>,
+    /// The containers and PM2 apps, as last listed.
+    #[serde(default)]
+    pub apps: Option<monitor::Apps>,
 }
 
 /// What a command run with [`Command::Exec`] did. Output is decoded as
@@ -926,8 +934,8 @@ pub enum Command {
         timeout: Option<u32>,
     },
     /// Starts burrow-agent on an SSH host node, putting it there first if
-    /// needed, and reports what it sees as [`Event::MonitorSample`] and
-    /// [`Event::MonitorUnits`]. Returns [`Response::Session`]: the host's
+    /// needed, and reports what it sees as [`Event::MonitorSample`],
+    /// [`Event::MonitorUnits`] and [`Event::MonitorApps`]. Returns [`Response::Session`]: the host's
     /// background monitor if it has one, otherwise a new session.
     OpenMonitor {
         node: NodeId,
@@ -1201,6 +1209,13 @@ pub enum Event {
         session: SessionId,
         node: NodeId,
         units: Vec<monitor::Unit>,
+    },
+    /// A monitor's server has different containers or PM2 apps, or one of
+    /// them changed.
+    MonitorApps {
+        session: SessionId,
+        node: NodeId,
+        apps: monitor::Apps,
     },
     /// The tunnels that start with Burrow changed.
     AutostartChanged {

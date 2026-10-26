@@ -109,6 +109,7 @@ Every subscriber receives events. They are sent for changes made through command
 | `transfer_changed` | `transfer`, `session`, `state` | A download or upload moved on: `running { done, total }` (at most a few times a second), `finished`, `failed { error }` or `cancelled`. |
 | `monitor_sample` | `session`, `node`, `sample` | A monitor's server sent new stats, every 2 s. |
 | `monitor_units` | `session`, `node`, `units` | A monitor's server listed its services, and they differ from the last list. |
+| `monitor_apps` | `session`, `node`, `apps` | A monitor's server listed its containers and PM2 apps, and they differ from the last list. |
 | `autostart_changed` | `nodes` | The tunnels that start with Burrow changed. |
 | `alert_raised` | `alert` | Something went wrong on a host monitored in the background. |
 | `alert_cleared` | `alert` | An alert's condition ended, or its host stopped being monitored. |
@@ -206,7 +207,7 @@ target_port = 5432           # "local" only
 
 ## Monitors
 
-`open_monitor` on an `ssh-host` node runs `burrow-agent` on the server and reports what it sees. Once the session is `connected`, `monitor_sample` arrives every 2 seconds, and `monitor_units` whenever the server's systemd services change. `monitor_history` returns what the session has kept:
+`open_monitor` on an `ssh-host` node runs `burrow-agent` on the server and reports what it sees. Once the session is `connected`, `monitor_sample` arrives every 2 seconds, `monitor_units` whenever the server's systemd services change, and `monitor_apps` whenever its containers or PM2 apps do. `monitor_history` returns what the session has kept:
 
 ```json
 {"type": "monitor", "history": {"systemd": true, "units": [{"name": "nginx.service", "load": "loaded", "active": "failed", "sub": "failed", "description": "nginx"}], "samples": [{
@@ -218,6 +219,7 @@ target_port = 5432           # "local" only
 }]}}
 ```
 
+- **Apps:** `history.apps` is null until the first list, then `{"containers": …, "pm2": …}`. `containers` is null when the server has neither Docker nor Podman, and otherwise `{"runtime": "docker", "error"?: "…", "list": [{"id", "name", "image", "state", "status"}]}`: every container of the SSH user, running or not, with `id` cut to 12 characters, `state` such as `running`, `exited` or `restarting`, and `status` as `docker ps` words it, such as `Exited (1) 2 minutes ago`. `error` says why they couldn't be listed, such as no access to Docker's socket. `pm2` is null unless PM2's daemon runs for the SSH user, since asking PM2 would start it otherwise, and then `{"error"?: "…", "apps": [{"id", "name", "status", "cpu", "memory", "restarts", "since"}]}`, with `cpu` in percent of one core, `memory` in bytes and `since` in Unix milliseconds by the server's clock. The agent finds `pm2` on `PATH` or where nvm, Volta, n and npm put it. It sends only these fields: what `pm2 jlist` prints also holds each app's environment.
 - **Units:** sizes are bytes, `rx` and `tx` are bytes a second over the last interval, `cpu.percent` is busy time across all cores (0 to 100), and `time` is Unix milliseconds by the server's clock. `units` is null until the first list, and stays null when `systemd` is false.
 - **While a client watches:** a monitor runs while its session is open, and the client that opened it closing its connection closes it. Each session keeps its own samples for about an hour, in memory.
 - **In the background:** `set_monitoring` with `enabled: true` monitors an SSH host from when Burrow starts, whether or not a client is open. Like autostart, the choice is kept on this computer, in `$XDG_STATE_HOME/burrow/monitoring.toml`, so a node file can't turn it on. It is pinned to the host's name and props, and to the node it goes through, the way a grant is: turning it on needs `expect { name, props, via? }`, the host as the user was shown it, and a change to the host afterwards turns it off and stops its monitor (`monitoring_changed`).
@@ -231,12 +233,14 @@ target_port = 5432           # "local" only
   | `disk_full` | `mount`, `percent` (used) | a minute's average is over 90% used | it is under 85% |
   | `memory_low` | `percent` (available) | a minute's average is under 10% available | it is over 15% |
   | `unreachable` | `error` | the monitor has not answered for 60 s, after it had connected since Burrow started | it connects again |
+  | `container_failed` | `container`, `status` | a container exited with a code other than 0, is `dead` or is `restarting` | it runs, exits with 0 or is removed |
+  | `app_failed` | `app` | a PM2 app is `errored`, so PM2 stopped restarting it | it isn't |
 
   Each alert is raised once, with `alert_raised`, and keeps its id until `alert_cleared`. `list_alerts` returns those that hold now. They are kept in memory, so after a restart whatever still holds is raised again. Turning monitoring off, or deleting the host, clears its alerts. `burrowd` shows each raised alert as a desktop notification itself, over `org.freedesktop.Notifications` on the session bus, so alerts show with no window open; clients list them rather than notify again. Text from the server in a notification has markup escaped.
-- **The agent:** `burrow-agent` is a static program, built for x86_64 and aarch64 Linux servers, that only reads. It never listens on the network, and it stops when Burrow closes the session. Burrow puts it at `~/.local/share/burrow/burrow-agent-<version>` over SFTP on the host's shared connection, and removes other versions it finds there.
+- **The agent:** `burrow-agent` is a static program, built for x86_64 and aarch64 Linux servers, that only reads. Every 10 seconds it lists services with `systemctl`, containers with `docker ps` or `podman ps`, and PM2 apps with `pm2 jlist`, giving each 5 seconds. Its wire format is version 2, which added the apps line. It never listens on the network, and it stops when Burrow closes the session. Burrow puts it at `~/.local/share/burrow/burrow-agent-<version>` over SFTP on the host's shared connection, and removes other versions it finds there.
 - **Asked once per host:** before the first upload, the session asks a `confirm` prompt naming the host, the path and the program's SHA-256. The answer is kept in `$XDG_STATE_HOME/burrow/agent.toml`, pinned to the host node like a grant, so a node file can't approve it. Uploads after that, such as a new version, don't ask.
 - **Checked every time:** each `open_monitor` reads the file back and compares its hash with Burrow's copy, and replaces it if they differ. A symlink at the path, or on the way to it, fails the session: Burrow won't run or write through one.
-- **The server is not trusted:** a line from the agent over 1 MiB, or one that doesn't parse, ends the session, and so does an agent that doesn't say hello first or speaks another protocol version. Names lose control characters and are cut at 256 characters. Lists are cut (256 disks and interfaces, 4096 units), and numbers that no stat can have become 0. A sample still over 16 KiB as JSON ends the session too, so an hour of history stays under 30 MiB and fits one reply.
+- **The server is not trusted:** a line from the agent over 1 MiB, or one that doesn't parse, ends the session, and so does an agent that doesn't say hello first or speaks another protocol version. Names lose control characters and are cut at 256 characters. Lists are cut (256 disks and interfaces, 4096 units, containers and PM2 apps), and numbers that no stat can have become 0. A sample still over 16 KiB as JSON ends the session too, so an hour of history stays under 30 MiB and fits one reply.
 - **Where Burrow finds the agent:** the builds are named `burrow-agent-<arch>` and read from `$BURROW_AGENT_DIR`, then `lib/burrow/` beside the folder Burrow runs from (`~/.local/lib/burrow/` beside `~/.local/bin/`), then `/usr/lib/burrow/`, then the cargo target folder Burrow was built in (`target/<arch>-unknown-linux-musl/agent/`). Build them with `cargo build -p burrow-agent --profile agent --target x86_64-unknown-linux-musl` (or `aarch64-unknown-linux-musl`).
 
 ## Databases
