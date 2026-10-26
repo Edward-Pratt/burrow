@@ -1205,6 +1205,132 @@ async fn service_actions_and_logs_run_where_the_monitor_found_them() {
     }
 }
 
+/// A VNC server on a local port that takes the password "secret12" and,
+/// once signed in, answers ClientInit with `SERVERINIT` and then echoes.
+/// A failed sign-in closes its connection, as real servers do.
+async fn vnc_server(listener: TcpListener) {
+    // "secret12" encrypting 00..0f, from `openssl enc -des-ecb -nopad`.
+    const CHALLENGE: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    const ANSWER: &str = "adcd997f8e16fee575e973f93c2b62b4";
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        tokio::spawn(async move {
+            stream.write_all(b"RFB 003.008\n").await?;
+            let mut version = [0; 12];
+            stream.read_exact(&mut version).await?;
+            stream.write_all(&[2, 19, 2]).await?;
+            assert_eq!(stream.read_u8().await?, 2, "VNC authentication");
+            stream.write_all(&CHALLENGE).await?;
+            let mut answer = [0; 16];
+            stream.read_exact(&mut answer).await?;
+            let hex: String = answer.iter().map(|b| format!("{b:02x}")).collect();
+            if hex != ANSWER {
+                let why = b"Authentication failed";
+                stream.write_all(&1u32.to_be_bytes()).await?;
+                stream.write_all(&(why.len() as u32).to_be_bytes()).await?;
+                return stream.write_all(why).await;
+            }
+            stream.write_all(&0u32.to_be_bytes()).await?;
+            assert_eq!(stream.read_u8().await?, 1, "a shared ClientInit");
+            stream.write_all(b"SERVERINIT").await?;
+            let mut buffer = [0; 256];
+            loop {
+                let n = stream.read(&mut buffer).await?;
+                if n == 0 {
+                    return Ok::<_, std::io::Error>(());
+                }
+                stream.write_all(&buffer[..n]).await?;
+            }
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_desktop_signs_in_in_the_core_and_then_passes_bytes() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let host = host(&core, "test").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(vnc_server(listener));
+    let mut props = toml::Table::new();
+    props.insert("via".into(), host.id.0.to_string().into());
+    props.insert("host".into(), "127.0.0.1".into());
+    props.insert("port".into(), i64::from(port).into());
+    let create = Command::CreateNode {
+        parent: None,
+        kind: "vnc".into(),
+        name: "desktop".into(),
+        color: None,
+        props,
+    };
+    let node = match core.execute(create).await.unwrap() {
+        Response::Node { node } => node,
+        other => panic!("expected a node, got {other:?}"),
+    };
+
+    let mut events = core.subscribe();
+    let session = match core
+        .execute(Command::OpenVnc { node: node.id })
+        .await
+        .unwrap()
+    {
+        Response::Session { session } => session,
+        other => panic!("expected a session, got {other:?}"),
+    };
+    let mut output = core.take_output(session).unwrap();
+    // No saved password: asked for, refused with the server's reason,
+    // asked again.
+    let password = |value: &str| PromptAnswer::Text {
+        value: SecretValue::new(value),
+        save: false,
+    };
+    let prompt = expect_prompt(&mut events, session).await;
+    assert!(matches!(prompt.kind, PromptKind::Secret { .. }));
+    answer(&core, session, &prompt, password("wrong")).await;
+    let prompt = expect_prompt(&mut events, session).await;
+    assert!(
+        prompt.message.starts_with("Authentication failed."),
+        "{}",
+        prompt.message
+    );
+    answer(&core, session, &prompt, password("secret12")).await;
+    assert_eq!(
+        expect_state(&mut events, session).await,
+        SessionState::Connected
+    );
+
+    // The client sees a server that needs no password, then the real one.
+    let write = |data: &[u8]| Command::WriteTerminal {
+        session,
+        data: data.to_vec(),
+    };
+    let mut seen = Vec::new();
+    let mut take = async |n: usize| {
+        while seen.len() < n {
+            seen.extend(output.recv().await.expect("output ended"));
+        }
+        seen.drain(..n).collect::<Vec<u8>>()
+    };
+    assert_eq!(take(12).await, b"RFB 003.008\n");
+    core.execute(write(b"RFB 003.008\n")).await.unwrap();
+    assert_eq!(take(2).await, [1, 1], "one security type: none");
+    core.execute(write(&[1])).await.unwrap();
+    assert_eq!(take(4).await, [0; 4], "signed in");
+    // ClientInit goes to the real server, which answers.
+    core.execute(write(&[1])).await.unwrap();
+    assert_eq!(take(10).await, b"SERVERINIT");
+    core.execute(write(b"ping")).await.unwrap();
+    read_until(&mut output, "ping").await;
+
+    core.execute(Command::CloseSession { session })
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn exec_returns_output_and_status() {
     let Some(server) = Server::start() else {

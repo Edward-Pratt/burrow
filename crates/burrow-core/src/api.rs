@@ -28,6 +28,10 @@ pub const SSH_HOST_KIND: &str = "ssh-host";
 /// through and what to forward; see [`Command::StartTunnel`].
 pub const SSH_TUNNEL_KIND: &str = "ssh-tunnel";
 
+/// The `kind` of VNC desktop nodes, reached through an SSH host; see
+/// [`Command::OpenVnc`].
+pub const VNC_KIND: &str = "vnc";
+
 /// The `kind` of PostgreSQL connection nodes. Their props say where the
 /// server is and how to reach it; see [`Command::OpenDatabase`].
 pub const POSTGRES_KIND: &str = "postgres";
@@ -184,6 +188,8 @@ pub enum SessionKind {
     Exec,
     /// burrow-agent reporting a server's state, for [`Command::OpenMonitor`].
     Monitor,
+    /// A VNC desktop, for [`Command::OpenVnc`].
+    Vnc,
 }
 
 /// Identifies a download or upload. Unique for as long as the core runs.
@@ -1007,6 +1013,15 @@ pub enum Command {
         /// In seconds: 60 when missing, at most 3600.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout: Option<u32>,
+    },
+    /// Connects to a `vnc` node's desktop through its SSH host and signs
+    /// in, asking for the password if the server wants one. Returns
+    /// [`Response::Session`]. Once `connected`, the session's output is the
+    /// server's RFB stream, as if from a server that needs no password and
+    /// speaks RFB 3.8: the client reads it with `take_output`, writes with
+    /// [`Command::WriteTerminal`], and speaks RFB itself.
+    OpenVnc {
+        node: NodeId,
     },
     /// Starts, stops, restarts, reloads, enables or disables a service on
     /// an SSH host node, and waits for it. A systemd unit's action runs as

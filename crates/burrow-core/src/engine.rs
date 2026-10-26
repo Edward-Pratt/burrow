@@ -8,7 +8,7 @@ use crate::addon::{Host, Manifest, Permission};
 use crate::api::{
     API_VERSION, AlertKind, Capability, Command, Event, Grant, Node, NodeId, POSTGRES_KIND,
     Problem, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionKind,
-    TerminalRun, View,
+    TerminalRun, VNC_KIND, View,
 };
 use crate::class::AddonRule;
 use crate::db;
@@ -22,6 +22,7 @@ use crate::ssh::{
     self, Agents, Autostart, Connections, Input, Sessions, Transfers, Waits, files, hosts, services,
 };
 use crate::tree::{Entry, Tree};
+use crate::vnc;
 
 /// How many events a slow subscriber can fall behind before it starts
 /// missing them (it then gets `RecvError::Lagged` and should re-list).
@@ -382,6 +383,11 @@ impl Core {
             Command::OpenDatabase { node } => {
                 let node = self.node_of_kind(node, POSTGRES_KIND)?;
                 let session = db::open(self, node);
+                return Ok(Response::Session { session });
+            }
+            Command::OpenVnc { node } => {
+                let node = self.node_of_kind(node, VNC_KIND)?;
+                let session = vnc::open(self, node);
                 return Ok(Response::Session { session });
             }
             Command::RunQuery {
@@ -1108,6 +1114,7 @@ impl Inner {
             | Command::Upload { .. }
             | Command::CancelTransfer { .. }
             | Command::OpenDatabase { .. }
+            | Command::OpenVnc { .. }
             | Command::RunQuery { .. }
             | Command::CancelQuery { .. }
             | Command::SetReadOnly { .. }
@@ -1317,6 +1324,7 @@ fn check_kind(node: &Node, kind: &str) -> Result<()> {
         SSH_HOST_KIND => "an SSH host".to_string(),
         SSH_TUNNEL_KIND => "an SSH tunnel".to_string(),
         POSTGRES_KIND => "a database".to_string(),
+        VNC_KIND => "a desktop".to_string(),
         // No command asks for another kind today. A new one that does
         // gets a plain error rather than a panic.
         _ => format!("a {kind} node"),
