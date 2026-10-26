@@ -61,6 +61,8 @@ impl Remote {
         {
             self.terminal.feed(status.as_bytes());
             self.state = State::Closed;
+            // It was the ended shell's.
+            self.title = None;
             self.ending = Ending::default();
         }
     }

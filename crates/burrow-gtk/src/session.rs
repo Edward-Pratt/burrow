@@ -37,10 +37,6 @@ pub enum Msg {
 /// until then.
 pub struct SessionPage {
     pub state: State,
-    /// Whether an ending moves the focus to the Reconnect button. Where
-    /// the content held the focus, it would otherwise land on the
-    /// selectable message, with all of it selected.
-    pub focus_reconnect: bool,
     stack: gtk::Stack,
     message: gtk::Label,
     reconnect: gtk::Button,
@@ -69,7 +65,6 @@ impl SessionPage {
         stack.set_visible_child_name("message");
         SessionPage {
             state: State::Starting,
-            focus_reconnect: false,
             stack,
             message,
             reconnect,
@@ -90,10 +85,13 @@ impl SessionPage {
 
     /// Shows a message in place of the content.
     pub fn show_message(&self, text: &str, can_reconnect: bool) {
+        // Where the content held the focus, hiding it would move the focus
+        // to the selectable message, with all of it selected.
+        let had_focus = self.stack.focus_child().is_some();
         self.message.set_label(text);
         self.reconnect.set_visible(can_reconnect);
         self.stack.set_visible_child_name("message");
-        if can_reconnect && self.focus_reconnect {
+        if can_reconnect && had_focus {
             self.reconnect.grab_focus();
         }
     }

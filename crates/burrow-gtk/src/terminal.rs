@@ -192,8 +192,13 @@ pub fn page(terminal: &vte4::Terminal) -> gtk::ScrolledWindow {
         .build()
 }
 
-/// The terminal inside a tab page, if the page is a terminal page.
+/// The terminal inside a tab page, if the page is a terminal page or a
+/// box, such as an SSH shell's with its toolbar, that ends with one.
 pub fn in_page(page: &gtk::Widget) -> Option<vte4::Terminal> {
+    let page = match page.downcast_ref::<gtk::Box>() {
+        Some(page) => page.last_child()?,
+        None => page.clone(),
+    };
     page.downcast_ref::<gtk::ScrolledWindow>()?
         .child()?
         .downcast()

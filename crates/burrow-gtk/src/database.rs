@@ -284,8 +284,7 @@ impl Database {
         main.append(&split);
         split.set_vexpand(true);
 
-        let mut session = SessionPage::new(&main, send(Msg::Session(session::Msg::Reconnect)));
-        session.focus_reconnect = true;
+        let session = SessionPage::new(&main, send(Msg::Session(session::Msg::Reconnect)));
         session.widget().set_vexpand(true);
         page.append(session.widget());
 

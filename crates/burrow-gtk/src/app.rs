@@ -723,10 +723,13 @@ impl Component for App {
                 }
             }
             AppMsg::RemoteTitle { tab, title } => {
-                if let Some(remote) = self.shell(tab) {
+                // VTE reports a title after the output that set it, which
+                // can be after the shell has ended.
+                if let Some(remote) = self.shell(tab)
+                    && matches!(remote.state, session::State::Running(_))
+                {
                     // The server sets it.
                     remote.title = Some(files::printable(&title));
-                    self.set_remote_tooltip(tab);
                 }
             }
             AppMsg::NewShell(id) => self.new_shell(id, widgets, &sender),
@@ -989,6 +992,7 @@ impl Component for App {
             } else {
                 "tabs"
             });
+        self.refresh_tabs();
         self.refresh_status(widgets);
     }
 }
@@ -1132,6 +1136,7 @@ impl App {
             }
             Event::NodeUpdated { node } => {
                 let id = node.id;
+                let kind = self.kind_label(&node.kind);
                 for (key, tab) in self.tabs.iter().filter(|(key, _)| key.node() == Some(id)) {
                     let title = match (key, &tab.panel) {
                         (TabKey::Files(_), _) => files_title(&node.name),
@@ -1141,7 +1146,7 @@ impl App {
                     };
                     set_tab_title(&tab.title, &title);
                     if let Panel::Placeholder(page) = &tab.panel {
-                        fill_page(page, &node, &self.nodes);
+                        fill_page(page, &node, &kind, &self.nodes);
                     }
                 }
                 // A running tunnel keeps the settings it started with.
@@ -1156,14 +1161,6 @@ impl App {
                 }
                 widgets.sidebar.update(&node, &self.icons());
                 self.nodes.insert(id, node);
-                // Setting a shell's title replaced its tooltip.
-                let shells: Vec<TabKey> = (self.tabs.keys())
-                    .filter(|key| matches!(key, TabKey::Shell(node, _) if *node == id))
-                    .copied()
-                    .collect();
-                for key in shells {
-                    self.set_remote_tooltip(key);
-                }
                 // Tunnel pages name the host they go through.
                 self.refresh_tunnels(sender);
                 // The addon draws from the node, so ask it again.
@@ -1399,18 +1396,28 @@ impl App {
         }
     }
 
-    /// An SSH shell tab's tooltip: its title, and the title the shell set,
-    /// as a local terminal's tab shows its shell's.
-    fn set_remote_tooltip(&self, key: TabKey) {
-        let Some(tab) = self.tabs.get(&key) else {
-            return;
-        };
-        if let Panel::Shell(Remote {
-            title: Some(title), ..
-        }) = &tab.panel
-        {
-            let tooltip = format!("{}\n{title}", tab.title.label());
-            tab.title.set_tooltip_text(Some(&tooltip));
+    /// Dims the titles of tabs whose session has ended. A shell's tooltip
+    /// adds the title its shell set, as a local terminal's tab shows its
+    /// shell's, while the shell runs.
+    fn refresh_tabs(&self) {
+        for tab in self.tabs.values() {
+            if tab.panel.session() == Some(session::State::Closed) {
+                tab.title.add_css_class("dim");
+            } else {
+                tab.title.remove_css_class("dim");
+            }
+            if let Panel::Shell(remote) = &tab.panel {
+                let label = tab.title.label();
+                let tooltip = match &remote.title {
+                    Some(title) => Some(format!("{label}\n{title}")),
+                    None => title_tooltip(&label).map(str::to_string),
+                };
+                // Setting it, even to the same text, would redraw it on
+                // every burst of output.
+                if tab.title.tooltip_text().as_deref() != tooltip.as_deref() {
+                    tab.title.set_tooltip_text(tooltip.as_deref());
+                }
+            }
         }
     }
 
@@ -1814,7 +1821,7 @@ impl App {
             return;
         }
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        fill_page(&page, node, &self.nodes);
+        fill_page(&page, node, &self.kind_label(&node.kind), &self.nodes);
         let panel = Panel::Placeholder(page.clone());
         self.add_tab(key, page.upcast(), panel, icon, &name, widgets, sender);
     }
@@ -1864,7 +1871,26 @@ impl App {
                 move |cols, rows| sender.input(AppMsg::RemoteResize { tab, cols, rows })
             },
         );
-        let page = terminal::page(&term);
+        // The host's other tabs, a click away rather than in its context
+        // menu. The buttons leave the focus in the terminal.
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        bar.add_css_class("shell-bar");
+        for (label, message) in [
+            ("Files", AppMsg::OpenFiles(id)),
+            ("Monitor", AppMsg::OpenMonitor(id)),
+            ("New shell", AppMsg::NewShell(id)),
+        ] {
+            let button = gtk::Button::with_label(label);
+            button.add_css_class("flat");
+            button.set_focus_on_click(false);
+            send_on_click(&button, sender, message);
+            bar.append(&button);
+        }
+        let scroller = terminal::page(&term);
+        scroller.set_vexpand(true);
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page.append(&bar);
+        page.append(&scroller);
         remote::start(&self.core, tab, id, &term, sender);
         term.grab_focus();
         let icon = sidebar::icon_name(node, false, &self.icons()).to_string();
@@ -2775,11 +2801,17 @@ fn close_page(notebook: &gtk::Notebook, page: &gtk::Widget) {
 /// label's minimum is just the "…", so the minimum is set to fit the text.
 /// A title that is cut short shows in full on hover.
 fn set_tab_title(label: &gtk::Label, title: &str) {
-    const MAX_CHARS: usize = 24;
-    let chars = title.chars().count();
     label.set_label(title);
-    label.set_width_chars(chars.min(MAX_CHARS) as i32);
-    label.set_tooltip_text((chars > MAX_CHARS).then_some(title));
+    label.set_width_chars(title.chars().count().min(MAX_TITLE_CHARS) as i32);
+    label.set_tooltip_text(title_tooltip(title));
+}
+
+/// How many characters of a tab's title show before it is cut short.
+const MAX_TITLE_CHARS: usize = 24;
+
+/// A tab title's tooltip: the title, if it is cut short.
+fn title_tooltip(title: &str) -> Option<&str> {
+    (title.chars().count() > MAX_TITLE_CHARS).then_some(title)
 }
 
 /// A tunnel's settings as the window shows them, for `set_autostart`:
@@ -2827,7 +2859,8 @@ fn sentence_case(text: &str) -> String {
 }
 
 /// Placeholder page for a node until its addon provides a real view.
-fn fill_page(page: &gtk::Box, node: &Node, nodes: &HashMap<NodeId, Node>) {
+/// `kind` names the node's kind, as [`App::kind_label`] does.
+fn fill_page(page: &gtk::Box, node: &Node, kind: &str, nodes: &HashMap<NodeId, Node>) {
     while let Some(child) = page.first_child() {
         page.remove(&child);
     }
@@ -2842,9 +2875,9 @@ fn fill_page(page: &gtk::Box, node: &Node, nodes: &HashMap<NodeId, Node>) {
 
     let location = sidebar::location(nodes, node);
     let subtitle = gtk::Label::new(Some(&if location.is_empty() {
-        node.kind.clone()
+        kind.to_string()
     } else {
-        format!("{} · {location}", node.kind)
+        format!("{kind} · {location}")
     }));
     subtitle.set_xalign(0.0);
     subtitle.add_css_class("dim");
