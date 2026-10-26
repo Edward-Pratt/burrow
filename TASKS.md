@@ -24,7 +24,7 @@ Next milestones from `docs/DESIGN.md`, in rough order; pick by what the tester u
 
 ## Done
 
-- [x] ~~M12: architecture and UX review~~ (2026-10-26, branch m12-architecture-ux, PR not opened yet)
+- [x] ~~M12: architecture and UX review~~ (2026-10-26, PR #19 merged, with the context-menu hang fix in PR #18)
 - [x] ~~`stop()` probe can turn away a starting daemon~~ (2026-10-25, branch m12-core-2: a starting daemon retries the lock for about a second)
 - [x] ~~Install script with daily updates from main, and an icon~~ (2026-10-25, PR #16 merged)
 - [x] ~~`burrow daemon stop` under an open window~~ (2026-10-25, PR #14 merged)
