@@ -159,15 +159,14 @@ pub struct TunnelPage {
     /// "State".
     values: Vec<gtk::Label>,
     stale: gtk::Label,
-    /// Start, or Stop while the tunnel runs. One button, so it keeps the
-    /// focus when it is pressed from the keyboard.
-    toggle: gtk::Button,
+    /// Only the one that applies can be pressed; the other is greyed out.
+    start: gtk::Button,
+    stop: gtk::Button,
     restart: gtk::Button,
     autostart: gtk::CheckButton,
     /// Set while the checkbox is changed to match the core, so that isn't
     /// taken for the user's choice.
     quiet: Cell<bool>,
-    running: Cell<bool>,
     actions: RefCell<Option<Actions>>,
 }
 
@@ -217,11 +216,14 @@ impl TunnelPage {
 
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         buttons.set_margin_top(12);
-        let toggle = gtk::Button::new();
+        let start = gtk::Button::with_label("Start");
+        start.add_css_class("suggested-action");
+        let stop = gtk::Button::with_label("Stop");
         let restart = gtk::Button::with_label("Restart");
         restart.add_css_class("suggested-action");
         let edit = gtk::Button::with_label("Edit…");
-        buttons.append(&toggle);
+        buttons.append(&start);
+        buttons.append(&stop);
         buttons.append(&restart);
         buttons.append(&edit);
         page.append(&buttons);
@@ -235,38 +237,33 @@ impl TunnelPage {
             title,
             values,
             stale,
-            toggle: toggle.clone(),
+            start: start.clone(),
+            stop: stop.clone(),
             restart: restart.clone(),
             autostart: autostart.clone(),
             quiet: Cell::new(false),
-            running: Cell::new(false),
             actions: RefCell::new(None),
         });
 
         // The handlers hold the page weakly: it holds them through its
         // buttons.
         let weak = Rc::downgrade(&tab);
-        let run = move |pick: fn(&TunnelPage, &Actions) -> Rc<dyn Fn()>| {
+        let run = move |pick: fn(&Actions) -> Rc<dyn Fn()>| {
             let weak = weak.clone();
             move |_: &gtk::Button| {
                 let Some(tab) = weak.upgrade() else { return };
                 // Taken out of the borrow first, as the action may draw
                 // the page again.
-                let action = tab.actions.borrow().as_ref().map(|a| pick(&tab, a));
+                let action = tab.actions.borrow().as_ref().map(pick);
                 if let Some(action) = action {
                     action();
                 }
             }
         };
-        toggle.connect_clicked(run(|tab, actions| {
-            if tab.running.get() {
-                actions.stop.clone()
-            } else {
-                actions.start.clone()
-            }
-        }));
-        restart.connect_clicked(run(|_, actions| actions.restart.clone()));
-        edit.connect_clicked(run(|_, actions| actions.edit.clone()));
+        start.connect_clicked(run(|actions| actions.start.clone()));
+        stop.connect_clicked(run(|actions| actions.stop.clone()));
+        restart.connect_clicked(run(|actions| actions.restart.clone()));
+        edit.connect_clicked(run(|actions| actions.edit.clone()));
         autostart.connect_toggled({
             let weak = Rc::downgrade(&tab);
             move |check| {
@@ -324,19 +321,20 @@ impl TunnelPage {
         }
 
         let running = status.running().is_some();
-        self.running.set(running);
         self.stale.set_visible(status.stale && running);
-        self.toggle
-            .set_label(if running { "Stop" } else { "Start" });
-        if running {
-            self.toggle.remove_css_class("suggested-action");
+        // A button that is greyed out or hidden while it has the focus
+        // would drop it, so the focus goes to the one that applies now.
+        let (now, then) = if running {
+            (&self.stop, &self.start)
         } else {
-            self.toggle.add_css_class("suggested-action");
-        }
+            (&self.start, &self.stop)
+        };
+        now.set_sensitive(true);
         let restart = running && status.stale;
-        if !restart && self.restart.has_focus() {
-            self.toggle.grab_focus();
+        if then.has_focus() || (!restart && self.restart.has_focus()) {
+            now.grab_focus();
         }
+        then.set_sensitive(false);
         self.restart.set_visible(restart);
 
         if self.autostart.is_active() != autostart {
