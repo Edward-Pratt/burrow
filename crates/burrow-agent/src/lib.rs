@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// The wire format's version. A change that an older reader would get
 /// wrong bumps it, and Burrow refuses an agent whose version isn't its own.
-pub const PROTO: u32 = 1;
+pub const PROTO: u32 = 2;
 
 /// The agent's version, which is also its file name on servers.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -28,6 +28,8 @@ pub enum Message {
     /// Every systemd service, less often than samples because listing them
     /// runs a program.
     Units { units: Vec<Unit> },
+    /// Containers and PM2 apps, as often as units.
+    Apps(Apps),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -90,4 +92,84 @@ pub struct Unit {
     /// `running`, `exited`, `dead`…
     pub sub: String,
     pub description: String,
+}
+
+/// What runs on the server besides systemd services.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Apps {
+    /// `None` when neither Docker nor Podman is installed.
+    pub containers: Option<Containers>,
+    /// `None` when PM2 isn't running for the SSH user.
+    pub pm2: Option<Pm2>,
+}
+
+/// Every container, running or not, as `docker ps --all` or `podman ps
+/// --all` lists them for the SSH user.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Containers {
+    /// `docker` or `podman`.
+    pub runtime: String,
+    /// Why they couldn't be listed, such as no access to Docker's socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub list: Vec<Container>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Container {
+    /// The short id, 12 characters.
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    /// `running`, `exited`, `restarting`, `paused`, `dead`…
+    pub state: String,
+    /// What `ps` says about it, such as "Up 3 hours" or "Exited (1) 2
+    /// minutes ago".
+    pub status: String,
+}
+
+impl Container {
+    /// Whether it exited with an error, died or keeps restarting. One that
+    /// exited cleanly is often a job that finished.
+    pub fn failed(&self) -> bool {
+        match self.state.as_str() {
+            "dead" | "restarting" => true,
+            "exited" => !self.status.starts_with("Exited (0)"),
+            _ => false,
+        }
+    }
+}
+
+/// The apps PM2 runs for the SSH user.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Pm2 {
+    /// Why they couldn't be listed, such as `pm2` not being found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub apps: Vec<Pm2App>,
+}
+
+/// A PM2 app. Only these fields leave the server: what `pm2 jlist` says
+/// also holds each app's environment, secrets included.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Pm2App {
+    pub id: u64,
+    pub name: String,
+    /// `online`, `stopped`, `errored`, `launching`…
+    pub status: String,
+    /// Percent of one core.
+    pub cpu: f64,
+    /// Bytes.
+    pub memory: u64,
+    pub restarts: u64,
+    /// When it last started, in Unix milliseconds, by the server's clock.
+    pub since: u64,
+}
+
+impl Pm2App {
+    /// Whether PM2 gave up restarting it. A stopped app was stopped on
+    /// purpose.
+    pub fn failed(&self) -> bool {
+        self.status == "errored"
+    }
 }

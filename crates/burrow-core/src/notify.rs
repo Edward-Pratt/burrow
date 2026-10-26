@@ -99,6 +99,14 @@ async fn send(connection: &zbus::Connection, host: &str, alert: &Alert) -> zbus:
             format!("{percent:.0}% of memory is available."),
         ),
         AlertKind::Unreachable { error } => (format!("{host} is not answering"), error.clone()),
+        AlertKind::ContainerFailed { container, status } => (
+            format!("{host}: a container stopped"),
+            format!("{container}: {status}."),
+        ),
+        AlertKind::AppFailed { app } => (
+            format!("{host}: a PM2 app failed"),
+            format!("{app} errored, and PM2 stopped restarting it."),
+        ),
     };
     let mut hints: HashMap<&str, Value> = HashMap::new();
     hints.insert("desktop-entry", DESKTOP_ENTRY.into());

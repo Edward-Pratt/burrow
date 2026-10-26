@@ -1,62 +1,31 @@
 //! Listing systemd services with `systemctl`.
 
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::path::Path;
 
 use burrow_agent::Unit;
 
-/// How long `systemctl` may take. A wedged systemd shouldn't stall the
-/// samples, which are sent from the same loop.
-const TIMEOUT: Duration = Duration::from_secs(5);
+use crate::run;
 
 /// Whether systemd runs this system, the way `sd_booted()` decides.
 pub fn available() -> bool {
-    std::path::Path::new("/run/systemd/system").is_dir()
+    Path::new("/run/systemd/system").is_dir()
 }
 
 /// Every service, or `None` if `systemctl` failed or took too long.
 pub fn list() -> Option<Vec<Unit>> {
-    let mut child = Command::new("systemctl")
-        .args([
-            "list-units",
-            "--type=service",
-            "--all",
-            "--plain",
-            "--no-legend",
-            "--no-pager",
-            "--full",
-        ])
-        .env("SYSTEMD_COLORS", "0")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    // Read on another thread, so a full pipe can't keep the child from
-    // exiting while this one waits.
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        stdout.read_to_string(&mut text).ok().map(|_| text)
-    });
-    let deadline = Instant::now() + TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
-    let text = reader.join().ok()??;
-    status.success().then(|| parse(&text))
+    let systemctl = run::find("systemctl")?;
+    let args = [
+        "list-units",
+        "--type=service",
+        "--all",
+        "--plain",
+        "--no-legend",
+        "--no-pager",
+        "--full",
+    ];
+    run::output(&systemctl, &args, None)
+        .ok()
+        .map(|text| parse(&text))
 }
 
 /// Parses `UNIT LOAD ACTIVE SUB DESCRIPTION` lines.

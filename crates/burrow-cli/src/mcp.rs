@@ -480,6 +480,7 @@ fn monitor_summary(history: &burrow_core::MonitorHistory, all_units: bool) -> Va
         },
         "systemd": history.systemd,
         "services": units,
+        "apps": history.apps,
     })
 }
 

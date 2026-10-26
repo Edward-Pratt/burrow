@@ -5,7 +5,9 @@
 //! runs as the SSH user and changes nothing on the server. It stops when
 //! Burrow closes its stdin or stops reading.
 
+mod apps;
 mod proc;
+mod run;
 mod units;
 
 use std::collections::BTreeMap;
@@ -14,9 +16,10 @@ use std::io::{self, Read, Write};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
-use burrow_agent::{Cpu, Interface, Message, PROTO, Sample, VERSION};
+use burrow_agent::{Apps, Cpu, Interface, Message, PROTO, Sample, VERSION};
 
-/// How often units are listed, whatever the sample interval.
+/// How often units, containers and PM2 apps are listed, whatever the
+/// sample interval.
 const UNITS_EVERY: Duration = Duration::from_secs(10);
 
 fn main() -> ExitCode {
@@ -65,11 +68,19 @@ fn stream(interval: Duration) -> ExitCode {
     let mut units_due = Instant::now();
     loop {
         // Units first, so they are there when the first sample is drawn.
-        if systemd && Instant::now() >= units_due {
+        if Instant::now() >= units_due {
             units_due = Instant::now() + UNITS_EVERY;
-            if let Some(units) = units::list()
+            if systemd
+                && let Some(units) = units::list()
                 && send(&mut out, &Message::Units { units }).is_err()
             {
+                break;
+            }
+            let apps = Apps {
+                containers: apps::containers(),
+                pm2: apps::pm2(),
+            };
+            if send(&mut out, &Message::Apps(apps)).is_err() {
                 break;
             }
         }

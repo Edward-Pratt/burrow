@@ -132,7 +132,11 @@ async fn installs_after_asking_then_reports() {
     let sample = rig.next_sample(session).await;
     assert!(sample.memory.total > 0);
     assert!(sample.cpu.cores > 0);
-    assert!(!rig.history(session).await.samples.is_empty());
+    let history = rig.history(session).await;
+    assert!(!history.samples.is_empty());
+    // Containers and PM2 apps are listed before the first sample, whether
+    // or not this machine has either.
+    assert!(history.apps.is_some());
 
     rig.core
         .execute(Command::CloseSession { session })

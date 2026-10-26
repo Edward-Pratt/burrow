@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use burrow_agent::{Message, PROTO, Sample, Unit};
+use burrow_agent::{Apps, Message, PROTO, Sample, Unit};
 use russh::ChannelMsg;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -89,6 +89,7 @@ struct History {
     systemd: bool,
     samples: VecDeque<Sample>,
     units: Option<Vec<Unit>>,
+    apps: Option<Apps>,
 }
 
 impl Monitor {
@@ -112,6 +113,7 @@ impl Monitor {
             systemd: history.systemd,
             samples: history.samples.iter().cloned().collect(),
             units: history.units.clone(),
+            apps: history.apps.clone(),
         }
     }
 }
@@ -232,6 +234,23 @@ pub(super) async fn run(
                                         session: prompter.session,
                                         node: node.id,
                                         units,
+                                    });
+                                }
+                            }
+                            (Message::Apps(apps), true) => {
+                                let apps = clean_apps(apps);
+                                let mut history = monitor.history.lock().unwrap();
+                                if history.apps.as_ref() != Some(&apps) {
+                                    history.apps = Some(apps.clone());
+                                    drop(history);
+                                    if monitor.background() {
+                                        let failed = alerts::failed_apps(&apps);
+                                        core.set_alerts(node.id, Rule::Apps, failed);
+                                    }
+                                    core.emit(Event::MonitorApps {
+                                        session: prompter.session,
+                                        node: node.id,
+                                        apps,
                                     });
                                 }
                             }
@@ -440,6 +459,39 @@ fn clean_units(mut units: Vec<Unit>) -> Vec<Unit> {
         }
     }
     units
+}
+
+fn clean_apps(mut apps: Apps) -> Apps {
+    if let Some(containers) = &mut apps.containers {
+        containers.list.truncate(MAX_UNITS);
+        clean_text(&mut containers.runtime);
+        if let Some(error) = &mut containers.error {
+            clean_text(error);
+        }
+        for container in &mut containers.list {
+            for field in [
+                &mut container.id,
+                &mut container.name,
+                &mut container.image,
+                &mut container.state,
+                &mut container.status,
+            ] {
+                clean_text(field);
+            }
+        }
+    }
+    if let Some(pm2) = &mut apps.pm2 {
+        pm2.apps.truncate(MAX_UNITS);
+        if let Some(error) = &mut pm2.error {
+            clean_text(error);
+        }
+        for app in &mut pm2.apps {
+            clean_text(&mut app.name);
+            clean_text(&mut app.status);
+            clean_number(&mut app.cpu);
+        }
+    }
+    apps
 }
 
 fn text(error: impl std::fmt::Display) -> String {
