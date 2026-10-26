@@ -31,7 +31,7 @@ pub use api::{
     GrantShown, HistoryEntry, MonitorHistory, Node, NodeId, NodePatch, POSTGRES_KIND, Problem,
     Prompt, PromptAnswer, PromptKind, QueryError, QueryResult, Response, SSH_HOST_KIND,
     SSH_TUNNEL_KIND, SecretValue, SessionId, SessionInfo, SessionKind, SessionState,
-    StatementResult, TransferId, TransferState, TrendRange, TunnelShown, View, monitor,
+    StatementResult, TransferId, TransferState, TrendRange, TunnelShown, View, monitor, sha256_hex,
 };
 pub use engine::{Core, CoreOptions, Paths};
 pub use error::{Error, Result};

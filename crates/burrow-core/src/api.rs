@@ -32,6 +32,13 @@ pub const SSH_TUNNEL_KIND: &str = "ssh-tunnel";
 /// server is and how to reach it; see [`Command::OpenDatabase`].
 pub const POSTGRES_KIND: &str = "postgres";
 
+/// The SHA-256 of `data` in lower-case hex, as [`Response::File`] gives
+/// it and [`Command::WriteFile`]'s `expect` takes it.
+pub fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    data_encoding::HEXLOWER.encode(&Sha256::digest(data))
+}
+
 /// Stable identity of a node. Stored in the node's file, so it survives
 /// renames and moves and can be used in references between nodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

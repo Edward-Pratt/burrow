@@ -284,7 +284,7 @@ impl Core {
                 let (data, size) = files::read_file(&sftp, &path, limit)
                     .await
                     .map_err(Error::Remote)?;
-                let sha256 = files::sha256(&data);
+                let sha256 = crate::api::sha256_hex(&data);
                 return Ok(Response::File { data, size, sha256 });
             }
             Command::WriteFile {

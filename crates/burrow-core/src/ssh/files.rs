@@ -17,16 +17,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use data_encoding::HEXLOWER;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
 use super::{Input, Prompter};
 use crate::api::{
     Event, FileEntry, FileKind, Node, SessionId, SessionState, TransferId, TransferState,
+    sha256_hex,
 };
 use crate::engine::Core;
 
@@ -735,11 +734,6 @@ pub(crate) async fn read_file(
     Ok((data, size))
 }
 
-/// The SHA-256 of `data`, in lower-case hex, as [`Response::File`] gives it.
-pub(crate) fn sha256(data: &[u8]) -> String {
-    HEXLOWER.encode(&Sha256::digest(data))
-}
-
 /// Writes `data` to a remote file, as an upload would. An existing file is
 /// only replaced with `overwrite`, or when it still has the SHA-256 in
 /// `expect`.
@@ -767,7 +761,7 @@ pub(crate) async fn write_file(
             Ok(_) => return Err(format!("{path} is no longer a file")),
             Err(_) => return Err(format!("{path} was removed on the server")),
         };
-        if !sha256(&now).eq_ignore_ascii_case(expect) {
+        if !sha256_hex(&now).eq_ignore_ascii_case(expect) {
             return Err(format!("{path} changed on the server since it was read"));
         }
     } else if !overwrite && sftp.symlink_metadata(path).await.is_ok() {
