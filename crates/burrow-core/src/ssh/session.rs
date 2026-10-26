@@ -1,5 +1,5 @@
 //! One SSH terminal session: connect, check the host key, sign in, then
-//! pass bytes between the remote shell and the client.
+//! pass bytes between the remote shell, or a command, and the client.
 
 use std::fmt::Display;
 
@@ -21,6 +21,7 @@ pub(super) async fn run(
     core: &Core,
     node: &Node,
     (mut cols, mut rows): (u16, u16),
+    command: Option<&str>,
     mut input: mpsc::UnboundedReceiver<Input>,
     output: mpsc::Sender<Vec<u8>>,
     prompter: &Prompter,
@@ -60,7 +61,10 @@ pub(super) async fn run(
         .request_pty(false, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
         .await
         .map_err(text)?;
-    channel.request_shell(false).await.map_err(text)?;
+    match command {
+        Some(command) => channel.exec(false, command).await.map_err(text)?,
+        None => channel.request_shell(false).await.map_err(text)?,
+    }
     core.emit(Event::SessionChanged {
         session: prompter.session,
         node: node.id,

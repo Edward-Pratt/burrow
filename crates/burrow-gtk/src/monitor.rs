@@ -18,9 +18,11 @@ use std::time::{Duration, Instant};
 use burrow_core::ipc::Client;
 use burrow_core::monitor::{Apps, Sample, Unit};
 use burrow_core::{
-    Alert, AlertKind, Command, MonitorHistory, NodeId, Response, SessionState, TrendRange,
+    Alert, AlertKind, Command, MonitorHistory, NodeId, Response, Service, ServiceAction,
+    SessionState, TrendRange,
 };
 use relm4::gtk::prelude::*;
+use relm4::gtk::{gdk, glib};
 use relm4::{ComponentSender, gtk};
 
 use crate::app::{App, AppMsg};
@@ -92,6 +94,8 @@ pub struct Monitor {
     units: Option<Vec<Unit>>,
     containers: AppsSection,
     pm2: AppsSection,
+    /// Opens the menu of a service's actions at a row's button.
+    menu: Menu,
     background: gtk::CheckButton,
     /// Set while the checkbox is changed to match the core, so that isn't
     /// taken for the user's choice.
@@ -239,6 +243,7 @@ impl Monitor {
 
         let session = SessionPage::new(&scroller, send(Msg::Session(session::Msg::Reconnect)));
         page.append(session.widget());
+        let menu = menu_opener(&page, node, sender);
 
         Monitor {
             node,
@@ -262,6 +267,7 @@ impl Monitor {
             units: None,
             containers,
             pm2,
+            menu,
             background,
             quiet,
             ranges,
@@ -461,6 +467,10 @@ impl Monitor {
             Some(containers) => {
                 let rows: Vec<AppRow> = (containers.list.iter())
                     .map(|c| AppRow {
+                        service: Service::Container {
+                            runtime: containers.runtime.clone(),
+                            name: c.name.clone(),
+                        },
                         name: c.name.clone(),
                         state: c.status.clone(),
                         detail: c.image.clone(),
@@ -473,12 +483,9 @@ impl Monitor {
                     _ => "Docker",
                 };
                 let heading = format!("Containers ({runtime})");
-                self.containers.show(
-                    &heading,
-                    &rows,
-                    containers.error.as_deref(),
-                    "No containers.",
-                );
+                let (error, empty) = (containers.error.as_deref(), "No containers.");
+                self.containers
+                    .show(&heading, &rows, error, empty, &self.menu);
             }
             None => self.containers.section.set_visible(false),
         }
@@ -486,6 +493,10 @@ impl Monitor {
             Some(pm2) => {
                 let rows: Vec<AppRow> = (pm2.apps.iter())
                     .map(|app| AppRow {
+                        service: Service::Pm2App {
+                            pm2: pm2.path.clone(),
+                            name: app.name.clone(),
+                        },
                         name: app.name.clone(),
                         state: app.status.clone(),
                         detail: format!(
@@ -498,8 +509,8 @@ impl Monitor {
                         running: app.status == "online",
                     })
                     .collect();
-                self.pm2
-                    .show("PM2 apps", &rows, pm2.error.as_deref(), "PM2 runs no apps.");
+                let (error, empty) = (pm2.error.as_deref(), "PM2 runs no apps.");
+                self.pm2.show("PM2 apps", &rows, error, empty, &self.menu);
             }
             None => self.pm2.section.set_visible(false),
         }
@@ -556,7 +567,7 @@ impl Monitor {
                 None => {
                     let row = moving
                         .remove(&key)
-                        .unwrap_or_else(|| UnitRow::new(key, &entry));
+                        .unwrap_or_else(|| UnitRow::new(key, &entry, &self.menu));
                     self.units_list.insert(&row.row, index as i32);
                     row
                 }
@@ -656,6 +667,7 @@ struct AppsSection {
 
 #[derive(Clone, Debug, PartialEq)]
 struct AppRow {
+    service: Service,
     name: String,
     state: String,
     detail: String,
@@ -681,7 +693,7 @@ impl AppsSection {
         }
     }
 
-    fn show(&self, title: &str, rows: &[AppRow], error: Option<&str>, empty: &str) {
+    fn show(&self, title: &str, rows: &[AppRow], error: Option<&str>, empty: &str, menu: &Menu) {
         self.section.set_visible(true);
         let failed = rows.iter().filter(|row| row.failed).count();
         self.heading.set_label(&match failed {
@@ -705,12 +717,12 @@ impl AppsSection {
             let text = label(&printable(error));
             text.add_css_class("error-text");
             text.set_wrap(true);
-            self.grid.attach(&text, 0, line, 3, 1);
+            self.grid.attach(&text, 0, line, 4, 1);
             line += 1;
         } else if rows.is_empty() {
             let text = label(empty);
             text.add_css_class("dim");
-            self.grid.attach(&text, 0, line, 3, 1);
+            self.grid.attach(&text, 0, line, 4, 1);
         }
         for row in rows.iter().take(MAX_ROWS) {
             let name = label(&printable(&row.name));
@@ -735,15 +747,95 @@ impl AppsSection {
             self.grid.attach(&name, 0, line, 1, 1);
             self.grid.attach(&state, 1, line, 1, 1);
             self.grid.attach(&detail, 2, line, 1, 1);
+            let button = menu_button(menu, row.service.clone());
+            self.grid.attach(&button, 3, line, 1, 1);
             line += 1;
         }
         if rows.len() > MAX_ROWS {
             let more = label(&format!("{} more.", rows.len() - MAX_ROWS));
             more.add_css_class("dim");
-            self.grid.attach(&more, 0, line, 3, 1);
+            self.grid.attach(&more, 0, line, 4, 1);
         }
         self.shown.replace(now);
     }
+}
+
+/// Opens the menu of a service's actions, pointing at a widget.
+type Menu = Rc<dyn Fn(&gtk::Widget, Service)>;
+
+/// The menu opener for a monitor whose page is `page`. The menu hangs off
+/// the page, never a row: rows come and go with each list, and a popover
+/// among a list's children once hung the window when the list changed
+/// while it was open (commit 9fa1e36).
+fn menu_opener(page: &gtk::Box, node: NodeId, sender: &ComponentSender<App>) -> Menu {
+    let page = page.downgrade();
+    let sender = sender.clone();
+    Rc::new(move |anchor: &gtk::Widget, service: Service| {
+        let Some(page) = page.upgrade() else {
+            return;
+        };
+        let popover = crate::app::menu_popover(service_entries(node, &service), &sender);
+        popover.set_parent(&page);
+        if let Some(bounds) = anchor.compute_bounds(&page) {
+            let at = gdk::Rectangle::new(
+                bounds.x() as i32,
+                bounds.y() as i32,
+                bounds.width() as i32,
+                bounds.height() as i32,
+            );
+            popover.set_pointing_to(Some(&at));
+        }
+        popover.connect_closed(|popover| {
+            // Unparented once the signal has returned, not inside it.
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
+        popover.popup();
+    })
+}
+
+/// The button at the end of a row that opens its service's menu.
+fn menu_button(menu: &Menu, service: Service) -> gtk::Button {
+    let button = gtk::Button::from_icon_name("view-more-symbolic");
+    button.add_css_class("flat");
+    button.set_valign(gtk::Align::Center);
+    button.set_tooltip_text(Some("Actions"));
+    let menu = menu.clone();
+    button.connect_clicked(move |button| menu(button.upcast_ref(), service.clone()));
+    button
+}
+
+/// A service's actions, then its log. Those that interrupt it ask first,
+/// so they end in "…".
+fn service_entries(node: NodeId, service: &Service) -> Vec<(String, AppMsg)> {
+    let mut entries: Vec<(String, AppMsg)> = (service.actions().iter())
+        .map(|&action| {
+            let mut label = crate::app::sentence_case(action.verb());
+            if confirms(action) {
+                label.push('…');
+            }
+            let message = AppMsg::Control {
+                node,
+                service: service.clone(),
+                action,
+            };
+            (label, message)
+        })
+        .collect();
+    let log = AppMsg::ShowLogs {
+        node,
+        service: service.clone(),
+    };
+    entries.push(("Follow log".into(), log));
+    entries
+}
+
+/// Whether an action interrupts what the service does, so asks first.
+pub fn confirms(action: ServiceAction) -> bool {
+    matches!(
+        action,
+        ServiceAction::Stop | ServiceAction::Restart | ServiceAction::Disable
+    )
 }
 
 /// What a row of the services list stands for, so a new list finds the
@@ -867,7 +959,7 @@ enum RowView {
 }
 
 impl UnitRow {
-    fn new(key: RowKey, entry: &Entry) -> UnitRow {
+    fn new(key: RowKey, entry: &Entry, menu: &Menu) -> UnitRow {
         let row = gtk::ListBoxRow::new();
         let view = match entry {
             Entry::Unit(_) => {
@@ -884,6 +976,11 @@ impl UnitRow {
                 line.append(&name);
                 line.append(&state);
                 line.append(&description);
+                // A row stands for one name, so its menu can be made now.
+                if let RowKey::Unit(name, _) = &key {
+                    let service = Service::Unit { name: name.clone() };
+                    line.append(&menu_button(menu, service));
+                }
                 row.set_child(Some(&line));
                 RowView::Unit {
                     name,

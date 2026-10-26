@@ -217,6 +217,7 @@ async fn a_terminal_runs_over_the_socket() {
         node: node.id,
         cols: 80,
         rows: 24,
+        run: None,
     };
     let session = match client.execute(command).await.unwrap() {
         Response::Session { session } => session,
@@ -272,6 +273,7 @@ async fn another_client_can_answer_a_prompt() {
         node: node.id,
         cols: 80,
         rows: 24,
+        run: None,
     };
     let Response::Session { session } = cli.execute(command).await.unwrap() else {
         panic!("expected a session");
@@ -334,6 +336,7 @@ async fn a_clients_sessions_close_when_it_goes() {
         node: node.id,
         cols: 80,
         rows: 24,
+        run: None,
     };
     let Response::Session { session } = client.execute(command).await.unwrap() else {
         panic!("expected a session");

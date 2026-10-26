@@ -7,7 +7,8 @@ use tokio::sync::{broadcast, mpsc};
 use crate::addon::{Host, Manifest, Permission};
 use crate::api::{
     API_VERSION, AlertKind, Capability, Command, Event, Grant, Node, NodeId, POSTGRES_KIND,
-    Problem, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionKind, View,
+    Problem, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionKind,
+    TerminalRun, View,
 };
 use crate::class::AddonRule;
 use crate::db;
@@ -18,13 +19,17 @@ use crate::secrets::{KeyringStore, SecretKey, SecretStore};
 use crate::ssh::alerts::{Alerts, Rule};
 use crate::ssh::trend::{self, Trends};
 use crate::ssh::{
-    self, Agents, Autostart, Connections, Input, Sessions, Transfers, Waits, files, hosts,
+    self, Agents, Autostart, Connections, Input, Sessions, Transfers, Waits, files, hosts, services,
 };
 use crate::tree::{Entry, Tree};
 
 /// How many events a slow subscriber can fall behind before it starts
 /// missing them (it then gets `RecvError::Lagged` and should re-list).
 const EVENT_BUFFER: usize = 256;
+
+/// How long a service action may take, in seconds. A unit stopping can
+/// wait out its own timeout, which is 90 seconds by default.
+const CONTROL_TIMEOUT: u32 = 120;
 
 pub struct CoreOptions {
     /// Burrow's config directory. The tree lives in its `tree/` subfolder
@@ -215,10 +220,41 @@ impl Core {
     pub async fn execute(&self, command: Command) -> Result<Response> {
         let sessions = &self.inner.sessions;
         let (session, input) = match command {
-            Command::OpenTerminal { node, cols, rows } => {
+            Command::OpenTerminal {
+                node,
+                cols,
+                rows,
+                run,
+            } => {
                 let node = self.node_of_kind(node, SSH_HOST_KIND)?;
-                let session = ssh::open_terminal(self, node, cols, rows);
+                let command = match &run {
+                    None => None,
+                    Some(TerminalRun::Logs { service }) => Some(services::logs(service)),
+                    Some(TerminalRun::Control { service, action }) => {
+                        Some(services::control(service, *action, true))
+                    }
+                };
+                let command = command.transpose().map_err(|e| Error::invalid("run", e))?;
+                let session = ssh::open_terminal(self, node, cols, rows, command);
                 return Ok(Response::Session { session });
+            }
+            Command::ControlService {
+                node,
+                service,
+                action,
+            } => {
+                let node = self.node_of_kind(node, SSH_HOST_KIND)?;
+                let command = services::control(&service, action, false)
+                    .map_err(|e| Error::invalid("service", e))?;
+                let result = ssh::exec::start(self, node, command, Some(CONTROL_TIMEOUT))?
+                    .await
+                    .map_err(|_| Error::Remote("the command was stopped".to_string()))?
+                    .map_err(Error::Remote)?;
+                let needs_password = services::needs_password(result.status, &result.stderr);
+                return Ok(Response::Controlled {
+                    result,
+                    needs_password,
+                });
             }
             Command::StartTunnel { node } => {
                 let node = self.node_of_kind(node, SSH_TUNNEL_KIND)?;
@@ -1061,6 +1097,7 @@ impl Inner {
             | Command::StartTunnel { .. }
             | Command::OpenFiles { .. }
             | Command::Exec { .. }
+            | Command::ControlService { .. }
             | Command::ListDir { .. }
             | Command::ReadFile { .. }
             | Command::WriteFile { .. }

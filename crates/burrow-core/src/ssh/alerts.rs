@@ -325,6 +325,7 @@ mod tests {
             }),
             pm2: Some(Pm2 {
                 error: None,
+                path: "/usr/bin/pm2".into(),
                 apps: vec![
                     app("site", "online"),
                     app("paused", "stopped"),

@@ -19,6 +19,7 @@ pub(crate) mod files;
 pub(crate) mod hosts;
 mod known_hosts;
 mod monitor;
+pub(crate) mod services;
 mod session;
 mod socks;
 pub(crate) mod trend;
@@ -280,9 +281,16 @@ impl Sessions {
     }
 }
 
-/// Starts a terminal session for an SSH host node. It runs until the shell
-/// exits, the connection fails, or a client closes it.
-pub(crate) fn open_terminal(core: &Core, node: Node, cols: u16, rows: u16) -> SessionId {
+/// Starts a terminal session for an SSH host node, running `command` or
+/// else the login shell. It runs until that exits, the connection fails,
+/// or a client closes it.
+pub(crate) fn open_terminal(
+    core: &Core,
+    node: Node,
+    cols: u16,
+    rows: u16,
+    command: Option<String>,
+) -> SessionId {
     let (output_tx, output_rx) = mpsc::channel(OUTPUT_BUFFER);
     spawn(
         core,
@@ -291,7 +299,8 @@ pub(crate) fn open_terminal(core: &Core, node: Node, cols: u16, rows: u16) -> Se
         Some(output_rx),
         move |core, node, input, prompter| async move {
             let size = (cols, rows);
-            session::run(&core, &node, size, input, output_tx, &prompter).await
+            let command = command.as_deref();
+            session::run(&core, &node, size, command, input, output_tx, &prompter).await
         },
     )
 }

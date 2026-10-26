@@ -60,7 +60,7 @@ pub fn pm2() -> Option<Pm2> {
     let Some(program) = find_pm2(&home) else {
         return Some(Pm2 {
             error: Some("PM2 is running, but its pm2 command wasn't found".into()),
-            apps: Vec::new(),
+            ..Pm2::default()
         });
     };
     // pm2 is a Node script, and Node installed with nvm or Volta is only on
@@ -69,18 +69,17 @@ pub fn pm2() -> Option<Pm2> {
         let rest = std::env::var("PATH").unwrap_or_default();
         format!("{}:{rest}", dir.display())
     });
-    Some(match run::output(&program, &["jlist"], path.as_deref()) {
+    let (error, apps) = match run::output(&program, &["jlist"], path.as_deref()) {
         Ok(text) => match parse_pm2(&text) {
-            Some(apps) => Pm2 { error: None, apps },
-            None => Pm2 {
-                error: Some("pm2 jlist printed no list".into()),
-                apps: Vec::new(),
-            },
+            Some(apps) => (None, apps),
+            None => (Some("pm2 jlist printed no list".into()), Vec::new()),
         },
-        Err(error) => Pm2 {
-            error: Some(error),
-            apps: Vec::new(),
-        },
+        Err(error) => (Some(error), Vec::new()),
+    };
+    Some(Pm2 {
+        error,
+        path: program.to_string_lossy().into_owned(),
+        apps,
     })
 }
 
