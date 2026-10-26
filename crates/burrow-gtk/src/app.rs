@@ -40,6 +40,7 @@ use crate::settings::{Theme, UiSettings};
 use crate::sidebar;
 use crate::terminal;
 use crate::tunnels;
+use crate::update;
 
 pub struct Init {
     pub core: Client,
@@ -297,6 +298,7 @@ pub enum AppMsg {
     ShowPalette,
     ToggleSidebar,
     ShowSettings,
+    CheckForUpdates,
     SetTheme(Theme),
     /// `None` goes back to the system's monospace font.
     SetTerminalFont(Option<String>),
@@ -354,6 +356,7 @@ impl AppMsg {
                 | AppMsg::ShowPalette
                 | AppMsg::ToggleSidebar
                 | AppMsg::ShowSettings
+                | AppMsg::CheckForUpdates
                 | AppMsg::SetTheme(_)
                 | AppMsg::SetTerminalFont(_)
                 | AppMsg::ReloadConfig
@@ -1143,6 +1146,7 @@ impl Component for App {
                 self.save_settings();
             }
             AppMsg::ShowSettings => show_settings(window, &self.settings, &sender),
+            AppMsg::CheckForUpdates => update::show(window),
             AppMsg::SetTheme(theme) => {
                 self.settings.theme = theme;
                 self.apply_theme();
@@ -2779,6 +2783,7 @@ impl App {
             command("Open config folder", AppMsg::OpenConfigFolder),
             command("Manage addons…", AppMsg::ManageAddons),
             command("Settings…", AppMsg::ShowSettings),
+            command("Check for updates…", AppMsg::CheckForUpdates),
         ]);
         for addon in self.addons.iter().filter(|a| addons::usable(a)) {
             items.extend(addon.commands.iter().map(|c| Item {
@@ -3324,6 +3329,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
             ("Open config folder", AppMsg::OpenConfigFolder),
             ("Addons…", AppMsg::ManageAddons),
             ("Settings…    Ctrl+,", AppMsg::ShowSettings),
+            ("Check for updates…", AppMsg::CheckForUpdates),
         ],
         sender,
     )));

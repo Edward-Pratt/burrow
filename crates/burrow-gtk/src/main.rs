@@ -18,6 +18,7 @@ mod settings;
 mod sidebar;
 mod terminal;
 mod tunnels;
+mod update;
 
 use burrow_core::ipc::{self, Role};
 use burrow_core::{Paths, doctor};
@@ -50,6 +51,7 @@ fn main() {
         config_dir: paths.config_dir,
         state_dir: paths.state_dir,
     });
+    update::restart_if_asked();
 }
 
 /// Says why Burrow can't start: on stderr, and in a window when there is a
