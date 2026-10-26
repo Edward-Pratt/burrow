@@ -8,9 +8,22 @@ use std::path::Path;
 use std::time::Duration;
 
 use relm4::gtk;
-use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
+use relm4::gtk::{gdk, gio, glib, pango};
 use vte4::prelude::*;
+
+/// PCRE2 compile flags, which VTE takes as plain numbers. VTE wants
+/// `MULTILINE` on every regex it is given.
+const PCRE2_CASELESS: u32 = 0x0000_0008;
+const PCRE2_MULTILINE: u32 = 0x0000_0400;
+
+/// Web and mail addresses in the output. A sentence often ends just after
+/// a link, so the last character can't be punctuation.
+const URL_PATTERN: &str = r#"(?:https?://|mailto:)[^\s<>"'`]*[^\s<>"'`.,;:!?)\]}]"#;
+
+/// How much one Ctrl+= or Ctrl+- changes the text size, and its limits.
+const ZOOM_STEP: f64 = 1.1;
+const ZOOM_RANGE: (f64, f64) = (0.5, 3.0);
 
 /// Entries in `/etc/shells` that are not meant for an interactive session.
 const NOT_INTERACTIVE: [&str; 5] = [
@@ -150,24 +163,37 @@ fn base(on_title: impl Fn(String) + 'static) -> vte4::Terminal {
             on_title(title.to_string());
         }
     });
-    add_clipboard_shortcuts(&terminal);
+    add_shortcuts(&terminal);
+    add_links(&terminal);
     terminal
 }
 
-/// Ctrl+Shift+C and Ctrl+Shift+V. VTE has no bindings of its own, and plain
-/// Ctrl+C and Ctrl+V belong to the shell.
-fn add_clipboard_shortcuts(terminal: &vte4::Terminal) {
-    let controller = gtk::ShortcutController::new();
-    // Before VTE's own key handler, which would send the keys to the shell.
-    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-    type Run = fn(&vte4::Terminal);
-    let shortcuts: [(&str, Run); 2] = [
+type Run = fn(&vte4::Terminal);
+
+/// Ctrl+Shift+C and Ctrl+Shift+V, and zoom. VTE has no bindings of its
+/// own, and plain Ctrl+C and Ctrl+V belong to the shell.
+fn add_shortcuts(terminal: &vte4::Terminal) {
+    let shortcuts: [(&str, Run); 8] = [
         ("<Control><Shift>c", |t| {
             t.copy_clipboard_format(vte4::Format::Text)
         }),
         ("<Control><Shift>v", |t| t.paste_clipboard()),
+        ("<Control>equal", |t| zoom(t, ZOOM_STEP)),
+        ("<Control>plus", |t| zoom(t, ZOOM_STEP)),
+        ("<Control>KP_Add", |t| zoom(t, ZOOM_STEP)),
+        ("<Control>minus", |t| zoom(t, 1.0 / ZOOM_STEP)),
+        ("<Control>KP_Subtract", |t| zoom(t, 1.0 / ZOOM_STEP)),
+        ("<Control>0", |t| t.set_font_scale(1.0)),
     ];
-    for (trigger, run) in shortcuts {
+    add_shortcut_controller(terminal, &shortcuts);
+}
+
+/// Runs each shortcut on `terminal` before VTE's own key handler, which
+/// would send the keys to the shell.
+fn add_shortcut_controller(terminal: &vte4::Terminal, shortcuts: &[(&str, Run)]) {
+    let controller = gtk::ShortcutController::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    for &(trigger, run) in shortcuts {
         // The action is handed the terminal it is attached to, so it needs no
         // reference of its own.
         let action = gtk::CallbackAction::new(move |widget, _| {
@@ -184,21 +210,230 @@ fn add_clipboard_shortcuts(terminal: &vte4::Terminal) {
     terminal.add_controller(controller);
 }
 
-/// The tab page around a terminal: the terminal plus a scrollbar.
-pub fn page(terminal: &vte4::Terminal) -> gtk::ScrolledWindow {
-    gtk::ScrolledWindow::builder()
-        .child(terminal)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .build()
+fn zoom(terminal: &vte4::Terminal, by: f64) {
+    let scale = (terminal.font_scale() * by).clamp(ZOOM_RANGE.0, ZOOM_RANGE.1);
+    terminal.set_font_scale(scale);
 }
 
-/// The terminal inside a tab page, if the page is a terminal page or a
-/// box, such as an SSH shell's with its toolbar, that ends with one.
-pub fn in_page(page: &gtk::Widget) -> Option<vte4::Terminal> {
-    let page = match page.downcast_ref::<gtk::Box>() {
-        Some(page) => page.last_child()?,
-        None => page.clone(),
+/// Sets the terminal's font from a Pango description such as
+/// "Monospace 11", or to the system's monospace font for `None`.
+pub fn set_font(terminal: &vte4::Terminal, font: Option<&str>) {
+    let font = font.map(pango::FontDescription::from_string);
+    terminal.set_font(font.as_ref());
+}
+
+/// Links in the output open with Ctrl+click: addresses VTE finds in the
+/// text, and OSC 8 links, which show other text than where they go, so
+/// their tooltip says where.
+fn add_links(terminal: &vte4::Terminal) {
+    terminal.set_allow_hyperlink(true);
+    let regex = vte4::Regex::for_match(URL_PATTERN, PCRE2_CASELESS | PCRE2_MULTILINE)
+        .expect("the URL pattern is valid");
+    let tag = terminal.match_add_regex(&regex, 0);
+    terminal.match_set_cursor_name(tag, "pointer");
+
+    let click = gtk::GestureClick::new();
+    click.set_button(gdk::BUTTON_PRIMARY);
+    // Before VTE starts a selection with the same click.
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    click.connect_pressed(|gesture, _, x, y| {
+        if !(gesture.current_event_state()).contains(gdk::ModifierType::CONTROL_MASK) {
+            return;
+        }
+        let Some(terminal) = gesture.widget().and_downcast::<vte4::Terminal>() else {
+            return;
+        };
+        let uri = (terminal.check_hyperlink_at(x, y)).or_else(|| terminal.check_match_at(x, y).0);
+        let Some(uri) = uri.filter(|uri| openable(uri)) else {
+            return;
+        };
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        let window = terminal.root().and_downcast::<gtk::Window>();
+        gtk::UriLauncher::new(&uri).launch(window.as_ref(), None::<&gio::Cancellable>, |_| {});
+    });
+    terminal.add_controller(click);
+
+    terminal.set_has_tooltip(true);
+    terminal.connect_query_tooltip(|terminal, x, y, _, tooltip| {
+        let Some(uri) = terminal.check_hyperlink_at(x.into(), y.into()) else {
+            return false;
+        };
+        let uri: String = uri.chars().filter(|c| !c.is_control()).collect();
+        if openable(&uri) {
+            tooltip.set_text(Some(&format!("{uri}\nCtrl+click to open")));
+        } else {
+            tooltip.set_text(Some(&uri));
+        }
+        true
+    });
+}
+
+/// Whether a click may open `uri`. Output comes from programs and servers
+/// Burrow doesn't trust, and OSC 8 can link any URI, such as a `file:` path
+/// or another program's own scheme, so only web and mail links open.
+fn openable(uri: &str) -> bool {
+    let scheme = uri
+        .split_once(':')
+        .map(|(scheme, _)| scheme.to_ascii_lowercase());
+    matches!(scheme.as_deref(), Some("http" | "https" | "mailto"))
+}
+
+/// The tab page around a terminal: a find bar, then the terminal with a
+/// scrollbar.
+pub fn page(terminal: &vte4::Terminal) -> gtk::Box {
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(terminal)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .build();
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    page.append(&find_bar(terminal));
+    page.append(&scroller);
+    page
+}
+
+/// A bar that finds text in the terminal, shown with Ctrl+Shift+F. Finding
+/// goes up first, since the newest output is at the bottom.
+fn find_bar(terminal: &vte4::Terminal) -> gtk::SearchBar {
+    let entry = gtk::SearchEntry::builder()
+        .placeholder_text("Find")
+        .hexpand(true)
+        .build();
+    let older = gtk::Button::from_icon_name("go-up-symbolic");
+    older.set_tooltip_text(Some("Find older (Enter)"));
+    let newer = gtk::Button::from_icon_name("go-down-symbolic");
+    newer.set_tooltip_text(Some("Find newer (Shift+Enter)"));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    row.add_css_class("linked");
+    row.append(&entry);
+    row.append(&older);
+    row.append(&newer);
+    let bar = gtk::SearchBar::builder()
+        .child(&row)
+        .show_close_button(true)
+        .build();
+    bar.connect_entry(&entry);
+    terminal.search_set_wrap_around(true);
+
+    // The terminal holds the bar through its shortcut, so the bar's own
+    // handlers hold the terminal weakly.
+    let weak = terminal.downgrade();
+    let find = move |entry: &gtk::SearchEntry, older: bool| {
+        let Some(terminal) = weak.upgrade() else {
+            return;
+        };
+        let found = if older {
+            terminal.search_find_previous()
+        } else {
+            terminal.search_find_next()
+        };
+        if found || entry.text().is_empty() {
+            entry.remove_css_class("error");
+        } else {
+            entry.add_css_class("error");
+        }
     };
+    let find = std::rc::Rc::new(find);
+
+    entry.connect_search_changed(glib::clone!(
+        #[weak]
+        terminal,
+        #[strong]
+        find,
+        move |entry| {
+            let text = entry.text();
+            let regex = (!text.is_empty())
+                .then(|| vte4::Regex::for_search(&literal(&text), PCRE2_CASELESS | PCRE2_MULTILINE))
+                .and_then(Result::ok);
+            terminal.search_set_regex(regex.as_ref(), 0);
+            terminal.unselect_all();
+            find(entry, true);
+        }
+    ));
+    entry.connect_activate({
+        let find = find.clone();
+        move |entry| find(entry, true)
+    });
+    let shift_enter = gtk::ShortcutController::new();
+    shift_enter.add_shortcut(gtk::Shortcut::new(
+        gtk::ShortcutTrigger::parse_string("<Shift>Return"),
+        Some(gtk::CallbackAction::new({
+            let find = find.clone();
+            move |widget, _| {
+                if let Some(entry) = widget.downcast_ref::<gtk::SearchEntry>() {
+                    find(entry, false);
+                }
+                glib::Propagation::Stop
+            }
+        })),
+    ));
+    entry.add_controller(shift_enter);
+    older.connect_clicked(glib::clone!(
+        #[weak]
+        entry,
+        #[strong]
+        find,
+        move |_| find(&entry, true)
+    ));
+    newer.connect_clicked(glib::clone!(
+        #[weak]
+        entry,
+        move |_| find(&entry, false)
+    ));
+    entry.connect_stop_search(glib::clone!(
+        #[weak]
+        bar,
+        move |_| bar.set_search_mode(false)
+    ));
+    // Closing the bar clears the highlight and gives the keys back.
+    bar.connect_search_mode_enabled_notify(glib::clone!(
+        #[weak]
+        terminal,
+        move |bar| {
+            if !bar.is_search_mode() {
+                terminal.search_set_regex(None, 0);
+                terminal.unselect_all();
+                terminal.grab_focus();
+            }
+        }
+    ));
+
+    let bar_weak = bar.downgrade();
+    let open = gtk::CallbackAction::new(move |_, _| {
+        if let Some(bar) = bar_weak.upgrade() {
+            bar.set_search_mode(true);
+        }
+        glib::Propagation::Stop
+    });
+    let controller = gtk::ShortcutController::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.add_shortcut(gtk::Shortcut::new(
+        gtk::ShortcutTrigger::parse_string("<Control><Shift>f"),
+        Some(open),
+    ));
+    terminal.add_controller(controller);
+    bar
+}
+
+/// `text` as a PCRE2 pattern that matches it literally: a backslash before
+/// anything but a letter or digit makes it literal.
+fn literal(text: &str) -> String {
+    let mut pattern = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        if !c.is_alphanumeric() && !c.is_whitespace() {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern
+}
+
+/// The terminal inside a tab page: a terminal page, or a box, such as an
+/// SSH shell's with its toolbar, that ends with one.
+pub fn in_page(page: &gtk::Widget) -> Option<vte4::Terminal> {
+    if let Some(page) = page.downcast_ref::<gtk::Box>() {
+        return in_page(&page.last_child()?);
+    }
     page.downcast_ref::<gtk::ScrolledWindow>()?
         .child()?
         .downcast()
@@ -235,5 +470,23 @@ mod tests {
     fn names_come_from_the_path() {
         assert_eq!(shell_name("/usr/bin/zsh"), "zsh");
         assert_eq!(shell_name("fish"), "fish");
+    }
+
+    #[test]
+    fn found_text_is_matched_literally() {
+        assert_eq!(literal("a.b*"), r"a\.b\*");
+        assert_eq!(literal(r"C:\x (1)"), r"C\:\\x \(1\)");
+        assert_eq!(literal("café 2"), "café 2");
+    }
+
+    #[test]
+    fn only_web_and_mail_links_open() {
+        assert!(openable("https://example.com/a?b=c"));
+        assert!(openable("HTTP://example.com"));
+        assert!(openable("mailto:someone@example.com"));
+        assert!(!openable("file:///etc/passwd"));
+        assert!(!openable("javascript:alert(1)"));
+        assert!(!openable("ssh://host"));
+        assert!(!openable("no scheme"));
     }
 }

@@ -257,6 +257,8 @@ pub enum AppMsg {
     ToggleSidebar,
     ShowSettings,
     SetTheme(Theme),
+    /// `None` goes back to the system's monospace font.
+    SetTerminalFont(Option<String>),
     ReloadConfig,
     OpenConfigFolder,
 }
@@ -307,6 +309,7 @@ impl AppMsg {
                 | AppMsg::ToggleSidebar
                 | AppMsg::ShowSettings
                 | AppMsg::SetTheme(_)
+                | AppMsg::SetTerminalFont(_)
                 | AppMsg::ReloadConfig
                 | AppMsg::OpenConfigFolder
         )
@@ -964,10 +967,19 @@ impl Component for App {
                     .set_visible(self.settings.sidebar_visible);
                 self.save_settings();
             }
-            AppMsg::ShowSettings => show_settings(window, self.settings.theme, &sender),
+            AppMsg::ShowSettings => show_settings(window, &self.settings, &sender),
             AppMsg::SetTheme(theme) => {
                 self.settings.theme = theme;
                 self.apply_theme();
+                self.save_settings();
+            }
+            AppMsg::SetTerminalFont(font) => {
+                self.settings.terminal_font = font;
+                for tab in self.tabs.values() {
+                    if let Some(terminal) = terminal::in_page(&tab.page) {
+                        terminal::set_font(&terminal, self.settings.terminal_font.as_deref());
+                    }
+                }
                 self.save_settings();
             }
             AppMsg::ReloadConfig => execute(&self.core, &sender, Command::ReloadConfig),
@@ -1885,11 +1897,10 @@ impl App {
             send_on_click(&button, sender, message);
             bar.append(&button);
         }
-        let scroller = terminal::page(&term);
-        scroller.set_vexpand(true);
         let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
         page.append(&bar);
-        page.append(&scroller);
+        page.append(&terminal::page(&term));
+        terminal::set_font(&term, self.settings.terminal_font.as_deref());
         remote::start(&self.core, tab, id, &term, sender);
         term.grab_focus();
         let icon = sidebar::icon_name(node, false, &self.icons()).to_string();
@@ -2028,6 +2039,7 @@ impl App {
                 move || sender.input(AppMsg::TerminalExited(id))
             },
         );
+        terminal::set_font(&term, self.settings.terminal_font.as_deref());
         let page = terminal::page(&term);
         let key = TabKey::Terminal(id);
         let name = terminal::shell_name(&shell);
@@ -3146,7 +3158,11 @@ fn add_shortcuts(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>)
     window.add_controller(controller);
 }
 
-fn show_settings(window: &gtk::ApplicationWindow, current: Theme, sender: &ComponentSender<App>) {
+fn show_settings(
+    window: &gtk::ApplicationWindow,
+    current: &UiSettings,
+    sender: &ComponentSender<App>,
+) {
     let dialog = gtk::Window::builder()
         .title("Settings")
         .modal(true)
@@ -3162,13 +3178,17 @@ fn show_settings(window: &gtk::ApplicationWindow, current: Theme, sender: &Compo
         .margin_start(18)
         .margin_end(18)
         .build();
+    let row_label = |text: &str| {
+        let label = gtk::Label::new(Some(text));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label
+    };
 
-    let label = gtk::Label::new(Some("Theme"));
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
     let names: Vec<&str> = Theme::ALL.iter().map(|t| t.label()).collect();
     let theme = gtk::DropDown::from_strings(&names);
-    theme.set_selected(Theme::ALL.iter().position(|&t| t == current).unwrap_or(0) as u32);
+    let selected = Theme::ALL.iter().position(|&t| t == current.theme);
+    theme.set_selected(selected.unwrap_or(0) as u32);
     theme.connect_selected_notify({
         let sender = sender.clone();
         move |dropdown| {
@@ -3177,8 +3197,60 @@ fn show_settings(window: &gtk::ApplicationWindow, current: Theme, sender: &Compo
             }
         }
     });
-    grid.attach(&label, 0, 0, 1, 1);
+    grid.attach(&row_label("Theme"), 0, 0, 1, 1);
     grid.attach(&theme, 1, 0, 1, 1);
+
+    // Only fixed-width fonts, since the terminal grid needs one.
+    let fonts = gtk::FontDialog::new();
+    fonts.set_title("Terminal font");
+    fonts.set_filter(Some(&gtk::CustomFilter::new(|item| {
+        item.downcast_ref::<gtk::pango::FontFamily>()
+            .is_some_and(|family| family.is_monospace())
+    })));
+    let font = gtk::FontDialogButton::new(Some(fonts));
+    font.set_level(gtk::FontLevel::Font);
+    // What the button shows for the system's font.
+    const SYSTEM_FONT: &str = "Monospace 11";
+    let initial = current.terminal_font.as_deref().unwrap_or(SYSTEM_FONT);
+    font.set_font_desc(&gtk::pango::FontDescription::from_string(initial));
+    let reset = gtk::Button::from_icon_name("edit-undo-symbolic");
+    reset.set_tooltip_text(Some("Use the system's monospace font"));
+    reset.set_sensitive(current.terminal_font.is_some());
+    let chosen = font.connect_font_desc_notify({
+        let (sender, reset) = (sender.clone(), reset.clone());
+        move |button| {
+            if let Some(desc) = button.font_desc() {
+                reset.set_sensitive(true);
+                sender.input(AppMsg::SetTerminalFont(Some(desc.to_string())));
+            }
+        }
+    });
+    reset.connect_clicked({
+        let (sender, font) = (sender.clone(), font.clone());
+        move |reset| {
+            reset.set_sensitive(false);
+            // Showing the system's font is not choosing it.
+            font.block_signal(&chosen);
+            font.set_font_desc(&gtk::pango::FontDescription::from_string(SYSTEM_FONT));
+            font.unblock_signal(&chosen);
+            sender.input(AppMsg::SetTerminalFont(None));
+        }
+    });
+    let font_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    font_row.append(&font);
+    font_row.append(&reset);
+    grid.attach(&row_label("Terminal font"), 0, 1, 1, 1);
+    grid.attach(&font_row, 1, 1, 1, 1);
+
+    let hint = gtk::Label::new(Some(
+        "Ctrl+= and Ctrl+- change the size in one terminal, and Ctrl+0 resets it.",
+    ));
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+    hint.set_max_width_chars(40);
+    hint.add_css_class("dim-label");
+    grid.attach(&hint, 0, 2, 2, 1);
+
     dialog.set_child(Some(&grid));
     dialogs::close_on_escape(&dialog);
     dialog.present();
