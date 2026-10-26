@@ -75,7 +75,7 @@ All non-secret state lives as TOML files in `$XDG_CONFIG_HOME/burrow/` (default 
 
 ### Server agent
 
-`burrow-agent` is an optional small static binary (musl, x86_64 and aarch64, about 500 KB) that runs on servers. It streams host stats and systemd services over the existing SSH connection as JSON lines. Containers and PM2 come later.
+`burrow-agent` is an optional small static binary (musl, x86_64 and aarch64, about 500 KB) that runs on servers. It streams host stats, systemd services, Docker or Podman containers and PM2 apps over the existing SSH connection as JSON lines.
 
 - **Owned by the core, like Postgres:** the core uploads the agent, runs it and parses its output, and the monitor tab is built in. An addon process would need the SSH connection, which only the core holds.
 - **Install:** Burrow asks once per host, then uploads it to `~/.local/share/burrow/` on the server, and checks its hash against its own copy every time a monitor starts. The consent lives in the state folder, pinned to the host node, because a node file must never put a program on a server. The MCP bridge can read monitors with a grant, but never installs.
