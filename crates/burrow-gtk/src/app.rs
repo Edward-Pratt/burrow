@@ -354,8 +354,7 @@ enum Panel {
     Files(Files),
     Monitor(Monitor),
     Database(Database),
-    /// The box a tunnel's page is drawn in.
-    Tunnel(gtk::Box),
+    Tunnel(Rc<tunnels::TunnelPage>),
     /// The box an addon draws its view in.
     View(gtk::Box),
     /// A node Burrow can't open, described by [`fill_page`].
@@ -1613,8 +1612,8 @@ impl App {
 
     /// Draws a tunnel's tab again, if it is open.
     fn refresh_tunnel(&self, id: NodeId, sender: &ComponentSender<Self>) {
-        let page = self.tabs.get(&TabKey::Node(id)).map(|tab| &tab.panel);
-        let (Some(Panel::Tunnel(page)), Some(node)) = (page, self.nodes.get(&id)) else {
+        let panel = self.tabs.get(&TabKey::Node(id)).map(|tab| &tab.panel);
+        let (Some(Panel::Tunnel(tunnel)), Some(node)) = (panel, self.nodes.get(&id)) else {
             return;
         };
         let send = |message: AppMsg| -> Rc<dyn Fn()> {
@@ -1633,7 +1632,7 @@ impl App {
         };
         let status = self.tunnels.get(&id).cloned().unwrap_or_default();
         let autostart = self.autostart.contains(&id);
-        tunnels::fill(page, node, &self.nodes, &status, autostart, &actions);
+        tunnel.fill(node, &self.nodes, &status, autostart, &actions);
     }
 
     /// Creates a tunnel in `parent`, or edits the tunnel `id`.
@@ -1801,10 +1800,10 @@ impl App {
             return;
         }
         if node.kind == SSH_TUNNEL_KIND {
-            let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
-            page.add_css_class("tunnel-view");
-            let panel = Panel::Tunnel(page.clone());
-            self.add_tab(key, page.upcast(), panel, icon, &name, widgets, sender);
+            let tunnel = tunnels::TunnelPage::new();
+            let page = tunnel.page.clone().upcast();
+            let panel = Panel::Tunnel(tunnel);
+            self.add_tab(key, page, panel, icon, &name, widgets, sender);
             self.refresh_tunnel(id, sender);
             return;
         }

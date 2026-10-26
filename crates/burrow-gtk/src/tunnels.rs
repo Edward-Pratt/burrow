@@ -149,36 +149,11 @@ pub fn status_text(status: &Status) -> (String, Option<&'static str>) {
     }
 }
 
-/// Shows the tunnel's settings, state and buttons in `page`. The widgets
-/// are built on the first call for a page and updated on later ones, so
-/// focus and selected text survive a change of state.
-pub fn fill(
-    page: &gtk::Box,
-    node: &Node,
-    nodes: &HashMap<NodeId, Node>,
-    status: &Status,
-    autostart: bool,
-    actions: &Actions,
-) {
-    let tab = PAGES.with_borrow(|pages| {
-        pages
-            .get(&node.id)
-            .filter(|tab| tab.page.upgrade().as_ref() == Some(page))
-            .cloned()
-    });
-    let tab = tab.unwrap_or_else(|| TunnelPage::build(page, node.id));
-    tab.update(node, nodes, status, autostart, actions);
-}
-
-thread_local! {
-    /// The widgets of each open tunnel tab. GTK runs on one thread, and
-    /// `fill` is only given the page, so this is where it finds them again.
-    static PAGES: RefCell<HashMap<NodeId, Rc<TunnelPage>>> = RefCell::default();
-}
-
-/// The widgets of one tunnel tab, and the actions its buttons run.
-struct TunnelPage {
-    page: glib::WeakRef<gtk::Box>,
+/// A tunnel tab: its settings, state and buttons. The widgets are built
+/// once and updated by [`TunnelPage::fill`], so focus and selected text
+/// survive a change of state.
+pub struct TunnelPage {
+    pub page: gtk::Box,
     title: gtk::Label,
     /// The values next to "Listens on", "Forwards to", "Through" and
     /// "State".
@@ -197,10 +172,10 @@ struct TunnelPage {
 }
 
 impl TunnelPage {
-    fn build(page: &gtk::Box, id: NodeId) -> Rc<TunnelPage> {
-        while let Some(child) = page.first_child() {
-            page.remove(&child);
-        }
+    /// An empty page, until the first [`TunnelPage::fill`].
+    pub fn new() -> Rc<TunnelPage> {
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        page.add_css_class("tunnel-view");
 
         let title = gtk::Label::new(None);
         title.set_xalign(0.0);
@@ -256,7 +231,7 @@ impl TunnelPage {
         page.append(&autostart);
 
         let tab = Rc::new(TunnelPage {
-            page: page.downgrade(),
+            page,
             title,
             values,
             stale,
@@ -310,21 +285,12 @@ impl TunnelPage {
             }
         });
 
-        page.connect_destroy(move |page| {
-            PAGES.with_borrow_mut(|pages| {
-                let ours = pages
-                    .get(&id)
-                    .is_some_and(|tab| tab.page.upgrade().is_none_or(|shown| shown == *page));
-                if ours {
-                    pages.remove(&id);
-                }
-            });
-        });
-        PAGES.with_borrow_mut(|pages| pages.insert(id, tab.clone()));
         tab
     }
 
-    fn update(
+    /// Shows `node` with its `status`. `actions` are what the buttons run
+    /// from now on.
+    pub fn fill(
         &self,
         node: &Node,
         nodes: &HashMap<NodeId, Node>,
