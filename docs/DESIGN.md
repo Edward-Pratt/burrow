@@ -93,7 +93,8 @@ All non-secret state lives as TOML files in `$XDG_CONFIG_HOME/burrow/` (default 
 | Paths | XDG base directories (`directories` crate) |
 | Notifications | `burrowd` calls `org.freedesktop.Notifications` over D-Bus itself (zbus, already there for the keyring), so alerts show with no window open; works with mako, swaync and GNOME. Not `GNotification`, which needs the window. |
 | Packaging | A PKGBUILD for pacman, or `dist/install.sh` for one user in `~/.local`, which a daily systemd user timer runs again to build and install the newest main. No updater inside the app. Not Flatpak: its sandbox blocks host shells, the SSH agent and `~/.ssh`. |
-| RDP | IronRDP or FreeRDP, as a late addon |
+| VNC | The core signs in over a channel on the SSH host's connection, then passes the RFB stream to the window, which draws it with vnc-rs into a GTK texture. Not gtk-vnc, which is GTK 3 only. |
+| RDP | IronRDP or FreeRDP, later |
 
 ## Addons
 
@@ -153,4 +154,4 @@ Built-in features use the same addon API as third-party ones.
 14. Edit remote files: the file viewer saves back over SFTP, and checks the file didn't change on the server meanwhile
 15. Containers and PM2 in `burrow-agent`, shown in the monitor tab, with alerts when one stops
 16. Service actions from the monitor tab: systemd units through sudo (a terminal asks for the password when sudo needs one), containers and PM2 apps, and each one's log in a tab
-17. VNC in a tab, through the core over SSH so the password stays in the core
+17. VNC desktops in a tab, through an SSH host, with the core signing in so the password stays in the core

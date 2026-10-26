@@ -13,8 +13,7 @@
 
 Next milestones from `docs/DESIGN.md`, in rough order; pick by what the tester uses.
 
-- [ ] **M17: VNC** - DESIGN.md milestone 17. gtk-vnc is GTK 3 only, so this needs an RFB client drawn into a GTK 4 texture.
-
+- [ ] **VNC: clipboard, and fewer messages for the pointer** - each pointer move is one command to the daemon. Left out of M17.
 - [ ] **Shell-command fallback** for servers without the agent - DESIGN.md "Fallback (later)".
 - [ ] **Secrets bundle** for sharing a config folder (Argon2id + XChaCha20-Poly1305) - DESIGN.md "Plain-text config", "Sharing". No code yet.
 - [ ] **Alert thresholds per host** - Monitoring v2 has fixed rules (disk 90%, memory 10%, a minute unreachable). Per-host numbers would need a settings UI, and should live in the state folder rather than node files, so a shared config can't silence alerts.
@@ -25,7 +24,8 @@ Next milestones from `docs/DESIGN.md`, in rough order; pick by what the tester u
 
 ## Done
 
-- [x] ~~M16: service actions and logs~~ (2026-10-26, branch m16-service-actions)
+- [x] ~~M17: VNC desktops~~ (2026-10-26, branch m17-vnc)
+- [x] ~~M16: service actions and logs~~ (2026-10-26, PR #23 merged)
 - [x] ~~M15: containers and PM2~~ (2026-10-26, PR #22 merged)
 - [x] ~~M14: edit remote files~~ (2026-10-26, PR #21 merged)
 - [x] ~~M13: terminal essentials~~ (2026-10-26, PR #20 merged)
