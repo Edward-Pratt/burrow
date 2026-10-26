@@ -149,3 +149,8 @@ Built-in features use the same addon API as third-party ones.
 10. Hosts added in Burrow: a dialog that writes `~/.ssh/config.d/burrow.conf`
 11. Monitoring v2: background monitors, history on disk, alerts and desktop notifications
 12. Architecture and UX review: one store for every pinned approval, each command classified in one place, an audit log with rotation, the sidebar on a list model with drag and drop, one panel type per tab, several shells per host, pages that update in place, a read-only file viewer, and an errors list in the status bar
+13. Terminal essentials: open tabs restored at the next start, find in a terminal, links that open with Ctrl+click, a terminal font setting and zoom
+14. Edit remote files: the file viewer saves back over SFTP, and checks the file didn't change on the server meanwhile
+15. Containers and PM2 in `burrow-agent`, shown in the monitor tab, with alerts when one stops
+16. systemd actions (start, stop, restart, enable, disable) from the monitor tab, and a unit's journal in a tab
+17. VNC in a tab, through the core over SSH so the password stays in the core
