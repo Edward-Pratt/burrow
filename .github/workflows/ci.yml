@@ -75,3 +75,55 @@ jobs:
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             su builder -c "cargo build -p burrow-agent --profile agent --target $target"
           done
+
+  # Each green push to main becomes the build that `burrow-update`
+  # downloads, so nobody compiles Burrow to install or update it. It
+  # replaces the files of one release, build-main, whose tag follows main.
+  # Built on the newest Arch, so it runs on an Arch kept up to date.
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install system packages
+        run: pacman -Syu --noconfirm --needed base-devel git rustup gtk4 vte4 gtksourceview5 github-cli
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        run: |
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      # The same build and layout as `burrow-update --branch`, from the
+      # script itself.
+      - name: Build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          dist/install.sh --stage out/burrow
+          tar -czf burrow-x86_64.tar.gz -C out burrow
+          sha256sum burrow-x86_64.tar.gz >SHA256SUMS
+          cp out/burrow/commit commit
+
+      # One file at a time, in the reverse of the order the script reads
+      # them, so `commit` names a new build only once its files are there.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag -f build-main
+          git push -f origin build-main
+          if ! gh release view build-main >/dev/null 2>&1; then
+            gh release create build-main --title "Latest build of main" --notes "" --latest
+          fi
+          for file in burrow-x86_64.tar.gz SHA256SUMS commit; do
+            gh release upload build-main "$file" --clobber
+          done
+          gh release edit build-main --notes "Built from $GITHUB_SHA. Install it with dist/install.sh, which also keeps it up to date."
