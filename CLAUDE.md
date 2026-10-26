@@ -7,11 +7,11 @@ A Linux-first desktop app for servers and databases, in Rust + GTK4 (gtk4-rs + r
 - `crates/burrow-core`: everything that isn't drawing. It owns config, secrets, SSH, tunnels, SFTP and the addon host. Clients drive it only through `Core::execute(Command)` and `Core::subscribe()` (`src/api.rs` is the contract).
   - `src/ssh/`: `connection.rs` shares one connection per host; `session.rs` holds terminals, `tunnel.rs` tunnels, `files.rs` SFTP.
   - `src/addon/`: manifests, approval, JSON-RPC over stdio.
-- `crates/burrow-gtk`: a thin client of the core in `burrowd`. State flows one way: user action → `Command` → core `Event` → redraw. Each tab kind has a module: `terminal.rs`/`remote.rs` (terminals), `tunnels.rs`, `files.rs`, `addons.rs`. `app.rs` routes messages and session events between them.
+- `crates/burrow-gtk`: a thin client of the core in `burrowd`. State flows one way: user action → `Command` → core `Event` → redraw. Each tab kind has a module: `terminal.rs`/`remote.rs` (terminals), `tunnels.rs`, `files.rs`, `monitor.rs`, `database.rs`, `addons.rs`. `session.rs` is the session page the file panel, monitor and database share, and `sidebar.rs` the tree. `app.rs` keeps each tab's `Panel` and routes messages and session events between them.
 - `crates/burrow-addon-notes`: the example addon, plus the addon integration tests.
 - `crates/burrowd`: the daemon binary. The daemon itself is `burrow-core/src/daemon.rs`, and the socket protocol (server, client, finding and starting the daemon, and what each role may run) is `src/ipc/`.
 - `crates/burrow-agent`: the program monitors run on servers, and its wire format. The core's side is `ssh/agent.rs` (install) and `ssh/monitor.rs` (session). Its sshd tests live here so they can upload its real binary. Build it for servers with `cargo build -p burrow-agent --profile agent --target x86_64-unknown-linux-musl`.
-- `crates/burrow-cli`: the `burrow` command, and `burrow mcp serve` in `src/mcp.rs`. What the MCP bridge may do is decided in the daemon (`ipc/server.rs`, `grants.rs`), never in the bridge.
+- `crates/burrow-cli`: the `burrow` command, and `burrow mcp serve` in `src/mcp.rs`. What the MCP bridge may do is decided in the daemon, never in the bridge: `class.rs` says what each command needs, and `ipc/server.rs` and `grants.rs` enforce it.
 
 ## Checks
 

@@ -1275,10 +1275,12 @@ fn check_kind(node: &Node, kind: &str) -> Result<()> {
         return Ok(());
     }
     let wanted = match kind {
-        SSH_HOST_KIND => "an SSH host",
-        SSH_TUNNEL_KIND => "an SSH tunnel",
-        POSTGRES_KIND => "a database",
-        _ => unreachable!("no command needs a {kind} node"),
+        SSH_HOST_KIND => "an SSH host".to_string(),
+        SSH_TUNNEL_KIND => "an SSH tunnel".to_string(),
+        POSTGRES_KIND => "a database".to_string(),
+        // No command asks for another kind today. A new one that does
+        // gets a plain error rather than a panic.
+        _ => format!("a {kind} node"),
     };
     Err(Error::invalid(
         "node",
@@ -1317,6 +1319,28 @@ mod tests {
     fn core_is_send_and_sync() {
         fn check<T: Send + Sync + 'static>() {}
         check::<Core>();
+    }
+
+    #[test]
+    fn a_node_of_the_wrong_kind_is_an_error() {
+        let node = Node {
+            id: NodeId::new(),
+            parent: None,
+            kind: crate::api::FOLDER_KIND.into(),
+            name: "work".into(),
+            color: None,
+            props: toml::Table::new(),
+            secrets: Default::default(),
+        };
+        assert!(check_kind(&node, crate::api::FOLDER_KIND).is_ok());
+        let error = check_kind(&node, SSH_HOST_KIND).unwrap_err().to_string();
+        assert!(
+            error.contains("work is a folder, not an SSH host"),
+            "{error}"
+        );
+        // A kind no command asks for yet is still only an error.
+        let error = check_kind(&node, "notes").unwrap_err().to_string();
+        assert!(error.contains("not a notes node"), "{error}");
     }
 
     /// A core with one addon that may read and write nodes.
