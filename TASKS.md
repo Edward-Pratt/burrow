@@ -13,7 +13,6 @@
 
 Next milestones from `docs/DESIGN.md`, in rough order; pick by what the tester uses.
 
-- [ ] **M16: systemd actions and journal** - DESIGN.md milestone 16.
 - [ ] **M17: VNC** - DESIGN.md milestone 17. gtk-vnc is GTK 3 only, so this needs an RFB client drawn into a GTK 4 texture.
 
 - [ ] **Shell-command fallback** for servers without the agent - DESIGN.md "Fallback (later)".
@@ -26,7 +25,8 @@ Next milestones from `docs/DESIGN.md`, in rough order; pick by what the tester u
 
 ## Done
 
-- [x] ~~M15: containers and PM2~~ (2026-10-26, branch m15-containers-pm2)
+- [x] ~~M16: service actions and logs~~ (2026-10-26, branch m16-service-actions)
+- [x] ~~M15: containers and PM2~~ (2026-10-26, PR #22 merged)
 - [x] ~~M14: edit remote files~~ (2026-10-26, PR #21 merged)
 - [x] ~~M13: terminal essentials~~ (2026-10-26, PR #20 merged)
 
