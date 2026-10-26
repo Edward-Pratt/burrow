@@ -147,11 +147,14 @@ pub fn remote(
 }
 
 /// The folder the shell is in, when it says. Shells set up for VTE report
-/// it after each command (OSC 7), and others never do.
+/// it after each command (OSC 7), and others never do. Any program's output
+/// can say it too, such as an SSH session inside a local shell naming a
+/// folder on its own host, so a folder on another host is not this one.
 pub fn folder(terminal: &vte4::Terminal) -> Option<PathBuf> {
     let uri = terminal.current_directory_uri()?;
-    let (path, _host) = glib::filename_from_uri(&uri).ok()?;
-    Some(path)
+    let (path, host) = glib::filename_from_uri(&uri).ok()?;
+    let local = host.is_none_or(|host| host == "localhost" || host == glib::host_name());
+    local.then_some(path)
 }
 
 /// Columns and rows.

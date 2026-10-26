@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use burrow_core::NodeId;
+use relm4::gtk::glib;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -40,6 +41,18 @@ pub struct Layout {
     pub current: usize,
     #[serde(default, rename = "tab")]
     pub tabs: Vec<SavedTab>,
+}
+
+/// Whether a local shell may start in `folder` again. Output can name any
+/// folder as the shell's (OSC 7), and prompts that run `git` in a folder
+/// run hooks from its repository, so the folder must be the user's own and
+/// writable by nobody else. The home folder is used otherwise.
+pub fn safe_folder(folder: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(home), Ok(meta)) = (fs::metadata(glib::home_dir()), fs::metadata(folder)) else {
+        return false;
+    };
+    meta.is_dir() && meta.uid() == home.uid() && meta.mode() & 0o022 == 0
 }
 
 fn layout_path(state_dir: &Path) -> PathBuf {
@@ -94,6 +107,24 @@ mod tests {
         };
         layout.save(&dir).unwrap();
         assert_eq!(Layout::load(&dir), layout);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shells_start_only_in_folders_no_one_else_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("burrow-folder-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(safe_folder(&dir));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(!safe_folder(&dir));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o757)).unwrap();
+        assert!(!safe_folder(&dir));
+        // Shared folders such as /tmp. (CI runs as root, so `/` would be
+        // the user's own there.)
+        assert!(!safe_folder(Path::new("/tmp")));
+        assert!(!safe_folder(&dir.join("missing")));
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -28,7 +28,7 @@ use crate::database::{self, Database};
 use crate::dialogs;
 use crate::files::{self, Files};
 use crate::hosts;
-use crate::layout::{Layout, SavedTab};
+use crate::layout::{self, Layout, SavedTab};
 use crate::monitor::{self, Monitor};
 use crate::palette::{self, Item};
 use crate::remote::{self, Remote, Unclaimed};
@@ -1109,7 +1109,7 @@ impl App {
                 SavedTab::Terminal { shell, folder } => {
                     // A shell no longer installed gives way to the login one.
                     let shell = Some(shell).filter(|shell| shells.contains(shell));
-                    let folder = folder.filter(|folder| folder.is_dir());
+                    let folder = folder.filter(|folder| layout::safe_folder(folder));
                     self.open_terminal(shell, folder.as_deref(), widgets, sender);
                 }
                 SavedTab::Node { node } => self.open_tab_now(node, widgets, sender),
