@@ -22,6 +22,7 @@ mod pins;
 mod secrets;
 mod ssh;
 mod tree;
+mod vnc;
 mod watch;
 
 pub use api::{
@@ -32,7 +33,7 @@ pub use api::{
     Prompt, PromptAnswer, PromptKind, QueryError, QueryResult, Response, SSH_HOST_KIND,
     SSH_TUNNEL_KIND, SecretValue, Service, ServiceAction, SessionId, SessionInfo, SessionKind,
     SessionState, StatementResult, TerminalRun, TransferId, TransferState, TrendRange, TunnelShown,
-    View, monitor, sha256_hex,
+    VNC_KIND, View, monitor, sha256_hex,
 };
 pub use engine::{Core, CoreOptions, Paths};
 pub use error::{Error, Result};

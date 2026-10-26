@@ -40,7 +40,7 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `check_ssh_include` | `alias` | `ssh_include { included, config, line }` |
 | `add_ssh_host` | `parent?`, `alias`, `hostname`, `user?`, `port?`, `identity_file?`, `add_include?` | `node { node }` |
 | `open_terminal` | `node`, `cols`, `rows`, `run?` | `session { session }` |
-| `write_terminal` | `session`, `data` (base64) | `ok` |
+| `write_terminal` | `session`, `data` (base64) | `ok` (to a terminal or a desktop) |
 | `resize_terminal` | `session`, `cols`, `rows` | `ok` |
 | `answer_prompt` | `session`, `prompt`, `answer` | `ok` |
 | `close_session` | `session` | `ok` |
@@ -67,6 +67,7 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `list_alerts` | | `alerts { alerts }` |
 | `set_monitoring` | `node`, `enabled`, `expect?` | `ok` |
 | `open_database` | `node` | `session { session }` |
+| `open_vnc` | `node` | `session { session }` |
 | `run_query` | `session`, `sql`, `limit?` | `query { result }` |
 | `cancel_query` | `session` | `ok` |
 | `set_read_only` | `session`, `read_only` | `ok` |
@@ -142,7 +143,7 @@ A `service` is something a monitor lists: `{"kind": "unit", "name": "nginx.servi
 
 `result` is the command's `exec` result, so a failed action is a reply with a non-zero `status` and the server's words in `stderr`, not an error. `needs_password` is true when sudo wanted a password, so nothing was done: run the same action with `open_terminal`'s `run` instead, where the user can type it. Burrow never sees that password. Names come from the server, so they are checked and quoted in one place before any of these lines is built: a name that is empty, over 256 bytes, starts with `-`, or has a `'` or a control character is refused, and so is a `runtime` other than `docker` or `podman`, a `pm2` that isn't an absolute path, and an action the service doesn't take.
 
-Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files`, `database`, `exec` or `monitor`) and `state`, and `background: true` on a background monitor.
+Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files`, `database`, `exec`, `monitor` or `vnc`) and `state`, and `background: true` on a background monitor.
 
 - **Host settings** come from `ssh -G <alias>`, so `Include`, `Match`, `Host` patterns and defaults apply exactly as for `ssh <alias>`. `props.alias` is the alias (the node's name when missing). An alias that is empty, starts with `-`, or has spaces or control characters is refused, because node files can come from a shared folder.
 - **Host keys** are checked against the `UserKnownHostsFile` and `GlobalKnownHostsFile` files, following `StrictHostKeyChecking`. A changed or `@revoked` key is always refused. A new key is asked about (`ask`) or added (`accept-new`/`no`), except when the host has known keys of another type, which is always asked about. New keys go into the first user file, hashed if `HashKnownHosts` is on.
@@ -290,6 +291,25 @@ sslrootcert = "/path/ca.pem" # optional; replaces the system's trusted CAs
 - **`list_schema`** returns each schema the user made (not `pg_*` or `information_schema`), with its tables, views, materialized views, foreign and partitioned tables (`kind`), and their columns' `name`, `data_type` and `nullable`.
 - **`export_query`** writes every row to `path` as CSV, with a header row for each result. A NULL is an empty field and an empty string is `""`. It runs in a read-only transaction of its own, even on a writable session, and refuses to start while the session has a transaction open, since rolling back at the end would throw that one's work away. The file is written next to `path` under a hidden name and moved into place when complete, so it is private (`0600`) and never half-written.
 - **History:** every query run with `run_query` is kept, newest last, up to 200 per node, in `$XDG_STATE_HOME/burrow/history/<node>.json` (`0600`). It stays on this computer because queries can hold data. Each entry has the `sql`, when it last ran (`at`, Unix seconds) and whether it ran without an error (`ok`). Queries over 64 KiB are not kept. `clear_history` forgets a node's, and so does deleting the node.
+
+## Desktops
+
+A `vnc` node is a VNC desktop, always reached through an SSH host, so the screen never crosses the network in the clear and nothing listens on this computer:
+
+```toml
+kind = "vnc"
+[props]
+via = "<id of an ssh-host node>"   # required
+host = "localhost"                 # as the SSH host sees it; the default
+port = 5900                        # the default
+```
+
+`open_vnc` dials the desktop over the host's shared connection and signs in. Once the session is `connected`, its output (`take_output`) is the server's RFB stream and `write_terminal` writes to it, so a client speaks RFB itself.
+
+- **The password stays in the core.** The core signs in, answering RFB 3.3, 3.7 or 3.8. It picks no authentication when the server offers it, and VNC authentication otherwise; a server offering only other types, such as VeNCrypt, fails the session naming them. A missing or refused password is asked for with a `secret` prompt, up to three times, giving the server's reason; a saved one is sent only to the target it was saved for, as for databases.
+- **The client sees a server that needs no password.** After signing in, the core sends the client `RFB 003.008`, waits for the same back, offers only security type 1 (none), and sends a successful SecurityResult once the client picks it. From the client's ClientInit on, bytes pass through unchanged both ways. A client that asks for another version fails the session.
+- **The server is not trusted:** its version line must be `RFB 003.xxx`, its refusal reasons are cut at 4 KiB and lose control characters, and signing in must finish within 30 seconds. What it sends after that is for the client to check: Burrow's window uses vnc-rs, which holds a screen to 8192 pixels a side and about 8.3 million pixels and every rectangle to the screen, and checks each update again before drawing.
+- **The MCP bridge** can't open a desktop.
 
 ## Addons
 

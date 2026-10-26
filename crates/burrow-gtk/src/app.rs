@@ -16,7 +16,7 @@ use burrow_core::{
     AddonInfo, Alert, Capability, Command, Event, FOLDER_KIND, FormValue, Grant, GrantShown, Node,
     NodeId, NodePatch, POSTGRES_KIND, Problem, Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND,
     Service, ServiceAction, SessionId, SessionInfo, SessionKind, SessionState, TerminalRun,
-    TunnelShown, View,
+    TunnelShown, VNC_KIND, View,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
@@ -26,6 +26,7 @@ use vte4::TerminalExt;
 
 use crate::addons;
 use crate::database::{self, Database};
+use crate::desktop::{self, Desktop};
 use crate::dialogs;
 use crate::files::{self, Files};
 use crate::hosts;
@@ -62,17 +63,19 @@ pub enum NewKind {
     SshHost,
     SshTunnel,
     Database,
+    Desktop,
     /// A kind owned by an addon.
     Addon(String),
 }
 
 /// The kinds Burrow knows itself: their id, what "New …" calls them, and
 /// what it creates.
-const BUILT_IN_KINDS: [(&str, &str, NewKind); 4] = [
+const BUILT_IN_KINDS: [(&str, &str, NewKind); 5] = [
     (FOLDER_KIND, "folder", NewKind::Folder),
     (SSH_HOST_KIND, "SSH host", NewKind::SshHost),
     (SSH_TUNNEL_KIND, "SSH tunnel", NewKind::SshTunnel),
     (POSTGRES_KIND, "PostgreSQL database", NewKind::Database),
+    (VNC_KIND, "VNC desktop", NewKind::Desktop),
 ];
 
 impl NewKind {
@@ -83,6 +86,7 @@ impl NewKind {
             NewKind::SshHost => SSH_HOST_KIND,
             NewKind::SshTunnel => SSH_TUNNEL_KIND,
             NewKind::Database => POSTGRES_KIND,
+            NewKind::Desktop => VNC_KIND,
             NewKind::Addon(kind) => kind,
         }
     }
@@ -215,6 +219,12 @@ pub enum AppMsg {
         msg: database::Msg,
     },
     EditDatabase(NodeId),
+    /// For the tab of a VNC desktop node.
+    Desktop {
+        node: NodeId,
+        msg: desktop::Msg,
+    },
+    EditDesktop(NodeId),
     /// Asks what the MCP bridge may do on a node.
     EditGrant(NodeId),
     GrantLoaded {
@@ -327,6 +337,7 @@ impl AppMsg {
                 | AppMsg::RestartTunnel(_)
                 | AppMsg::EditTunnel(_)
                 | AppMsg::EditDatabase(_)
+                | AppMsg::EditDesktop(_)
                 | AppMsg::EditGrant(_)
                 | AppMsg::SetAutostart { .. }
                 | AppMsg::Invoke { .. }
@@ -393,6 +404,8 @@ enum Panel {
     /// Boxed, being much bigger than the other panels.
     Monitor(Box<Monitor>),
     Database(Database),
+    /// Boxed, being much bigger than most panels.
+    Desktop(Box<Desktop>),
     Tunnel(Rc<tunnels::TunnelPage>),
     /// The box an addon draws its view in.
     View(gtk::Box),
@@ -414,6 +427,7 @@ impl Panel {
             Panel::Files(panel) => Some(panel.session.state),
             Panel::Monitor(panel) => Some(panel.session.state),
             Panel::Database(panel) => Some(panel.session.state),
+            Panel::Desktop(panel) => Some(panel.session.state),
             Panel::Tunnel(_) | Panel::View(_) | Panel::Placeholder(_) | Panel::Terminal { .. } => {
                 None
             }
@@ -893,6 +907,33 @@ impl Component for App {
                 }
             }
             AppMsg::EditDatabase(node) => self.edit_database(Some(node), None, window, &sender),
+            AppMsg::Desktop {
+                node,
+                msg: desktop::Msg::Session(session::Msg::Started(session)),
+            } => match self.tabs.get_mut(&TabKey::Node(node)) {
+                Some(Tab {
+                    panel: Panel::Desktop(panel),
+                    ..
+                }) if panel.session.state == session::State::Starting => {
+                    panel.session.state = session::State::Running(session);
+                    panel.attach(&self.core, session);
+                    for event in self.unclaimed.claim(session) {
+                        self.session_event(event, window, &sender);
+                    }
+                }
+                // The tab was closed while the session started.
+                _ => execute(&self.core, &sender, Command::CloseSession { session }),
+            },
+            AppMsg::Desktop { node, msg } => {
+                if let Some(Tab {
+                    panel: Panel::Desktop(panel),
+                    ..
+                }) = self.tabs.get_mut(&TabKey::Node(node))
+                {
+                    panel.update(msg, &self.core);
+                }
+            }
+            AppMsg::EditDesktop(node) => self.edit_desktop(Some(node), None, window, &sender),
             AppMsg::EditGrant(node) => {
                 let (core, input) = (self.core.clone(), sender.input_sender().clone());
                 runtime().spawn(async move {
@@ -1732,6 +1773,7 @@ impl App {
             Panel::Files(panel) => panel.session_changed(&state, &self.core, sender),
             Panel::Monitor(panel) => panel.session_changed(&state, &self.core, sender),
             Panel::Database(panel) => panel.session_changed(&state, &self.core, sender),
+            Panel::Desktop(panel) => panel.session_changed(&state),
             Panel::Tunnel(_) | Panel::View(_) | Panel::Placeholder(_) | Panel::Terminal { .. } => {}
         }
     }
@@ -1977,6 +2019,45 @@ impl App {
         });
     }
 
+    fn edit_desktop(
+        &self,
+        id: Option<NodeId>,
+        parent: Option<NodeId>,
+        window: &gtk::ApplicationWindow,
+        sender: &ComponentSender<Self>,
+    ) {
+        let node = id.and_then(|id| self.nodes.get(&id));
+        if id.is_some() && node.is_none() {
+            return;
+        }
+        let mut hosts: Vec<(NodeId, String)> = (self.nodes.values())
+            .filter(|n| n.kind == SSH_HOST_KIND)
+            .map(|n| (n.id, n.name.clone()))
+            .collect();
+        hosts.sort_by_key(|(id, name)| (name.to_lowercase(), *id));
+        let (core, sender) = (self.core.clone(), sender.clone());
+        desktop::edit(window, node, hosts, move |name, props| {
+            let command = match id {
+                Some(id) => Command::UpdateNode {
+                    id,
+                    patch: NodePatch {
+                        name: Some(name),
+                        props: Some(props),
+                        ..Default::default()
+                    },
+                },
+                None => Command::CreateNode {
+                    parent,
+                    kind: VNC_KIND.into(),
+                    name,
+                    color: None,
+                    props,
+                },
+            };
+            execute(&core, &sender, command);
+        });
+    }
+
     fn activate(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
         let Some(node) = self.nodes.get(&id) else {
             return;
@@ -2028,6 +2109,14 @@ impl App {
             let page = panel.page.clone().upcast();
             database::start(&self.core, id, sender);
             let panel = Panel::Database(panel);
+            self.add_tab(key, page, panel, icon, &name, widgets, sender);
+            return;
+        }
+        if node.kind == VNC_KIND {
+            let panel = Desktop::new(id, sender);
+            let page = panel.page.clone().upcast();
+            desktop::start(&self.core, id, sender);
+            let panel = Panel::Desktop(Box::new(panel));
             self.add_tab(key, page, panel, icon, &name, widgets, sender);
             return;
         }
@@ -2394,6 +2483,7 @@ impl App {
             NewKind::SshHost => return hosts::new_host(window, self.core.clone(), parent),
             NewKind::SshTunnel => return self.edit_tunnel(None, parent, window, sender),
             NewKind::Database => return self.edit_database(None, parent, window, sender),
+            NewKind::Desktop => return self.edit_desktop(None, parent, window, sender),
             NewKind::Addon(kind) => {
                 let label = self
                     .addons
@@ -2409,8 +2499,8 @@ impl App {
             let (kind, props) = match &kind {
                 NewKind::Folder => ("folder", toml::Table::new()),
                 NewKind::Addon(kind) => (kind.as_str(), toml::Table::new()),
-                NewKind::SshHost | NewKind::SshTunnel | NewKind::Database => {
-                    unreachable!("hosts, tunnels and databases have their own dialogs")
+                NewKind::SshHost | NewKind::SshTunnel | NewKind::Database | NewKind::Desktop => {
+                    unreachable!("hosts, tunnels, databases and desktops have their own dialogs")
                 }
             };
             execute(
@@ -2539,6 +2629,9 @@ impl App {
                 }
                 if node.kind == POSTGRES_KIND {
                     entries.push(("Edit…".into(), AppMsg::EditDatabase(node.id)));
+                }
+                if node.kind == VNC_KIND {
+                    entries.push(("Edit…".into(), AppMsg::EditDesktop(node.id)));
                 }
                 if !capabilities(&node.kind).is_empty() {
                     entries.push(("Claude access…".into(), AppMsg::EditGrant(node.id)));

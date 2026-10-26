@@ -47,7 +47,7 @@ use crate::engine::Core;
 use crate::error::{Error, Result};
 
 /// Output chunks a session buffers before it waits for the reader.
-const OUTPUT_BUFFER: usize = 64;
+pub(crate) const OUTPUT_BUFFER: usize = 64;
 
 /// What clients send to a running session.
 #[derive(Debug)]
@@ -98,7 +98,8 @@ impl Sessions {
             .get(&id)
             .filter(|e| e.input.is_some())
             .ok_or(Error::SessionNotFound(id))?;
-        if entry.kind != SessionKind::Terminal && !matches!(input, Input::Close) {
+        let writable = matches!(entry.kind, SessionKind::Terminal | SessionKind::Vnc);
+        if !writable && !matches!(input, Input::Close) {
             return Err(Error::invalid("session", format!("{id} is not a terminal")));
         }
         if entry.background {
@@ -188,6 +189,7 @@ impl Sessions {
                 SessionKind::Tunnel => "a tunnel",
                 SessionKind::Exec => "a command",
                 SessionKind::Monitor => "a monitor",
+                SessionKind::Vnc => "a desktop",
             };
             return Err(Error::invalid("session", format!("{id} is not {what}")));
         }

@@ -276,6 +276,7 @@ fn kind_icon<'a>(kind: &str, expanded: bool, icons: &'a HashMap<String, String>)
         "ssh-host" => "network-server-symbolic",
         "ssh-tunnel" => "preferences-system-network-proxy-symbolic",
         "postgres" => "drive-harddisk-symbolic",
+        "vnc" => "video-display-symbolic",
         kind => icons
             .get(kind)
             .map_or("text-x-generic-symbolic", String::as_str),

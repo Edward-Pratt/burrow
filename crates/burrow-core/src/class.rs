@@ -144,6 +144,8 @@ impl Command {
             Command::SetGrant { .. } => changes(AddonRule::Denied),
 
             Command::OpenDatabase { node } => opens(McpRule::Node(*node, SqlRead)),
+            // The bridge has no way to see a screen.
+            Command::OpenVnc { .. } => opens(McpRule::Denied),
             Command::RunQuery { session, .. } => mcp(McpRule::Query(*session)),
             Command::CancelQuery { session } | Command::ListSchema { session } => {
                 mcp(McpRule::Session(*session, SqlRead))

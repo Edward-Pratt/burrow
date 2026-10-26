@@ -171,3 +171,8 @@ popover.menu button {
 .unit-list row {
   padding: 2px 6px;
 }
+
+/* What a desktop doesn't cover, around a screen scaled to fit. */
+picture.desktop {
+  background: black;
+}
