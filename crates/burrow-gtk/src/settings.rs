@@ -34,6 +34,10 @@ pub struct UiSettings {
     pub theme: Theme,
     #[serde(default = "default_true")]
     pub sidebar_visible: bool,
+    /// A Pango font description such as "JetBrains Mono 11". Terminals use
+    /// the system's monospace font without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_font: Option<String>,
 }
 
 impl Default for UiSettings {
@@ -41,6 +45,7 @@ impl Default for UiSettings {
         UiSettings {
             theme: Theme::default(),
             sidebar_visible: true,
+            terminal_font: None,
         }
     }
 }
@@ -93,6 +98,7 @@ mod tests {
         let settings = UiSettings {
             theme: Theme::Dark,
             sidebar_visible: false,
+            terminal_font: Some("Monospace 12".into()),
         };
         settings.save(&dir).unwrap();
         assert_eq!(UiSettings::load(&dir), settings);

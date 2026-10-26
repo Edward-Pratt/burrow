@@ -13,7 +13,11 @@
 
 Next milestones from `docs/DESIGN.md`, in rough order; pick by what the tester uses.
 
-- [ ] **Containers and PM2 in burrow-agent** - DESIGN.md "Server agent".
+- [ ] **M14: edit remote files** - DESIGN.md milestone 14.
+- [ ] **M15: containers and PM2** - DESIGN.md milestone 15 and "Server agent".
+- [ ] **M16: systemd actions and journal** - DESIGN.md milestone 16.
+- [ ] **M17: VNC** - DESIGN.md milestone 17. gtk-vnc is GTK 3 only, so this needs an RFB client drawn into a GTK 4 texture.
+
 - [ ] **Shell-command fallback** for servers without the agent - DESIGN.md "Fallback (later)".
 - [ ] **Secrets bundle** for sharing a config folder (Argon2id + XChaCha20-Poly1305) - DESIGN.md "Plain-text config", "Sharing". No code yet.
 - [ ] **Alert thresholds per host** - Monitoring v2 has fixed rules (disk 90%, memory 10%, a minute unreachable). Per-host numbers would need a settings UI, and should live in the state folder rather than node files, so a shared config can't silence alerts.
@@ -24,7 +28,9 @@ Next milestones from `docs/DESIGN.md`, in rough order; pick by what the tester u
 
 ## Done
 
-- [x] ~~M12: architecture and UX review~~ (2026-10-26, branch m12-architecture-ux, PR not opened yet)
+- [x] ~~M13: terminal essentials~~ (2026-10-26, branch m13-terminal-essentials, PR not opened yet)
+
+- [x] ~~M12: architecture and UX review~~ (2026-10-26, PR #19 merged, with the context-menu hang fix in PR #18)
 - [x] ~~`stop()` probe can turn away a starting daemon~~ (2026-10-25, branch m12-core-2: a starting daemon retries the lock for about a second)
 - [x] ~~Install script with daily updates from main, and an icon~~ (2026-10-25, PR #16 merged)
 - [x] ~~`burrow daemon stop` under an open window~~ (2026-10-25, PR #14 merged)

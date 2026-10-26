@@ -7,6 +7,7 @@ mod database;
 mod dialogs;
 mod files;
 mod hosts;
+mod layout;
 mod monitor;
 mod palette;
 mod remote;
@@ -29,8 +30,8 @@ const APP_ID: &str = "dev.burrow.Burrow";
 fn main() {
     // Before GTK or tokio start any threads: this may be the daemon.
     burrow_core::daemon::run_if_asked();
-    let config_dir = match Paths::from_env() {
-        Ok(paths) => paths.config_dir,
+    let paths = match Paths::from_env() {
+        Ok(paths) => paths,
         Err(e) => fail(&e),
     };
     let core = match runtime().block_on(ipc::connect(Role::Gui)) {
@@ -43,7 +44,11 @@ fn main() {
     // Wayland shells take the icon from the desktop entry, but X11 window
     // managers read it from the window.
     gtk::Window::set_default_icon_name(APP_ID);
-    app.run::<app::App>(app::Init { core, config_dir });
+    app.run::<app::App>(app::Init {
+        core,
+        config_dir: paths.config_dir,
+        state_dir: paths.state_dir,
+    });
 }
 
 /// Says why Burrow can't start: on stderr, and in a window when there is a

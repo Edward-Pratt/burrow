@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,7 @@ use crate::database::{self, Database};
 use crate::dialogs;
 use crate::files::{self, Files};
 use crate::hosts;
+use crate::layout::{self, Layout, SavedTab};
 use crate::monitor::{self, Monitor};
 use crate::palette::{self, Item};
 use crate::remote::{self, Remote, Unclaimed};
@@ -41,6 +42,7 @@ use crate::tunnels;
 pub struct Init {
     pub core: Client,
     pub config_dir: PathBuf,
+    pub state_dir: PathBuf,
 }
 
 /// How long to wait between attempts to reach a daemon that went away.
@@ -249,6 +251,8 @@ pub enum AppMsg {
     ClearErrors,
     /// The window was asked to close.
     CloseRequested,
+    /// A tab was dragged to another place.
+    TabsMoved,
     ManageAddons,
     ReviewAddon(String),
     RevokeAddon(String),
@@ -257,6 +261,8 @@ pub enum AppMsg {
     ToggleSidebar,
     ShowSettings,
     SetTheme(Theme),
+    /// `None` goes back to the system's monospace font.
+    SetTerminalFont(Option<String>),
     ReloadConfig,
     OpenConfigFolder,
 }
@@ -299,6 +305,7 @@ impl AppMsg {
                 | AppMsg::Invoke { .. }
                 | AppMsg::ClearErrors
                 | AppMsg::CloseRequested
+                | AppMsg::TabsMoved
                 | AppMsg::ManageAddons
                 | AppMsg::ReviewAddon(_)
                 | AppMsg::RevokeAddon(_)
@@ -307,6 +314,7 @@ impl AppMsg {
                 | AppMsg::ToggleSidebar
                 | AppMsg::ShowSettings
                 | AppMsg::SetTheme(_)
+                | AppMsg::SetTerminalFont(_)
                 | AppMsg::ReloadConfig
                 | AppMsg::OpenConfigFolder
         )
@@ -359,8 +367,11 @@ enum Panel {
     View(gtk::Box),
     /// A node Burrow can't open, described by [`fill_page`].
     Placeholder(gtk::Box),
-    /// A local shell. VTE runs it, so there is nothing to keep.
-    Terminal,
+    /// A local shell. VTE runs it, so only its path is kept, to open it
+    /// again at the next start.
+    Terminal {
+        shell: String,
+    },
 }
 
 impl Panel {
@@ -372,7 +383,9 @@ impl Panel {
             Panel::Files(panel) => Some(panel.session.state),
             Panel::Monitor(panel) => Some(panel.session.state),
             Panel::Database(panel) => Some(panel.session.state),
-            Panel::Tunnel(_) | Panel::View(_) | Panel::Placeholder(_) | Panel::Terminal => None,
+            Panel::Tunnel(_) | Panel::View(_) | Panel::Placeholder(_) | Panel::Terminal { .. } => {
+                None
+            }
         }
     }
 }
@@ -380,7 +393,11 @@ impl Panel {
 pub struct App {
     core: Client,
     config_dir: PathBuf,
+    state_dir: PathBuf,
     settings: UiSettings,
+    /// The tabs to open again, until the first list of nodes arrives. The
+    /// file isn't written until then, so it keeps them meanwhile.
+    restore: Option<Layout>,
     nodes: HashMap<NodeId, Node>,
     problems: Vec<Problem>,
     addons: Vec<AddonInfo>,
@@ -475,8 +492,13 @@ impl Component for App {
     }
 
     fn init(init: Init, window: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
-        let Init { core, config_dir } = init;
+        let Init {
+            core,
+            config_dir,
+            state_dir,
+        } = init;
         let settings = UiSettings::load(&config_dir);
+        let restore = Some(Layout::load(&state_dir));
         // Registers the SQL editor's widgets and finds its languages.
         sourceview5::init();
 
@@ -501,7 +523,9 @@ impl Component for App {
         let mut model = App {
             core,
             config_dir,
+            state_dir,
             settings,
+            restore,
             nodes: HashMap::new(),
             problems: Vec::new(),
             addons: Vec::new(),
@@ -631,7 +655,7 @@ impl Component for App {
                     notebook.set_current_page(Some(next as u32));
                 }
             }
-            AppMsg::NewTerminal(shell) => self.open_terminal(shell, widgets, &sender),
+            AppMsg::NewTerminal(shell) => self.open_terminal(shell, None, widgets, &sender),
             AppMsg::TerminalTitle { id, title } => {
                 if let Some(tab) = self.tabs.get(&TabKey::Terminal(id)) {
                     set_tab_title(&tab.title, &title);
@@ -917,7 +941,12 @@ impl Component for App {
                 self.errors = ErrorLog::default();
                 widgets.errors_button.popdown();
             }
-            AppMsg::CloseRequested => self.close_window(window),
+            AppMsg::CloseRequested => {
+                // Where the shells are now, which no other save sees.
+                self.save_tabs(widgets);
+                self.close_window(window);
+            }
+            AppMsg::TabsMoved => self.save_tabs(widgets),
             AppMsg::ManageAddons => {
                 let review = {
                     let sender = sender.clone();
@@ -964,10 +993,19 @@ impl Component for App {
                     .set_visible(self.settings.sidebar_visible);
                 self.save_settings();
             }
-            AppMsg::ShowSettings => show_settings(window, self.settings.theme, &sender),
+            AppMsg::ShowSettings => show_settings(window, &self.settings, &sender),
             AppMsg::SetTheme(theme) => {
                 self.settings.theme = theme;
                 self.apply_theme();
+                self.save_settings();
+            }
+            AppMsg::SetTerminalFont(font) => {
+                self.settings.terminal_font = font;
+                for tab in self.tabs.values() {
+                    if let Some(terminal) = terminal::in_page(&tab.page) {
+                        terminal::set_font(&terminal, self.settings.terminal_font.as_deref());
+                    }
+                }
                 self.save_settings();
             }
             AppMsg::ReloadConfig => execute(&self.core, &sender, Command::ReloadConfig),
@@ -1054,6 +1092,74 @@ impl App {
             self.close_tab(key, widgets);
         }
         widgets.sidebar.replace(&self.nodes, &self.icons());
+        self.restore_tabs(widgets, sender);
+    }
+
+    /// Opens the tabs that were open when Burrow last closed, once, when
+    /// the nodes they belong to are known. Nodes deleted since are skipped.
+    fn restore_tabs(&mut self, widgets: &Widgets, sender: &ComponentSender<Self>) {
+        let Some(layout) = self.restore.take() else {
+            return;
+        };
+        let shells = terminal::shells();
+        let notebook = widgets.notebook.clone();
+        let mut current = None;
+        for (i, tab) in layout.tabs.into_iter().enumerate() {
+            let before = notebook.n_pages();
+            match tab {
+                SavedTab::Terminal { shell, folder } => {
+                    // A shell no longer installed gives way to the login one.
+                    let shell = Some(shell).filter(|shell| shells.contains(shell));
+                    let folder = folder.and_then(|folder| layout::safe_folder(&folder));
+                    self.open_terminal(shell, folder.as_deref(), widgets, sender);
+                }
+                SavedTab::Node { node } => self.open_tab_now(node, widgets, sender),
+                SavedTab::Shell { node } => self.new_shell(node, widgets, sender),
+                SavedTab::Files { node } => self.open_files(node, widgets, sender),
+                SavedTab::Monitor { node } => self.open_monitor(node, widgets, sender),
+            }
+            if i == layout.current && notebook.n_pages() > before {
+                current = Some(notebook.n_pages() - 1);
+            }
+        }
+        if current.is_some() {
+            notebook.set_current_page(current);
+        }
+        self.save_tabs(widgets);
+    }
+
+    /// Writes the open tabs, in the order they are shown, for the next start.
+    fn save_tabs(&mut self, widgets: &Widgets) {
+        if self.restore.is_some() {
+            return;
+        }
+        let notebook = &widgets.notebook;
+        let mut layout = Layout::default();
+        for i in 0..notebook.n_pages() {
+            let Some(page) = notebook.nth_page(Some(i)) else {
+                continue;
+            };
+            let Some((&key, tab)) = self.tabs.iter().find(|(_, tab)| tab.page == page) else {
+                continue;
+            };
+            if notebook.current_page() == Some(i) {
+                layout.current = layout.tabs.len();
+            }
+            layout.tabs.push(match (key, &tab.panel) {
+                (_, Panel::Terminal { shell }) => SavedTab::Terminal {
+                    shell: shell.clone(),
+                    folder: terminal::in_page(&tab.page).and_then(|t| terminal::folder(&t)),
+                },
+                (TabKey::Shell(node, _), _) => SavedTab::Shell { node },
+                (TabKey::Files(node), _) => SavedTab::Files { node },
+                (TabKey::Monitor(node), _) => SavedTab::Monitor { node },
+                (TabKey::Node(node), _) => SavedTab::Node { node },
+                (TabKey::Terminal(_), _) => continue,
+            });
+        }
+        if let Err(e) = layout.save(&self.state_dir) {
+            self.fail(format!("Could not save the open tabs: {e}"));
+        }
     }
 
     /// Switches to a new daemon after the old one went away. What ran in
@@ -1504,7 +1610,7 @@ impl App {
             Panel::Files(panel) => panel.session_changed(&state, &self.core, sender),
             Panel::Monitor(panel) => panel.session_changed(&state, &self.core, sender),
             Panel::Database(panel) => panel.session_changed(&state, &self.core, sender),
-            Panel::Tunnel(_) | Panel::View(_) | Panel::Placeholder(_) | Panel::Terminal => {}
+            Panel::Tunnel(_) | Panel::View(_) | Panel::Placeholder(_) | Panel::Terminal { .. } => {}
         }
     }
 
@@ -1885,11 +1991,10 @@ impl App {
             send_on_click(&button, sender, message);
             bar.append(&button);
         }
-        let scroller = terminal::page(&term);
-        scroller.set_vexpand(true);
         let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
         page.append(&bar);
-        page.append(&scroller);
+        page.append(&terminal::page(&term));
+        terminal::set_font(&term, self.settings.terminal_font.as_deref());
         remote::start(&self.core, tab, id, &term, sender);
         term.grab_focus();
         let icon = sidebar::icon_name(node, false, &self.icons()).to_string();
@@ -2011,6 +2116,7 @@ impl App {
     fn open_terminal(
         &mut self,
         shell: Option<String>,
+        folder: Option<&Path>,
         widgets: &Widgets,
         sender: &ComponentSender<Self>,
     ) {
@@ -2019,6 +2125,7 @@ impl App {
         let shell = shell.unwrap_or_else(terminal::default_shell);
         let term = terminal::new(
             &shell,
+            folder,
             {
                 let sender = sender.clone();
                 move |title| sender.input(AppMsg::TerminalTitle { id, title })
@@ -2028,19 +2135,13 @@ impl App {
                 move || sender.input(AppMsg::TerminalExited(id))
             },
         );
+        terminal::set_font(&term, self.settings.terminal_font.as_deref());
         let page = terminal::page(&term);
         let key = TabKey::Terminal(id);
-        let name = terminal::shell_name(&shell);
+        let name = terminal::shell_name(&shell).to_string();
         let icon = "utilities-terminal-symbolic";
-        self.add_tab(
-            key,
-            page.upcast(),
-            Panel::Terminal,
-            icon,
-            name,
-            widgets,
-            sender,
-        );
+        let panel = Panel::Terminal { shell };
+        self.add_tab(key, page.upcast(), panel, icon, &name, widgets, sender);
         term.grab_focus();
     }
 
@@ -2083,6 +2184,7 @@ impl App {
 
         send_on_click(&close, sender, AppMsg::CloseTab(key));
         self.tabs.insert(key, Tab { page, title, panel });
+        self.save_tabs(widgets);
     }
 
     fn close_tab(&mut self, key: TabKey, widgets: &Widgets) {
@@ -2090,6 +2192,7 @@ impl App {
             return;
         };
         close_page(&widgets.notebook, &tab.page);
+        self.save_tabs(widgets);
         // A session still starting is closed when its id arrives. Closing
         // a file panel's session stops its transfers too.
         if let Some(session::State::Running(session)) = tab.panel.session() {
@@ -2485,7 +2588,7 @@ impl App {
         let open = (self.tabs.values())
             .filter(|tab| match &tab.panel {
                 Panel::Shell(remote) => matches!(remote.state, session::State::Running(_)),
-                Panel::Terminal => true,
+                Panel::Terminal { .. } => true,
                 _ => false,
             })
             .count();
@@ -2974,6 +3077,10 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
     notebook.set_scrollable(true);
     // Typing goes straight to a terminal when its tab is chosen. The new
     // page isn't shown yet during the signal, so focus it just after.
+    notebook.connect_page_reordered({
+        let sender = sender.clone();
+        move |_, _, _| sender.input(AppMsg::TabsMoved)
+    });
     notebook.connect_switch_page(|_, page, _| {
         if let Some(terminal) = terminal::in_page(page) {
             glib::idle_add_local_once(move || {
@@ -3146,7 +3253,11 @@ fn add_shortcuts(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>)
     window.add_controller(controller);
 }
 
-fn show_settings(window: &gtk::ApplicationWindow, current: Theme, sender: &ComponentSender<App>) {
+fn show_settings(
+    window: &gtk::ApplicationWindow,
+    current: &UiSettings,
+    sender: &ComponentSender<App>,
+) {
     let dialog = gtk::Window::builder()
         .title("Settings")
         .modal(true)
@@ -3162,13 +3273,17 @@ fn show_settings(window: &gtk::ApplicationWindow, current: Theme, sender: &Compo
         .margin_start(18)
         .margin_end(18)
         .build();
+    let row_label = |text: &str| {
+        let label = gtk::Label::new(Some(text));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label
+    };
 
-    let label = gtk::Label::new(Some("Theme"));
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
     let names: Vec<&str> = Theme::ALL.iter().map(|t| t.label()).collect();
     let theme = gtk::DropDown::from_strings(&names);
-    theme.set_selected(Theme::ALL.iter().position(|&t| t == current).unwrap_or(0) as u32);
+    let selected = Theme::ALL.iter().position(|&t| t == current.theme);
+    theme.set_selected(selected.unwrap_or(0) as u32);
     theme.connect_selected_notify({
         let sender = sender.clone();
         move |dropdown| {
@@ -3177,8 +3292,67 @@ fn show_settings(window: &gtk::ApplicationWindow, current: Theme, sender: &Compo
             }
         }
     });
-    grid.attach(&label, 0, 0, 1, 1);
+    grid.attach(&row_label("Theme"), 0, 0, 1, 1);
     grid.attach(&theme, 1, 0, 1, 1);
+
+    // Only fixed-width fonts, since the terminal grid needs one. The list
+    // holds faces when a face can be chosen, and families otherwise.
+    let fonts = gtk::FontDialog::new();
+    fonts.set_title("Terminal font");
+    fonts.set_filter(Some(&gtk::CustomFilter::new(|item| {
+        let family = match item.downcast_ref::<gtk::pango::FontFace>() {
+            Some(face) => face.family(),
+            None => match item.downcast_ref::<gtk::pango::FontFamily>() {
+                Some(family) => family.clone(),
+                None => return false,
+            },
+        };
+        family.is_monospace()
+    })));
+    let font = gtk::FontDialogButton::new(Some(fonts));
+    font.set_level(gtk::FontLevel::Font);
+    // What the button shows for the system's font.
+    const SYSTEM_FONT: &str = "Monospace 11";
+    let initial = current.terminal_font.as_deref().unwrap_or(SYSTEM_FONT);
+    font.set_font_desc(&gtk::pango::FontDescription::from_string(initial));
+    let reset = gtk::Button::from_icon_name("edit-undo-symbolic");
+    reset.set_tooltip_text(Some("Use the system's monospace font"));
+    reset.set_sensitive(current.terminal_font.is_some());
+    let chosen = font.connect_font_desc_notify({
+        let (sender, reset) = (sender.clone(), reset.clone());
+        move |button| {
+            if let Some(desc) = button.font_desc() {
+                reset.set_sensitive(true);
+                sender.input(AppMsg::SetTerminalFont(Some(desc.to_string())));
+            }
+        }
+    });
+    reset.connect_clicked({
+        let (sender, font) = (sender.clone(), font.clone());
+        move |reset| {
+            reset.set_sensitive(false);
+            // Showing the system's font is not choosing it.
+            font.block_signal(&chosen);
+            font.set_font_desc(&gtk::pango::FontDescription::from_string(SYSTEM_FONT));
+            font.unblock_signal(&chosen);
+            sender.input(AppMsg::SetTerminalFont(None));
+        }
+    });
+    let font_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    font_row.append(&font);
+    font_row.append(&reset);
+    grid.attach(&row_label("Terminal font"), 0, 1, 1, 1);
+    grid.attach(&font_row, 1, 1, 1, 1);
+
+    let hint = gtk::Label::new(Some(
+        "Ctrl+= and Ctrl+- change the size in one terminal, and Ctrl+0 resets it.",
+    ));
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+    hint.set_max_width_chars(40);
+    hint.add_css_class("dim-label");
+    grid.attach(&hint, 0, 2, 2, 1);
+
     dialog.set_child(Some(&grid));
     dialogs::close_on_escape(&dialog);
     dialog.present();
