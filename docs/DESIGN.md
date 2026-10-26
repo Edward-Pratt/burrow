@@ -134,7 +134,7 @@ Built-in features use the same addon API as third-party ones.
 3. PostgreSQL client
 4. SFTP file panel
 5. SSH tunnels
-6. Later: systemd, Docker/Podman, PM2, monitoring, MCP bridge, RDP
+6. Since built into the core rather than as addons: systemd, Docker/Podman and PM2 (in the agent), monitoring, the MCP bridge and VNC. Later: RDP
 
 ## Milestones
 
