@@ -305,6 +305,7 @@ impl AppMsg {
                 | AppMsg::Invoke { .. }
                 | AppMsg::ClearErrors
                 | AppMsg::CloseRequested
+                | AppMsg::TabsMoved
                 | AppMsg::ManageAddons
                 | AppMsg::ReviewAddon(_)
                 | AppMsg::RevokeAddon(_)
@@ -3294,12 +3295,19 @@ fn show_settings(
     grid.attach(&row_label("Theme"), 0, 0, 1, 1);
     grid.attach(&theme, 1, 0, 1, 1);
 
-    // Only fixed-width fonts, since the terminal grid needs one.
+    // Only fixed-width fonts, since the terminal grid needs one. The list
+    // holds faces when a face can be chosen, and families otherwise.
     let fonts = gtk::FontDialog::new();
     fonts.set_title("Terminal font");
     fonts.set_filter(Some(&gtk::CustomFilter::new(|item| {
-        item.downcast_ref::<gtk::pango::FontFamily>()
-            .is_some_and(|family| family.is_monospace())
+        let family = match item.downcast_ref::<gtk::pango::FontFace>() {
+            Some(face) => face.family(),
+            None => match item.downcast_ref::<gtk::pango::FontFamily>() {
+                Some(family) => family.clone(),
+                None => return false,
+            },
+        };
+        family.is_monospace()
     })));
     let font = gtk::FontDialogButton::new(Some(fonts));
     font.set_level(gtk::FontLevel::Font);
