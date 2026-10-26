@@ -272,10 +272,24 @@ fn add_links(terminal: &vte4::Terminal) {
 /// Burrow doesn't trust, and OSC 8 can link any URI, such as a `file:` path
 /// or another program's own scheme, so only web and mail links open.
 fn openable(uri: &str) -> bool {
-    let scheme = uri
-        .split_once(':')
-        .map(|(scheme, _)| scheme.to_ascii_lowercase());
-    matches!(scheme.as_deref(), Some("http" | "https" | "mailto"))
+    let Some((scheme, rest)) = uri.split_once(':') else {
+        return false;
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" | "https" => true,
+        // Some mail programs take `attach=/path` and attach a local file,
+        // so only the fields that fill in a message are allowed. A name
+        // they would decode, such as `att%61ch`, isn't one of them.
+        "mailto" => rest.split_once('?').is_none_or(|(_, query)| {
+            query.split('&').all(|field| {
+                let name = field.split_once('=').map_or(field, |(name, _)| name);
+                ["to", "cc", "bcc", "subject", "body"]
+                    .iter()
+                    .any(|allowed| name.eq_ignore_ascii_case(allowed))
+            })
+        }),
+        _ => false,
+    }
 }
 
 /// The tab page around a terminal: a find bar, then the terminal with a
@@ -484,6 +498,16 @@ mod tests {
         assert!(openable("https://example.com/a?b=c"));
         assert!(openable("HTTP://example.com"));
         assert!(openable("mailto:someone@example.com"));
+        assert!(openable(
+            "mailto:a@example.com?subject=Hi&Body=text&cc=b@example.com"
+        ));
+        assert!(!openable(
+            "mailto:a@example.com?attach=/home/me/.ssh/id_ed25519"
+        ));
+        assert!(!openable(
+            "mailto:a@example.com?subject=x&ATTACHMENT=file:///etc/passwd"
+        ));
+        assert!(!openable("mailto:a@example.com?att%61ch=/etc/passwd"));
         assert!(!openable("file:///etc/passwd"));
         assert!(!openable("javascript:alert(1)"));
         assert!(!openable("ssh://host"));
