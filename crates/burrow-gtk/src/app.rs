@@ -40,6 +40,7 @@ use crate::settings::{Theme, UiSettings};
 use crate::sidebar;
 use crate::terminal;
 use crate::tunnels;
+use crate::update;
 
 pub struct Init {
     pub core: Client,
@@ -297,6 +298,10 @@ pub enum AppMsg {
     ShowPalette,
     ToggleSidebar,
     ShowSettings,
+    CheckForUpdates,
+    /// Closes the window the usual way, then starts this program, the
+    /// updated window, in its place.
+    Restart(PathBuf),
     SetTheme(Theme),
     /// `None` goes back to the system's monospace font.
     SetTerminalFont(Option<String>),
@@ -354,6 +359,8 @@ impl AppMsg {
                 | AppMsg::ShowPalette
                 | AppMsg::ToggleSidebar
                 | AppMsg::ShowSettings
+                | AppMsg::CheckForUpdates
+                | AppMsg::Restart(_)
                 | AppMsg::SetTheme(_)
                 | AppMsg::SetTerminalFont(_)
                 | AppMsg::ReloadConfig
@@ -1017,7 +1024,7 @@ impl Component for App {
             AppMsg::CloseRequested => {
                 // Where the shells are now, which no other save sees.
                 self.save_tabs(widgets);
-                self.close_window(window);
+                self.close_window(window, None);
             }
             AppMsg::TabsMoved => self.save_tabs(widgets),
             AppMsg::Control {
@@ -1143,6 +1150,16 @@ impl Component for App {
                 self.save_settings();
             }
             AppMsg::ShowSettings => show_settings(window, &self.settings, &sender),
+            AppMsg::CheckForUpdates => {
+                let sender = sender.clone();
+                update::show(window, move |program| {
+                    sender.input(AppMsg::Restart(program))
+                });
+            }
+            AppMsg::Restart(program) => {
+                self.save_tabs(widgets);
+                self.close_window(window, Some(program));
+            }
             AppMsg::SetTheme(theme) => {
                 self.settings.theme = theme;
                 self.apply_theme();
@@ -2388,8 +2405,12 @@ impl App {
                 move |title| sender.input(AppMsg::TerminalTitle { id, title })
             },
             {
-                let sender = sender.clone();
-                move || sender.input(AppMsg::TerminalExited(id))
+                // Closing the window ends the shell after the app has
+                // stopped taking messages, which `input` panics on.
+                let input = sender.input_sender().clone();
+                move || {
+                    let _ = input.send(AppMsg::TerminalExited(id));
+                }
             },
         );
         terminal::set_font(&term, self.settings.terminal_font.as_deref());
@@ -2779,6 +2800,7 @@ impl App {
             command("Open config folder", AppMsg::OpenConfigFolder),
             command("Manage addons…", AppMsg::ManageAddons),
             command("Settings…", AppMsg::ShowSettings),
+            command("Check for updates…", AppMsg::CheckForUpdates),
         ]);
         for addon in self.addons.iter().filter(|a| addons::usable(a)) {
             items.extend(addon.commands.iter().map(|c| Item {
@@ -2845,7 +2867,15 @@ impl App {
     /// Closes the window, first asking when that would end terminals: local
     /// shells end with the window, and burrowd closes this client's SSH
     /// sessions when it goes.
-    fn close_window(&self, window: &gtk::ApplicationWindow) {
+    /// Closes the window, asking first if terminals would end. `restart`
+    /// is started in its place once it has closed.
+    fn close_window(&self, window: &gtk::ApplicationWindow, restart: Option<PathBuf>) {
+        let close = move |window: &gtk::ApplicationWindow| {
+            if let Some(program) = restart {
+                update::restart_into(program);
+            }
+            window.destroy();
+        };
         let open = (self.tabs.values())
             .filter(|tab| match &tab.panel {
                 Panel::Shell(remote) => matches!(remote.state, session::State::Running(_)),
@@ -2854,8 +2884,7 @@ impl App {
             })
             .count();
         if open == 0 {
-            window.destroy();
-            return;
+            return close(window);
         }
         let detail = if open == 1 {
             "A terminal is open. Closing Burrow ends it.".to_string()
@@ -2864,7 +2893,7 @@ impl App {
         };
         let target = window.clone();
         dialogs::confirm(window, "Close Burrow?", &detail, "Close", move || {
-            target.destroy()
+            close(&target)
         });
     }
 
@@ -3324,6 +3353,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
             ("Open config folder", AppMsg::OpenConfigFolder),
             ("Addons…", AppMsg::ManageAddons),
             ("Settings…    Ctrl+,", AppMsg::ShowSettings),
+            ("Check for updates…", AppMsg::CheckForUpdates),
         ],
         sender,
     )));

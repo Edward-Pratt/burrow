@@ -25,19 +25,21 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Addons run as separate processes and m
 
 ## Trying it
 
-Install it with one command. It builds Burrow from source and installs it for you only, in `~/.local`, with a start-menu entry and the server agent for x86_64 and aarch64 servers:
+Install it with one command. It downloads the newest build of main and installs it for you only, in `~/.local`, with a start-menu entry and the server agent for x86_64 and aarch64 servers. Nothing is compiled:
 
 ```sh
-git clone https://github.com/Edward-Pratt/burrow && burrow/dist/install.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Edward-Pratt/burrow/main/dist/install.sh)
 ```
 
-On Arch and distros built on it, the script first installs what the build needs with pacman, asking for your password once: GTK 4.20 or newer, VTE 4, GtkSourceView 5, OpenSSH, a compiler, and Rust with its musl targets. With rustup it uses rustup instead, and sets it up if it has no toolchain yet. Elsewhere, install those yourself first (Rust 1.93 or newer, best with [rustup](https://rustup.rs)). It ends with `burrow doctor`, which says what is still missing at run time, such as a Secret Service (a keyring daemon such as gnome-keyring, KWallet or KeePassXC).
+The builds are made on the newest Arch Linux, so they run on an Arch that is kept up to date (`sudo pacman -Syu`). On Arch and distros built on it, the script first installs what Burrow needs with pacman, asking for your password once: GTK 4.20 or newer, VTE 4, GtkSourceView 5 and OpenSSH. It ends with `burrow doctor`, which says what is still missing at run time, such as a Secret Service (a keyring daemon such as gnome-keyring, KWallet or KeePassXC).
 
-It then keeps Burrow up to date by itself. Once a day a systemd user timer fetches main, and when it has moved, builds and installs it in the background, then says so in a desktop notification. Restart Burrow to use the new build.
+To update, choose **Check for updates…** in the window's menu, then **Update** and **Restart**. Once a day a systemd user timer checks too, and says in a desktop notification when an update is ready. From a terminal, `burrow-update` updates and `burrow-update --check` only checks. An update that wouldn't run on this system, because a library is missing or too old, isn't installed, and the old one stays.
 
-The script keeps its own clone in `~/.local/share/burrow/src`. Run `burrow-update` to update now, `burrow-update --branch NAME` to follow another branch, and `journalctl --user -u burrow-update` to see how the last update went. It builds and installs whatever lands on the branch without asking, so anyone who can push there can run code on your computer. To remove it, run `systemctl --user disable --now burrow-update.timer`, then delete `~/.local/bin/{burrow,burrowd,burrow-gtk,burrow-update}`, `~/.local/lib/burrow`, `~/.local/share/burrow/src`, `~/.local/share/icons/hicolor/scalable/apps/dev.burrow.Burrow.svg` and the `burrow*` units in `~/.local/share/systemd/user`.
+Elsewhere, or to try a branch, build from source instead: `burrow-update --branch NAME` (or `dist/install.sh --branch main` from a clone) keeps a clone in `~/.local/share/burrow/src` and builds that branch on each update, which takes a few minutes. It needs Rust 1.93 or newer (best with [rustup](https://rustup.rs)) and the libraries above. `burrow-update --release` goes back to the builds of main.
 
-To install it system-wide with pacman instead, without updates by itself, use the package in `dist/`: `cd burrow/dist && makepkg -si`. It packages the server agent for each musl target you have (`rust-musl` and `rust-aarch64-musl`, or `rustup target add`).
+Either way it installs whatever lands on main, or on the branch it follows, so anyone who can push there can run code on your computer. Run `journalctl --user -u burrow-update` to see the last check. To remove it, run `systemctl --user disable --now burrow-update.timer`, then delete `~/.local/bin/{burrow,burrowd,burrow-gtk,burrow-update}`, `~/.local/lib/burrow`, `~/.local/share/burrow`, `~/.local/share/applications/dev.burrow.Burrow.desktop`, `~/.local/share/icons/hicolor/scalable/apps/dev.burrow.Burrow.svg` and the `burrow*` units in `~/.local/share/systemd/user`.
+
+To install it system-wide with pacman instead, without the update button, use the package in `dist/`: `cd burrow/dist && makepkg -si`. It packages the server agent for each musl target you have (`rust-musl` and `rust-aarch64-musl`, or `rustup target add`).
 
 For development, build it from the checkout. If a library is missing, `cargo build` names it.
 

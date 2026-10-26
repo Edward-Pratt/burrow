@@ -1,5 +1,5 @@
 [Unit]
-Description=Update Burrow from source every day
+Description=Check for a Burrow update every day
 
 [Timer]
 OnCalendar=daily

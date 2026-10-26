@@ -40,7 +40,7 @@ jobs:
           # quietly skip, so the checks run as a normal user.
           useradd --create-home builder
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Rust
         run: |
@@ -48,7 +48,7 @@ jobs:
           su builder -c 'rustup default stable && rustup component add rustfmt clippy'
 
       # After the toolchain, since its version is part of the key.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.check }}
           cache-on-failure: true
@@ -75,3 +75,61 @@ jobs:
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             su builder -c "cargo build -p burrow-agent --profile agent --target $target"
           done
+
+  # Each green push to main becomes the build that `burrow-update`
+  # downloads, so nobody compiles Burrow to install or update it. It
+  # replaces the files of one release, build-main, whose tag follows main.
+  # Built on the newest Arch, so it runs on an Arch kept up to date.
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install system packages
+        run: pacman -Syu --noconfirm --needed base-devel git rustup gtk4 vte4 gtksourceview5 github-cli
+
+      # The write token stays out of the checkout, and so out of reach of
+      # the build; only the Publish step gets it.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # No build cache: a cache is shared with other runs, and what users
+      # install should come only from this commit.
+      - name: Set up Rust
+        run: |
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      # The same build and layout as `burrow-update --branch`, from the
+      # script itself.
+      - name: Build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          dist/install.sh --stage out/burrow
+          tar -czf burrow-x86_64.tar.gz -C out burrow
+          sha256sum burrow-x86_64.tar.gz >SHA256SUMS
+          cp out/burrow/commit commit
+
+      # One file at a time, in the reverse of the order the script reads
+      # them, so `commit` names a new build only once its files are there.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Through the API, since the checkout keeps no credentials.
+          if gh release view build-main >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/build-main" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh release create build-main --target "$GITHUB_SHA" \
+              --title "Latest build of main" --notes "" --latest
+          fi
+          for file in burrow-x86_64.tar.gz SHA256SUMS commit; do
+            gh release upload build-main "$file" --clobber
+          done
+          gh release edit build-main --notes "Built from $GITHUB_SHA. Install it with dist/install.sh, which also keeps it up to date."
