@@ -153,14 +153,14 @@ pub enum AppMsg {
         title: String,
     },
     TerminalExited(u32),
-    /// The core accepted `open_terminal` for an SSH host tab.
+    /// The core accepted `open_terminal` for an SSH shell tab.
     SessionStarted {
-        node: NodeId,
+        tab: TabKey,
         session: SessionId,
     },
     /// `open_terminal` itself failed.
     SessionFailed {
-        node: NodeId,
+        tab: TabKey,
         error: String,
     },
     SessionOutput {
@@ -170,21 +170,23 @@ pub enum AppMsg {
     SessionOutputEnded {
         session: SessionId,
     },
-    /// Typed into an SSH host tab.
+    /// Typed into an SSH shell tab.
     RemoteInput {
-        node: NodeId,
+        tab: TabKey,
         data: Vec<u8>,
     },
     RemoteResize {
-        node: NodeId,
+        tab: TabKey,
         cols: u16,
         rows: u16,
     },
     /// The title the shell on an SSH host set, as it arrived.
     RemoteTitle {
-        node: NodeId,
+        tab: TabKey,
         title: String,
     },
+    /// Opens another shell on an SSH host.
+    NewShell(NodeId),
     /// Opens an SSH host's file panel.
     OpenFiles(NodeId),
     /// Opens an SSH host's monitor.
@@ -284,6 +286,7 @@ impl AppMsg {
                 | AppMsg::CloseCurrentTab
                 | AppMsg::SwitchTab(_)
                 | AppMsg::NewTerminal(_)
+                | AppMsg::NewShell(_)
                 | AppMsg::OpenFiles(_)
                 | AppMsg::OpenMonitor(_)
                 | AppMsg::StartTunnel(_)
@@ -311,11 +314,16 @@ impl AppMsg {
 }
 
 /// What a tab shows. Node tabs follow their node; terminal tabs belong to
-/// no node and are numbered as they open.
+/// no node. Shells and terminals are numbered as they open, and numbers
+/// are never reused, so a late reply for a closed tab can't reach a new
+/// one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TabKey {
+    /// A node's own tab. SSH hosts have shells instead.
     Node(NodeId),
-    /// An SSH host's file panel. The host's own tab is its terminal.
+    /// A shell on an SSH host. A host can have several.
+    Shell(NodeId, u32),
+    /// An SSH host's file panel.
     Files(NodeId),
     /// An SSH host's monitor.
     Monitor(NodeId),
@@ -325,7 +333,9 @@ pub enum TabKey {
 impl TabKey {
     fn node(self) -> Option<NodeId> {
         match self {
-            TabKey::Node(id) | TabKey::Files(id) | TabKey::Monitor(id) => Some(id),
+            TabKey::Node(id) | TabKey::Shell(id, _) | TabKey::Files(id) | TabKey::Monitor(id) => {
+                Some(id)
+            }
             TabKey::Terminal(_) => None,
         }
     }
@@ -387,7 +397,8 @@ pub struct App {
     notice: Option<String>,
     notice_id: u32,
     tabs: HashMap<TabKey, Tab>,
-    next_terminal: u32,
+    /// The number the next shell or terminal tab gets.
+    next_tab: u32,
     unclaimed: Unclaimed,
     /// Whether a `list_sessions` to place an unknown session's prompt is
     /// on its way.
@@ -501,7 +512,7 @@ impl Component for App {
             notice: None,
             notice_id: 0,
             tabs: HashMap::new(),
-            next_terminal: 1,
+            next_tab: 1,
             unclaimed: Unclaimed::default(),
             looking_up: false,
             tunnels: HashMap::new(),
@@ -628,8 +639,8 @@ impl Component for App {
                 }
             }
             AppMsg::TerminalExited(id) => self.close_tab(TabKey::Terminal(id), widgets),
-            AppMsg::SessionStarted { node, session } => {
-                match self.tabs.get_mut(&TabKey::Node(node)) {
+            AppMsg::SessionStarted { tab, session } => {
+                match self.tabs.get_mut(&tab) {
                     Some(Tab {
                         panel: Panel::Shell(remote),
                         ..
@@ -654,8 +665,8 @@ impl Component for App {
                     _ => execute(&self.core, &sender, Command::CloseSession { session }),
                 }
             }
-            AppMsg::SessionFailed { node, error } => {
-                if let Some(remote) = self.shell(TabKey::Node(node)) {
+            AppMsg::SessionFailed { tab, error } => {
+                if let Some(remote) = self.shell(tab) {
                     remote.terminal.feed(remote::failure(&error).as_bytes());
                     remote.state = session::State::Closed;
                 }
@@ -671,11 +682,14 @@ impl Component for App {
                     remote.finish_if_done();
                 }
             }
-            AppMsg::RemoteInput { node, data } => {
-                let Some(Tab {
-                    panel: Panel::Shell(remote),
-                    ..
-                }) = self.tabs.get_mut(&TabKey::Node(node))
+            AppMsg::RemoteInput { tab, data } => {
+                let (
+                    Some(node),
+                    Some(Tab {
+                        panel: Panel::Shell(remote),
+                        ..
+                    }),
+                ) = (tab.node(), self.tabs.get_mut(&tab))
                 else {
                     return;
                 };
@@ -688,13 +702,13 @@ impl Component for App {
                     session::State::Closed if data.contains(&b'\r') => {
                         remote.terminal.feed(b"\r\n");
                         remote.state = session::State::Starting;
-                        remote::start(&self.core, node, &remote.terminal, &sender);
+                        remote::start(&self.core, tab, node, &remote.terminal, &sender);
                     }
                     _ => {}
                 }
             }
-            AppMsg::RemoteResize { node, cols, rows } => {
-                let panel = self.tabs.get(&TabKey::Node(node)).map(|t| &t.panel);
+            AppMsg::RemoteResize { tab, cols, rows } => {
+                let panel = self.tabs.get(&tab).map(|t| &t.panel);
                 if let Some(Panel::Shell(Remote {
                     state: session::State::Running(session),
                     ..
@@ -708,13 +722,14 @@ impl Component for App {
                     execute(&self.core, &sender, command);
                 }
             }
-            AppMsg::RemoteTitle { node, title } => {
-                if let Some(remote) = self.shell(TabKey::Node(node)) {
+            AppMsg::RemoteTitle { tab, title } => {
+                if let Some(remote) = self.shell(tab) {
                     // The server sets it.
                     remote.title = Some(files::printable(&title));
-                    self.set_remote_tooltip(node);
+                    self.set_remote_tooltip(tab);
                 }
             }
+            AppMsg::NewShell(id) => self.new_shell(id, widgets, &sender),
             AppMsg::OpenFiles(id) => self.open_files(id, widgets, &sender),
             AppMsg::Files {
                 node,
@@ -1118,9 +1133,10 @@ impl App {
             Event::NodeUpdated { node } => {
                 let id = node.id;
                 for (key, tab) in self.tabs.iter().filter(|(key, _)| key.node() == Some(id)) {
-                    let title = match key {
-                        TabKey::Files(_) => files_title(&node.name),
-                        TabKey::Monitor(_) => monitor_title(&node.name),
+                    let title = match (key, &tab.panel) {
+                        (TabKey::Files(_), _) => files_title(&node.name),
+                        (TabKey::Monitor(_), _) => monitor_title(&node.name),
+                        (_, Panel::Shell(remote)) => shell_title(&node.name, remote.number),
                         _ => node.name.clone(),
                     };
                     set_tab_title(&tab.title, &title);
@@ -1140,8 +1156,14 @@ impl App {
                 }
                 widgets.sidebar.update(&node, &self.icons());
                 self.nodes.insert(id, node);
-                // Setting the tab's title replaced its tooltip.
-                self.set_remote_tooltip(id);
+                // Setting a shell's title replaced its tooltip.
+                let shells: Vec<TabKey> = (self.tabs.keys())
+                    .filter(|key| matches!(key, TabKey::Shell(node, _) if *node == id))
+                    .copied()
+                    .collect();
+                for key in shells {
+                    self.set_remote_tooltip(key);
+                }
                 // Tunnel pages name the host they go through.
                 self.refresh_tunnels(sender);
                 // The addon draws from the node, so ask it again.
@@ -1377,18 +1399,17 @@ impl App {
         }
     }
 
-    /// An SSH host tab's tooltip: the host, and the title its shell set, as
-    /// a local terminal's tab shows its shell's.
-    fn set_remote_tooltip(&self, id: NodeId) {
-        let (Some(tab), Some(node)) = (self.tabs.get(&TabKey::Node(id)), self.nodes.get(&id))
-        else {
+    /// An SSH shell tab's tooltip: its title, and the title the shell set,
+    /// as a local terminal's tab shows its shell's.
+    fn set_remote_tooltip(&self, key: TabKey) {
+        let Some(tab) = self.tabs.get(&key) else {
             return;
         };
         if let Panel::Shell(Remote {
             title: Some(title), ..
         }) = &tab.panel
         {
-            let tooltip = format!("{}\n{title}", node.name);
+            let tooltip = format!("{}\n{title}", tab.title.label());
             tab.title.set_tooltip_text(Some(&tooltip));
         }
     }
@@ -1743,45 +1764,27 @@ impl App {
 
     fn open_tab_now(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
         let key = TabKey::Node(id);
-        if let Some(tab) = self.tabs.get(&key) {
-            if let Some(index) = widgets.notebook.page_num(&tab.page) {
-                widgets.notebook.set_current_page(Some(index));
-            }
+        if self.show_tab(key, widgets) {
             return;
         }
         let Some(node) = self.nodes.get(&id) else {
             return;
         };
-        let icon = sidebar::icon_name(node, false, &self.icons()).to_string();
-        let (icon, name) = (icon.as_str(), node.name.clone());
         if node.kind == SSH_HOST_KIND {
-            let term = terminal::remote(
-                {
-                    let sender = sender.clone();
-                    move |title| sender.input(AppMsg::RemoteTitle { node: id, title })
-                },
-                {
-                    let sender = sender.clone();
-                    move |data| sender.input(AppMsg::RemoteInput { node: id, data })
-                },
-                {
-                    let sender = sender.clone();
-                    move |cols, rows| {
-                        sender.input(AppMsg::RemoteResize {
-                            node: id,
-                            cols,
-                            rows,
-                        })
-                    }
-                },
-            );
-            let page = terminal::page(&term);
-            remote::start(&self.core, id, &term, sender);
-            term.grab_focus();
-            let panel = Panel::Shell(Remote::new(term));
-            self.add_tab(key, page.upcast(), panel, icon, &name, widgets, sender);
+            // The shell opened first.
+            let shell = (self.tabs.keys())
+                .filter_map(|key| match key {
+                    TabKey::Shell(node, n) if *node == id => Some(*n),
+                    _ => None,
+                })
+                .min();
+            if !shell.is_some_and(|n| self.show_tab(TabKey::Shell(id, n), widgets)) {
+                self.new_shell(id, widgets, sender);
+            }
             return;
         }
+        let icon = sidebar::icon_name(node, false, &self.icons()).to_string();
+        let (icon, name) = (icon.as_str(), node.name.clone());
         if node.kind == POSTGRES_KIND {
             let panel = Database::new(id, sender);
             let page = panel.page.clone().upcast();
@@ -1816,12 +1819,63 @@ impl App {
         self.add_tab(key, page.upcast(), panel, icon, &name, widgets, sender);
     }
 
+    /// Switches to the tab `key`. Returns whether it is open.
+    fn show_tab(&self, key: TabKey, widgets: &Widgets) -> bool {
+        let Some(tab) = self.tabs.get(&key) else {
+            return false;
+        };
+        if let Some(index) = widgets.notebook.page_num(&tab.page) {
+            widgets.notebook.set_current_page(Some(index));
+        }
+        true
+    }
+
+    /// Opens a new shell on the SSH host `id`.
+    fn new_shell(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
+        let Some(node) = self.nodes.get(&id).filter(|n| n.kind == SSH_HOST_KIND) else {
+            return;
+        };
+        let tab = TabKey::Shell(id, self.next_tab);
+        self.next_tab += 1;
+        // The lowest number not shown on another of the host's shells.
+        let taken: HashSet<u32> = (self.tabs.iter())
+            .filter_map(|(key, t)| match (key, &t.panel) {
+                (TabKey::Shell(node, _), Panel::Shell(remote)) if *node == id => {
+                    Some(remote.number)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut number = 1;
+        while taken.contains(&number) {
+            number += 1;
+        }
+        let term = terminal::remote(
+            {
+                let sender = sender.clone();
+                move |title| sender.input(AppMsg::RemoteTitle { tab, title })
+            },
+            {
+                let sender = sender.clone();
+                move |data| sender.input(AppMsg::RemoteInput { tab, data })
+            },
+            {
+                let sender = sender.clone();
+                move |cols, rows| sender.input(AppMsg::RemoteResize { tab, cols, rows })
+            },
+        );
+        let page = terminal::page(&term);
+        remote::start(&self.core, tab, id, &term, sender);
+        term.grab_focus();
+        let icon = sidebar::icon_name(node, false, &self.icons()).to_string();
+        let title = shell_title(&node.name, number);
+        let panel = Panel::Shell(Remote::new(term, number));
+        self.add_tab(tab, page.upcast(), panel, &icon, &title, widgets, sender);
+    }
+
     fn open_files(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
         let key = TabKey::Files(id);
-        if let Some(tab) = self.tabs.get(&key) {
-            if let Some(index) = widgets.notebook.page_num(&tab.page) {
-                widgets.notebook.set_current_page(Some(index));
-            }
+        if self.show_tab(key, widgets) {
             return;
         }
         let Some(node) = self.nodes.get(&id).filter(|n| n.kind == SSH_HOST_KIND) else {
@@ -1837,10 +1891,7 @@ impl App {
 
     fn open_monitor(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
         let key = TabKey::Monitor(id);
-        if let Some(tab) = self.tabs.get(&key) {
-            if let Some(index) = widgets.notebook.page_num(&tab.page) {
-                widgets.notebook.set_current_page(Some(index));
-            }
+        if self.show_tab(key, widgets) {
             return;
         }
         let Some(node) = self.nodes.get(&id).filter(|n| n.kind == SSH_HOST_KIND) else {
@@ -1938,8 +1989,8 @@ impl App {
         widgets: &Widgets,
         sender: &ComponentSender<Self>,
     ) {
-        let id = self.next_terminal;
-        self.next_terminal += 1;
+        let id = self.next_tab;
+        self.next_tab += 1;
         let shell = shell.unwrap_or_else(terminal::default_shell);
         let term = terminal::new(
             &shell,
@@ -2178,6 +2229,7 @@ impl App {
             Some(node) => {
                 entries.push(("Open".into(), AppMsg::Open(node.id)));
                 if node.kind == SSH_HOST_KIND {
+                    entries.push(("New shell".into(), AppMsg::NewShell(node.id)));
                     entries.push(("Browse files".into(), AppMsg::OpenFiles(node.id)));
                     entries.push(("Monitor".into(), AppMsg::OpenMonitor(node.id)));
                 }
@@ -2365,6 +2417,11 @@ impl App {
                 .flat_map(|node| {
                     let subtitle = sidebar::location(&self.nodes, node);
                     [
+                        Item {
+                            title: format!("New shell: {}", node.name),
+                            subtitle: subtitle.clone(),
+                            message: AppMsg::NewShell(node.id),
+                        },
                         Item {
                             title: format!("Browse files: {}", node.name),
                             subtitle: subtitle.clone(),
@@ -2737,11 +2794,22 @@ fn shown(nodes: &HashMap<NodeId, Node>, props: &toml::Table) -> Option<TunnelSho
     })
 }
 
-/// The title of an SSH host's file panel tab.
+/// The title of an SSH host's shell tab: the host for the first, and a
+/// number for the rest.
+fn shell_title(host: &str, number: u32) -> String {
+    if number == 1 {
+        host.to_string()
+    } else {
+        format!("{host} ({number})")
+    }
+}
+
+/// The title of an SSH host's monitor tab.
 fn monitor_title(host: &str) -> String {
     format!("{host} monitor")
 }
 
+/// The title of an SSH host's file panel tab.
 fn files_title(host: &str) -> String {
     format!("{host} files")
 }
@@ -3097,6 +3165,12 @@ mod tests {
             session: SessionId(7),
         };
         assert_eq!(command_name(&close), "close_session");
+    }
+
+    #[test]
+    fn shells_after_the_first_are_numbered() {
+        assert_eq!(shell_title("web", 1), "web");
+        assert_eq!(shell_title("web", 2), "web (2)");
     }
 
     #[test]

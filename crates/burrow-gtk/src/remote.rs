@@ -1,5 +1,6 @@
-//! SSH host tabs: a [`terminal::remote`] terminal showing a session the core
-//! runs. The tab outlives its sessions: when one ends, Enter starts another.
+//! SSH shell tabs: a [`terminal::remote`] terminal showing a session the
+//! core runs. A host can have several. The tab outlives its sessions: when
+//! one ends, Enter starts another.
 
 use std::collections::HashMap;
 
@@ -8,7 +9,7 @@ use burrow_core::{Command, Event, NodeId, Response, SessionId, SessionState};
 use relm4::ComponentSender;
 use vte4::TerminalExt;
 
-use crate::app::{App, AppMsg};
+use crate::app::{App, AppMsg, TabKey};
 use crate::runtime::runtime;
 use crate::session::State;
 use crate::terminal;
@@ -30,6 +31,8 @@ pub struct Remote {
     /// The title the shell on the host set, cleaned for showing, for the
     /// tab's tooltip.
     pub title: Option<String>,
+    /// Which of its host's shells this is, from 1, for the tab's title.
+    pub number: u32,
 }
 
 #[derive(Default)]
@@ -40,12 +43,13 @@ pub struct Ending {
 }
 
 impl Remote {
-    pub fn new(terminal: vte4::Terminal) -> Remote {
+    pub fn new(terminal: vte4::Terminal, number: u32) -> Remote {
         Remote {
             terminal,
             state: State::Starting,
             ending: Ending::default(),
             title: None,
+            number,
         }
     }
 
@@ -82,10 +86,12 @@ impl Unclaimed {
     }
 }
 
-/// Asks the core for a session on `node`. The reply arrives as
-/// [`AppMsg::SessionStarted`], followed by the session's output.
+/// Asks the core for a session on `node` for the shell tab `tab`. The
+/// reply arrives as [`AppMsg::SessionStarted`], followed by the session's
+/// output.
 pub fn start(
     core: &Client,
+    tab: TabKey,
     node: NodeId,
     terminal: &vte4::Terminal,
     sender: &ComponentSender<App>,
@@ -98,19 +104,16 @@ pub fn start(
             Ok(Response::Session { session }) => session,
             Ok(other) => {
                 let error = format!("unexpected reply {other:?}");
-                let _ = input.send(AppMsg::SessionFailed { node, error });
+                let _ = input.send(AppMsg::SessionFailed { tab, error });
                 return;
             }
             Err(e) => {
                 let error = e.to_string();
-                let _ = input.send(AppMsg::SessionFailed { node, error });
+                let _ = input.send(AppMsg::SessionFailed { tab, error });
                 return;
             }
         };
-        if input
-            .send(AppMsg::SessionStarted { node, session })
-            .is_err()
-        {
+        if input.send(AppMsg::SessionStarted { tab, session }).is_err() {
             return;
         }
         if let Ok(mut output) = core.take_output(session).await {
