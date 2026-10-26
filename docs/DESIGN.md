@@ -152,5 +152,5 @@ Built-in features use the same addon API as third-party ones.
 13. Terminal essentials: open tabs restored at the next start, find in a terminal, links that open with Ctrl+click, a terminal font setting and zoom
 14. Edit remote files: the file viewer saves back over SFTP, and checks the file didn't change on the server meanwhile
 15. Containers and PM2 in `burrow-agent`, shown in the monitor tab, with alerts when one stops
-16. systemd actions (start, stop, restart, enable, disable) from the monitor tab, and a unit's journal in a tab
+16. Service actions from the monitor tab: systemd units through sudo (a terminal asks for the password when sudo needs one), containers and PM2 apps, and each one's log in a tab
 17. VNC in a tab, through the core over SSH so the password stays in the core

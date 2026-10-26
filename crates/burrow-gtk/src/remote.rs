@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use burrow_core::ipc::Client;
-use burrow_core::{Command, Event, NodeId, Response, SessionId, SessionState};
+use burrow_core::{Command, Event, NodeId, Response, SessionId, SessionState, TerminalRun};
 use relm4::ComponentSender;
 use vte4::TerminalExt;
 
@@ -33,6 +33,10 @@ pub struct Remote {
     pub title: Option<String>,
     /// Which of its host's shells this is, from 1, for the tab's title.
     pub number: u32,
+    /// What runs instead of the shell, such as a service's log. It runs
+    /// again on reconnect, and the tab isn't opened again at the next
+    /// start.
+    pub run: Option<TerminalRun>,
 }
 
 #[derive(Default)]
@@ -43,13 +47,14 @@ pub struct Ending {
 }
 
 impl Remote {
-    pub fn new(terminal: vte4::Terminal, number: u32) -> Remote {
+    pub fn new(terminal: vte4::Terminal, number: u32, run: Option<TerminalRun>) -> Remote {
         Remote {
             terminal,
             state: State::Starting,
             ending: Ending::default(),
             title: None,
             number,
+            run,
         }
     }
 
@@ -88,20 +93,26 @@ impl Unclaimed {
     }
 }
 
-/// Asks the core for a session on `node` for the shell tab `tab`. The
-/// reply arrives as [`AppMsg::SessionStarted`], followed by the session's
-/// output.
+/// Asks the core for a session on `node` for the shell tab `tab`, running
+/// `run` or a shell. The reply arrives as [`AppMsg::SessionStarted`],
+/// followed by the session's output.
 pub fn start(
     core: &Client,
     tab: TabKey,
     node: NodeId,
     terminal: &vte4::Terminal,
+    run: Option<TerminalRun>,
     sender: &ComponentSender<App>,
 ) {
     let (cols, rows) = terminal::size(terminal);
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
-        let command = Command::OpenTerminal { node, cols, rows };
+        let command = Command::OpenTerminal {
+            node,
+            cols,
+            rows,
+            run,
+        };
         let session = match core.execute(command).await {
             Ok(Response::Session { session }) => session,
             Ok(other) => {

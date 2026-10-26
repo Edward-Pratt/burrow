@@ -366,6 +366,7 @@ async fn ssh(client: &Client, node: &str) -> Result<ExitCode> {
         node: node.id,
         cols,
         rows,
+        run: None,
     };
     let session = session(client, command).await?;
     let mut output = client.take_output(session).await?;

@@ -127,7 +127,10 @@ impl Command {
             Command::Download { .. } | Command::Upload { .. } | Command::CancelTransfer { .. } => {
                 base
             }
-            Command::Exec { node, .. } => mcp(McpRule::Node(*node, Exec)),
+            // No more than `exec` could run.
+            Command::Exec { node, .. } | Command::ControlService { node, .. } => {
+                mcp(McpRule::Node(*node, Exec))
+            }
 
             Command::OpenMonitor { node } => opens(McpRule::Monitor(*node)),
             Command::MonitorHistory { session } => mcp(McpRule::Session(*session, MonitorRead)),

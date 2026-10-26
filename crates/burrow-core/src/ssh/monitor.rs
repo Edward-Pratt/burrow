@@ -482,6 +482,7 @@ fn clean_apps(mut apps: Apps) -> Apps {
     }
     if let Some(pm2) = &mut apps.pm2 {
         pm2.apps.truncate(MAX_UNITS);
+        clean_text(&mut pm2.path);
         if let Some(error) = &mut pm2.error {
             clean_text(error);
         }

@@ -581,6 +581,77 @@ pub enum AlertKind {
     AppFailed { app: String },
 }
 
+/// Something that runs on a server, as a monitor lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Service {
+    /// A systemd service.
+    Unit { name: String },
+    /// A container, of `docker` or `podman`.
+    Container { runtime: String, name: String },
+    /// A PM2 app, with the `pm2` program the monitor found.
+    Pm2App { pm2: String, name: String },
+}
+
+impl Service {
+    pub fn name(&self) -> &str {
+        match self {
+            Service::Unit { name }
+            | Service::Container { name, .. }
+            | Service::Pm2App { name, .. } => name,
+        }
+    }
+
+    /// The actions it takes, in the order a menu shows them.
+    pub fn actions(&self) -> &'static [ServiceAction] {
+        use ServiceAction::*;
+        match self {
+            Service::Unit { .. } => &[Start, Stop, Restart, Reload, Enable, Disable],
+            Service::Container { .. } => &[Start, Stop, Restart],
+            Service::Pm2App { .. } => &[Start, Stop, Restart, Reload],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+    Reload,
+    /// Start at boot. Not started now.
+    Enable,
+    Disable,
+}
+
+impl ServiceAction {
+    /// The verb the programs take, which is also its name in the API.
+    pub fn verb(self) -> &'static str {
+        match self {
+            ServiceAction::Start => "start",
+            ServiceAction::Stop => "stop",
+            ServiceAction::Restart => "restart",
+            ServiceAction::Reload => "reload",
+            ServiceAction::Enable => "enable",
+            ServiceAction::Disable => "disable",
+        }
+    }
+}
+
+/// What an [`Command::OpenTerminal`] session runs instead of a shell.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TerminalRun {
+    /// Follows a service's log: its journal, `docker logs` or `pm2 logs`.
+    Logs { service: Service },
+    /// Runs an action, with sudo free to ask for a password.
+    Control {
+        service: Service,
+        action: ServiceAction,
+    },
+}
+
 /// How far back [`Command::MonitorTrend`] looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -810,6 +881,10 @@ pub enum Command {
         node: NodeId,
         cols: u16,
         rows: u16,
+        /// What runs instead of the login shell. The session ends when it
+        /// does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<TerminalRun>,
     },
     /// Sends keyboard input to the remote shell. `data` is base64 in
     /// JSON, and an array of numbers is still accepted.
@@ -932,6 +1007,17 @@ pub enum Command {
         /// In seconds: 60 when missing, at most 3600.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout: Option<u32>,
+    },
+    /// Starts, stops, restarts, reloads, enables or disables a service on
+    /// an SSH host node, and waits for it. A systemd unit's action runs as
+    /// root, with `sudo -n` unless the user is root: when sudo wants a
+    /// password, it fails with `needs_password`, and the same action can
+    /// run in a terminal with [`TerminalRun::Control`], where the user
+    /// types it. Returns [`Response::Controlled`].
+    ControlService {
+        node: NodeId,
+        service: Service,
+        action: ServiceAction,
     },
     /// Starts burrow-agent on an SSH host node, putting it there first if
     /// needed, and reports what it sees as [`Event::MonitorSample`],
@@ -1120,6 +1206,11 @@ pub enum Response {
     },
     Exec {
         result: ExecResult,
+    },
+    Controlled {
+        result: ExecResult,
+        /// sudo wanted a password, so nothing was done.
+        needs_password: bool,
     },
     Monitor {
         history: MonitorHistory,

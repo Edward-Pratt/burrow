@@ -15,7 +15,8 @@ use burrow_core::ipc::{self, Client, Role};
 use burrow_core::{
     AddonInfo, Alert, Capability, Command, Event, FOLDER_KIND, FormValue, Grant, GrantShown, Node,
     NodeId, NodePatch, POSTGRES_KIND, Problem, Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND,
-    SessionId, SessionInfo, SessionKind, SessionState, TunnelShown, View,
+    Service, ServiceAction, SessionId, SessionInfo, SessionKind, SessionState, TerminalRun,
+    TunnelShown, View,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
@@ -251,6 +252,32 @@ pub enum AppMsg {
     ClearErrors,
     /// The window was asked to close.
     CloseRequested,
+    /// The user picked an action on a service in a monitor. Those that
+    /// interrupt it ask first.
+    Control {
+        node: NodeId,
+        service: Service,
+        action: ServiceAction,
+    },
+    /// An action to run now, asked about if it needed to be.
+    ControlNow {
+        node: NodeId,
+        service: Service,
+        action: ServiceAction,
+    },
+    /// How an action went: what it printed, and whether sudo wanted a
+    /// password.
+    Controlled {
+        node: NodeId,
+        service: Service,
+        action: ServiceAction,
+        result: Result<(burrow_core::ExecResult, bool), String>,
+    },
+    /// Follows a service's log in a tab.
+    ShowLogs {
+        node: NodeId,
+        service: Service,
+    },
     /// A tab was dragged to another place.
     TabsMoved,
     ManageAddons,
@@ -306,6 +333,9 @@ impl AppMsg {
                 | AppMsg::ClearErrors
                 | AppMsg::CloseRequested
                 | AppMsg::TabsMoved
+                | AppMsg::Control { .. }
+                | AppMsg::ControlNow { .. }
+                | AppMsg::ShowLogs { .. }
                 | AppMsg::ManageAddons
                 | AppMsg::ReviewAddon(_)
                 | AppMsg::RevokeAddon(_)
@@ -726,7 +756,8 @@ impl Component for App {
                     session::State::Closed if data.contains(&b'\r') => {
                         remote.terminal.feed(b"\r\n");
                         remote.state = session::State::Starting;
-                        remote::start(&self.core, tab, node, &remote.terminal, &sender);
+                        let run = remote.run.clone();
+                        remote::start(&self.core, tab, node, &remote.terminal, run, &sender);
                     }
                     _ => {}
                 }
@@ -756,7 +787,7 @@ impl Component for App {
                     remote.title = Some(files::printable(&title));
                 }
             }
-            AppMsg::NewShell(id) => self.new_shell(id, widgets, &sender),
+            AppMsg::NewShell(id) => self.new_shell(id, None, widgets, &sender),
             AppMsg::OpenFiles(id) => self.open_files(id, widgets, &sender),
             AppMsg::Files {
                 node,
@@ -948,6 +979,82 @@ impl Component for App {
                 self.close_window(window);
             }
             AppMsg::TabsMoved => self.save_tabs(widgets),
+            AppMsg::Control {
+                node,
+                service,
+                action,
+            } => {
+                if !monitor::confirms(action) {
+                    return self.control(node, service, action, &sender);
+                }
+                let host = self.nodes.get(&node).map(|n| n.name.as_str()).unwrap_or("");
+                let (host, name) = (files::printable(host), files::printable(service.name()));
+                let verb = sentence_case(action.verb());
+                let detail = match action {
+                    ServiceAction::Stop => format!("{name} stops on {host} until it is started."),
+                    ServiceAction::Disable => format!("{name} won't start when {host} boots."),
+                    _ => format!("{name} stops on {host} and starts again."),
+                };
+                let sender = sender.clone();
+                dialogs::confirm(
+                    window,
+                    &format!("{verb} {name}?"),
+                    &detail,
+                    &verb,
+                    move || {
+                        sender.input(AppMsg::ControlNow {
+                            node,
+                            service,
+                            action,
+                        })
+                    },
+                );
+            }
+            AppMsg::ControlNow {
+                node,
+                service,
+                action,
+            } => self.control(node, service, action, &sender),
+            AppMsg::Controlled {
+                node,
+                service,
+                action,
+                result,
+            } => {
+                let name = files::printable(service.name());
+                match result {
+                    // sudo asks in a terminal, where the password goes
+                    // straight to it.
+                    Ok((_, true)) => {
+                        let run = TerminalRun::Control { service, action };
+                        self.new_shell(node, Some(run), widgets, &sender);
+                    }
+                    Ok((result, false)) if result.status == Some(0) => {
+                        let done = format!("{name}: {} done.", action.verb());
+                        sender.input(AppMsg::Notice(done));
+                    }
+                    Ok((result, false)) => {
+                        let said = [&result.stderr, &result.stdout]
+                            .into_iter()
+                            .flat_map(|text| text.lines())
+                            .map(str::trim)
+                            .find(|line| !line.is_empty())
+                            .map(files::printable);
+                        let why = said.unwrap_or_else(|| match result.status {
+                            Some(status) => format!("it exited with {status}"),
+                            None => "it was stopped".into(),
+                        });
+                        self.fail(format!("Could not {} {name}: {why}", action.verb()));
+                    }
+                    Err(error) => {
+                        self.fail(format!("Could not {} {name}: {error}", action.verb()));
+                    }
+                }
+            }
+            AppMsg::ShowLogs { node, service } => {
+                let run = TerminalRun::Logs { service };
+                self.new_shell(node, Some(run), widgets, &sender);
+            }
             AppMsg::ManageAddons => {
                 let review = {
                     let sender = sender.clone();
@@ -1115,7 +1222,7 @@ impl App {
                     self.open_terminal(shell, folder.as_deref(), widgets, sender);
                 }
                 SavedTab::Node { node } => self.open_tab_now(node, widgets, sender),
-                SavedTab::Shell { node } => self.new_shell(node, widgets, sender),
+                SavedTab::Shell { node } => self.new_shell(node, None, widgets, sender),
                 SavedTab::Files { node } => self.open_files(node, widgets, sender),
                 SavedTab::Monitor { node } => self.open_monitor(node, widgets, sender),
             }
@@ -1151,6 +1258,8 @@ impl App {
                     shell: shell.clone(),
                     folder: terminal::in_page(&tab.page).and_then(|t| terminal::folder(&t)),
                 },
+                // A log or an action is for now, not for the next start.
+                (TabKey::Shell(..), Panel::Shell(remote)) if remote.run.is_some() => continue,
                 (TabKey::Shell(node, _), _) => SavedTab::Shell { node },
                 (TabKey::Files(node), _) => SavedTab::Files { node },
                 (TabKey::Monitor(node), _) => SavedTab::Monitor { node },
@@ -1247,7 +1356,9 @@ impl App {
                     let title = match (key, &tab.panel) {
                         (TabKey::Files(_), _) => files_title(&node.name),
                         (TabKey::Monitor(_), _) => monitor_title(&node.name),
-                        (_, Panel::Shell(remote)) => shell_title(&node.name, remote.number),
+                        (_, Panel::Shell(remote)) => {
+                            shell_title(&node.name, remote.number, remote.run.as_ref())
+                        }
                         _ => node.name.clone(),
                     };
                     set_tab_title(&tab.title, &title);
@@ -1894,15 +2005,19 @@ impl App {
             return;
         };
         if node.kind == SSH_HOST_KIND {
-            // The shell opened first.
-            let shell = (self.tabs.keys())
-                .filter_map(|key| match key {
-                    TabKey::Shell(node, n) if *node == id => Some(*n),
+            // The shell opened first, not a tab following a log.
+            let shell = (self.tabs.iter())
+                .filter_map(|(key, tab)| match (key, &tab.panel) {
+                    (TabKey::Shell(node, n), Panel::Shell(remote))
+                        if *node == id && remote.run.is_none() =>
+                    {
+                        Some(*n)
+                    }
                     _ => None,
                 })
                 .min();
             if !shell.is_some_and(|n| self.show_tab(TabKey::Shell(id, n), widgets)) {
-                self.new_shell(id, widgets, sender);
+                self.new_shell(id, None, widgets, sender);
             }
             return;
         }
@@ -1954,13 +2069,54 @@ impl App {
     }
 
     /// Opens a new shell on the SSH host `id`.
-    fn new_shell(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
+    /// Runs `action` on `service`. How it went arrives as
+    /// [`AppMsg::Controlled`].
+    fn control(
+        &self,
+        node: NodeId,
+        service: Service,
+        action: ServiceAction,
+        sender: &ComponentSender<Self>,
+    ) {
+        let (core, input) = (self.core.clone(), sender.input_sender().clone());
+        runtime().spawn(async move {
+            let command = Command::ControlService {
+                node,
+                service: service.clone(),
+                action,
+            };
+            let result = match core.execute(command).await {
+                Ok(Response::Controlled {
+                    result,
+                    needs_password,
+                }) => Ok((result, needs_password)),
+                Ok(other) => Err(format!("unexpected reply {other:?}")),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = input.send(AppMsg::Controlled {
+                node,
+                service,
+                action,
+                result,
+            });
+        });
+    }
+
+    /// Opens a shell on the host `id`, or a tab running `run` there.
+    fn new_shell(
+        &mut self,
+        id: NodeId,
+        run: Option<TerminalRun>,
+        widgets: &Widgets,
+        sender: &ComponentSender<Self>,
+    ) {
         let Some(node) = self.nodes.get(&id).filter(|n| n.kind == SSH_HOST_KIND) else {
             return;
         };
         let tab = TabKey::Shell(id, self.next_tab);
         self.next_tab += 1;
         // The lowest number not shown on another of the host's shells.
+        // Tabs that run something else are named after it instead.
         let taken: HashSet<u32> = (self.tabs.iter())
             .filter_map(|(key, t)| match (key, &t.panel) {
                 (TabKey::Shell(node, _), Panel::Shell(remote)) if *node == id => {
@@ -1969,8 +2125,8 @@ impl App {
                 _ => None,
             })
             .collect();
-        let mut number = 1;
-        while taken.contains(&number) {
+        let mut number = if run.is_some() { 0 } else { 1 };
+        while run.is_none() && taken.contains(&number) {
             number += 1;
         }
         let term = terminal::remote(
@@ -2006,11 +2162,12 @@ impl App {
         page.append(&bar);
         page.append(&terminal::page(&term));
         terminal::set_font(&term, self.settings.terminal_font.as_deref());
-        remote::start(&self.core, tab, id, &term, sender);
+        remote::start(&self.core, tab, id, &term, run.clone(), sender);
         term.grab_focus();
         let icon = sidebar::icon_name(node, false, &self.icons()).to_string();
-        let title = shell_title(&node.name, number);
-        let panel = Panel::Shell(Remote::new(term, number));
+        let remote = Remote::new(term, number, run);
+        let title = shell_title(&node.name, number, remote.run.as_ref());
+        let panel = Panel::Shell(remote);
         self.add_tab(tab, page.upcast(), panel, &icon, &title, widgets, sender);
     }
 
@@ -2941,11 +3098,16 @@ fn shown(nodes: &HashMap<NodeId, Node>, props: &toml::Table) -> Option<TunnelSho
 
 /// The title of an SSH host's shell tab: the host for the first, and a
 /// number for the rest.
-fn shell_title(host: &str, number: u32) -> String {
-    if number == 1 {
-        host.to_string()
-    } else {
-        format!("{host} ({number})")
+/// "web" for a host's first shell, "web (2)" for the next, and what runs
+/// for a tab that runs something else.
+fn shell_title(host: &str, number: u32, run: Option<&TerminalRun>) -> String {
+    match run {
+        Some(TerminalRun::Logs { service }) => format!("{host}: {} log", service.name()),
+        Some(TerminalRun::Control { service, action }) => {
+            format!("{host}: {} {}", action.verb(), service.name())
+        }
+        None if number == 1 => host.to_string(),
+        None => format!("{host} ({number})"),
     }
 }
 
@@ -2964,7 +3126,7 @@ fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
 }
 
 /// `text` with its first letter capitalised, as "Folder" for "folder".
-fn sentence_case(text: &str) -> String {
+pub(crate) fn sentence_case(text: &str) -> String {
     let mut chars = text.chars();
     chars.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(chars).collect()
@@ -3015,7 +3177,7 @@ fn fill_page(page: &gtk::Box, node: &Node, kind: &str, nodes: &HashMap<NodeId, N
     page.append(&note);
 }
 
-fn menu_popover(
+pub(crate) fn menu_popover(
     entries: Vec<(impl AsRef<str>, AppMsg)>,
     sender: &ComponentSender<App>,
 ) -> gtk::Popover {
@@ -3386,8 +3548,21 @@ mod tests {
 
     #[test]
     fn shells_after_the_first_are_numbered() {
-        assert_eq!(shell_title("web", 1), "web");
-        assert_eq!(shell_title("web", 2), "web (2)");
+        assert_eq!(shell_title("web", 1, None), "web");
+        assert_eq!(shell_title("web", 2, None), "web (2)");
+        let service = Service::Unit {
+            name: "nginx.service".into(),
+        };
+        let logs = TerminalRun::Logs {
+            service: service.clone(),
+        };
+        assert_eq!(shell_title("web", 0, Some(&logs)), "web: nginx.service log");
+        let action = ServiceAction::Restart;
+        let control = TerminalRun::Control { service, action };
+        assert_eq!(
+            shell_title("web", 0, Some(&control)),
+            "web: restart nginx.service"
+        );
     }
 
     #[test]

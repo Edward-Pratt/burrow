@@ -146,6 +146,10 @@ pub struct Pm2 {
     /// Why they couldn't be listed, such as `pm2` not being found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Where `pm2` is, which may not be on a plain SSH `PATH`, so acting
+    /// on an app can run the same one. Empty when it wasn't found.
+    #[serde(default)]
+    pub path: String,
     pub apps: Vec<Pm2App>,
 }
 

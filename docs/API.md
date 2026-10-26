@@ -39,7 +39,7 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `reload_config` | | `ok` |
 | `check_ssh_include` | `alias` | `ssh_include { included, config, line }` |
 | `add_ssh_host` | `parent?`, `alias`, `hostname`, `user?`, `port?`, `identity_file?`, `add_include?` | `node { node }` |
-| `open_terminal` | `node`, `cols`, `rows` | `session { session }` |
+| `open_terminal` | `node`, `cols`, `rows`, `run?` | `session { session }` |
 | `write_terminal` | `session`, `data` (base64) | `ok` |
 | `resize_terminal` | `session`, `cols`, `rows` | `ok` |
 | `answer_prompt` | `session`, `prompt`, `answer` | `ok` |
@@ -49,6 +49,7 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `list_autostart` | | `autostart { nodes }` |
 | `set_autostart` | `node`, `enabled`, `expect?` | `ok` |
 | `exec` | `node`, `command`, `timeout?` (seconds) | `exec { result }` |
+| `control_service` | `node`, `service`, `action` | `controlled { result, needs_password }` |
 | `open_files` | `node` | `session { session }` |
 | `list_dir` | `session`, `path?` (empty = home) | `dir { path, entries }` |
 | `read_file` | `session`, `path`, `limit?` | `file { data, size, sha256 }` |
@@ -124,7 +125,22 @@ A subscriber that falls more than 256 events behind gets a "lagged" error and sh
 
 ## SSH sessions
 
-`open_terminal` on an `ssh-host` node replies at once with a session id. The session then connects in the background and reports each step as `session_changed`.
+`open_terminal` on an `ssh-host` node replies at once with a session id. The session then connects in the background and reports each step as `session_changed`. With `run`, it runs something in place of the login shell, and ends when that does:
+
+- `{"kind": "logs", "service": …}` follows a service's log: `journalctl --unit`, `docker logs --follow` or `pm2 logs`, starting 200 lines back.
+- `{"kind": "control", "service": …, "action": …}` runs an action as `control_service` would, except that sudo may ask for a password in the terminal, and a unit's status is shown afterwards.
+
+### Services
+
+A `service` is something a monitor lists: `{"kind": "unit", "name": "nginx.service"}`, `{"kind": "container", "runtime": "docker", "name": "web"}` or `{"kind": "pm2_app", "pm2": "/home/me/.nvm/versions/node/v20.11.1/bin/pm2", "name": "api"}`, where `pm2` is the path the monitor's `apps.pm2.path` gave. `control_service` runs an `action` on one over an `exec` session and waits up to 120 seconds:
+
+| Service | Actions | Runs |
+|---|---|---|
+| `unit` | `start`, `stop`, `restart`, `reload`, `enable`, `disable` | `systemctl <action> -- <name>`, as root: directly for root, otherwise through `sudo -n` |
+| `container` | `start`, `stop`, `restart` | `docker` or `podman <action> -- <name>` |
+| `pm2_app` | `start`, `stop`, `restart`, `reload` | `pm2 <action> <name>`, with the folder `pm2` is in first on `PATH` so its Node is found |
+
+`result` is the command's `exec` result, so a failed action is a reply with a non-zero `status` and the server's words in `stderr`, not an error. `needs_password` is true when sudo wanted a password, so nothing was done: run the same action with `open_terminal`'s `run` instead, where the user can type it. Burrow never sees that password. Names come from the server, so they are checked and quoted in one place before any of these lines is built: a name that is empty, over 256 bytes, starts with `-`, or has a `'` or a control character is refused, and so is a `runtime` other than `docker` or `podman`, a `pm2` that isn't an absolute path, and an action the service doesn't take.
 
 Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files`, `database`, `exec` or `monitor`) and `state`, and `background: true` on a background monitor.
 
@@ -430,7 +446,7 @@ The daemon sends:
 |---|---|---|
 | `sql-read` | `postgres` | `open_database`, `list_schema`, `cancel_query`, and `run_query` that cannot write |
 | `sql-write` | `postgres` | the above, `run_query` that writes, and `set_read_only` |
-| `exec` | `ssh-host` | `exec` |
+| `exec` | `ssh-host` | `exec`, `control_service` |
 | `files-read` | `ssh-host` | `open_files`, `list_dir`, `read_file` |
 | `files-write` | `ssh-host` | the above, `write_file`, `make_dir`, `rename_path`, `remove_path` |
 | `tunnel` | `ssh-tunnel` | `start_tunnel`, and `close_session` on that tunnel |

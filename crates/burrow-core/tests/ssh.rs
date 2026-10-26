@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use burrow_core::{
     Command, Core, Event, ExecResult, Node, NodePatch, PromptAnswer, PromptKind, Response,
-    SecretValue, SessionId, SessionKind, SessionState, TransferId, TransferState, TunnelShown,
+    SecretValue, Service, ServiceAction, SessionId, SessionKind, SessionState, TerminalRun,
+    TransferId, TransferState, TunnelShown,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -26,6 +27,7 @@ async fn open(core: &Core, node: &Node) -> (SessionId, mpsc::Receiver<Vec<u8>>) 
         node: node.id,
         cols: 80,
         rows: 24,
+        run: None,
     };
     let session = match core.execute(command).await.unwrap() {
         Response::Session { session } => session,
@@ -225,6 +227,7 @@ async fn only_ssh_hosts_open_terminals() {
             node: folder.id,
             cols: 80,
             rows: 24,
+            run: None,
         })
         .await;
     assert!(result.is_err());
@@ -1117,6 +1120,88 @@ async fn exec(core: &Core, node: &Node, command: &str, timeout: Option<u32>) -> 
     match core.execute(command).await.unwrap() {
         Response::Exec { result } => result,
         other => panic!("expected an exec result, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn service_actions_and_logs_run_where_the_monitor_found_them() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(server) = Server::start() else {
+        return;
+    };
+    trust(&server);
+    let core = server.core();
+    let node = host(&core, "test").await;
+    // A pm2 in a folder of its own, as nvm installs it, that says how it
+    // was run and which folder came first on its PATH.
+    let bin = server.path("node/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let pm2 = bin.join("pm2");
+    fs::write(
+        &pm2,
+        "#!/bin/sh\necho \"pm2 $*\"\necho \"first ${PATH%%:*}\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&pm2, fs::Permissions::from_mode(0o755)).unwrap();
+    let service = Service::Pm2App {
+        pm2: pm2.to_str().unwrap().into(),
+        name: "api server".into(),
+    };
+
+    let control = Command::ControlService {
+        node: node.id,
+        service: service.clone(),
+        action: ServiceAction::Restart,
+    };
+    match core.execute(control).await.unwrap() {
+        Response::Controlled {
+            result,
+            needs_password,
+        } => {
+            assert_eq!(result.status, Some(0), "{result:?}");
+            assert!(!needs_password);
+            let first = format!("first {}", bin.display());
+            assert_eq!(result.stdout, format!("pm2 restart api server\n{first}\n"));
+        }
+        other => panic!("expected an action's result, got {other:?}"),
+    }
+    // A container has no enable, and a name can't break out of its quotes.
+    let enable = Command::ControlService {
+        node: node.id,
+        service: Service::Container {
+            runtime: "docker".into(),
+            name: "web".into(),
+        },
+        action: ServiceAction::Enable,
+    };
+    assert!(core.execute(enable).await.is_err());
+    let escape = Command::ControlService {
+        node: node.id,
+        service: Service::Unit {
+            name: "x'; touch pwned; '".into(),
+        },
+        action: ServiceAction::Start,
+    };
+    assert!(core.execute(escape).await.is_err());
+
+    // Its log runs in a terminal, which ends when the program does.
+    let mut events = core.subscribe();
+    let logs = Command::OpenTerminal {
+        node: node.id,
+        cols: 80,
+        rows: 24,
+        run: Some(TerminalRun::Logs { service }),
+    };
+    let session = match core.execute(logs).await.unwrap() {
+        Response::Session { session } => session,
+        other => panic!("expected a session, got {other:?}"),
+    };
+    let mut output = core.take_output(session).unwrap();
+    read_until(&mut output, "pm2 logs --lines 200 api server").await;
+    loop {
+        if let SessionState::Closed { .. } = expect_state(&mut events, session).await {
+            break;
+        }
     }
 }
 
