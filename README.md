@@ -6,7 +6,7 @@ Inspired by [Tusk](https://github.com/repticJS/tusk). Burrow is written from scr
 
 ## Status
 
-Milestones 1–13 are done: core, GTK shell, local terminal, SSH, addons, tunnels and SFTP, the PostgreSQL client, `burrowd` with the `burrow` CLI and the MCP bridge, `burrow-agent` with the monitor tab, adding SSH hosts from Burrow, monitoring in the background with history and alerts, a review of the architecture and the window, and terminal essentials: tabs that open again at the next start, find, links and a font setting. It is early software, in testing with a few people. See [docs/DESIGN.md](docs/DESIGN.md).
+Milestones 1–14 are done: core, GTK shell, local terminal, SSH, addons, tunnels and SFTP, the PostgreSQL client, `burrowd` with the `burrow` CLI and the MCP bridge, `burrow-agent` with the monitor tab, adding SSH hosts from Burrow, monitoring in the background with history and alerts, a review of the architecture and the window, and terminal essentials: tabs that open again at the next start, find, links and a font setting, and editing remote text files. It is early software, in testing with a few people. See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Goals
 

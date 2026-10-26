@@ -46,6 +46,7 @@ pub enum Msg {
     /// A file's start arrived, to show in a viewer.
     Opened {
         name: String,
+        path: String,
         contents: viewer::Contents,
     },
     /// Lists the folder typed into the path bar.
@@ -344,7 +345,28 @@ impl Files {
                 self.session.show_content();
             }
             Msg::Failed(error) => self.show_error(Some(&printable(&error))),
-            Msg::Opened { name, contents } => viewer::show(window, &name, &contents),
+            Msg::Opened {
+                name,
+                path,
+                contents,
+            } => {
+                // A file opened from an ended session can still be read.
+                let save = self.session.running().map(|session| viewer::Save {
+                    core: core.clone(),
+                    session,
+                    path,
+                    saved: Box::new({
+                        let sender = sender.clone();
+                        move || {
+                            sender.input(AppMsg::Files {
+                                node,
+                                msg: Msg::Refresh,
+                            })
+                        }
+                    }),
+                });
+                viewer::show(window, &name, &contents, save);
+            }
             Msg::GoTyped => {
                 let typed = self.path_entry.text().trim().to_string();
                 // Unchanged text stands for the real path, which can hold
@@ -750,18 +772,20 @@ impl Files {
         let Some(session) = self.session.running() else {
             return self.show_error(Some("Not connected."));
         };
+        let path = join(&self.path, &name);
         let command = Command::ReadFile {
             session,
-            path: join(&self.path, &name),
+            path: path.clone(),
             limit: Some(viewer::LIMIT),
         };
         let (core, input, node) = (core.clone(), sender.input_sender().clone(), self.node);
         runtime().spawn(async move {
             let msg = match core.execute(command).await {
                 // Decoded here, away from the GTK thread.
-                Ok(Response::File { data, size }) => Msg::Opened {
+                Ok(Response::File { data, size, sha256 }) => Msg::Opened {
                     name,
-                    contents: viewer::Contents::new(&data, size),
+                    path,
+                    contents: viewer::Contents::new(&data, size, sha256),
                 },
                 Ok(other) => Msg::Failed(format!("unexpected reply {other:?}")),
                 Err(e) => Msg::Failed(e.to_string()),

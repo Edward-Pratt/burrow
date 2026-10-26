@@ -974,7 +974,7 @@ fn tables_count(count: usize) -> String {
 
 /// Picks the editor's colours to match the window's, light or dark, now and
 /// whenever they change. Without libadwaita nothing does it for us.
-fn follow_theme(buffer: &sourceview5::Buffer, editor: &sourceview5::View) {
+pub fn follow_theme(buffer: &sourceview5::Buffer, editor: &sourceview5::View) {
     let apply = {
         let buffer = buffer.clone();
         move |widget: &gtk::Widget| {

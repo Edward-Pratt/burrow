@@ -284,16 +284,18 @@ impl Core {
                 let (data, size) = files::read_file(&sftp, &path, limit)
                     .await
                     .map_err(Error::Remote)?;
-                return Ok(Response::File { data, size });
+                let sha256 = crate::api::sha256_hex(&data);
+                return Ok(Response::File { data, size, sha256 });
             }
             Command::WriteFile {
                 session,
                 path,
                 data,
                 overwrite,
+                expect,
             } => {
                 let sftp = sessions.sftp(session)?;
-                files::write_file(&sftp, &path, &data, overwrite)
+                files::write_file(&sftp, &path, &data, overwrite, expect.as_deref())
                     .await
                     .map_err(Error::Remote)?;
                 return Ok(Response::Ok);
