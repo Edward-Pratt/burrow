@@ -1,9 +1,8 @@
 [Unit]
-Description=Update Burrow from source
+Description=Check for a Burrow update
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/burrow-update
-# A build takes minutes; keep it out of the way of the desktop.
-Nice=10
-IOSchedulingClass=idle
+ExecStart=%h/.local/bin/burrow-update --check
+# Says on the desktop that an update is ready.
+Environment=BURROW_NOTIFY=1
