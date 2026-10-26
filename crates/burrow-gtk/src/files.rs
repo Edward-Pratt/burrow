@@ -1,5 +1,5 @@
-//! SFTP file panels: a tab that browses an SSH host's files, and copies
-//! files and folders to and from this computer.
+//! SFTP file panels: a tab that browses an SSH host's files, shows what is
+//! in them, and copies files and folders to and from this computer.
 //!
 //! Names come from the server, so they are cleaned up before they are
 //! shown, and checked before they become part of a local path. Remote
@@ -24,6 +24,8 @@ use crate::dialogs;
 use crate::runtime::runtime;
 use crate::session::{self, SessionPage, State};
 
+mod viewer;
+
 /// Rows drawn before the rest of a folder is summed up. A list of widgets
 /// gets slow long before a folder gets this big.
 const MAX_ROWS: usize = 2000;
@@ -41,6 +43,11 @@ pub enum Msg {
     },
     /// A command failed. Shown above the list.
     Failed(String),
+    /// A file's start arrived, to show in a viewer.
+    Opened {
+        name: String,
+        contents: viewer::Contents,
+    },
     /// Lists the folder typed into the path bar.
     GoTyped,
     Up,
@@ -337,6 +344,7 @@ impl Files {
                 self.session.show_content();
             }
             Msg::Failed(error) => self.show_error(Some(&printable(&error))),
+            Msg::Opened { name, contents } => viewer::show(window, &name, &contents),
             Msg::GoTyped => {
                 let typed = self.path_entry.text().trim().to_string();
                 // Unchanged text stands for the real path, which can hold
@@ -364,7 +372,7 @@ impl Files {
                     FileKind::Dir | FileKind::Symlink => {
                         self.list_dir(join(&self.path, &entry.name), core, sender)
                     }
-                    FileKind::File => self.update(Msg::Download, core, window, sender),
+                    FileKind::File => self.open(entry.name.clone(), core, sender),
                     FileKind::Other => {}
                 }
             }
@@ -729,6 +737,32 @@ impl Files {
         runtime().spawn(async move {
             let msg = match core.execute(Command::ListDir { session, path }).await {
                 Ok(Response::Dir { path, entries }) => Msg::Listed { path, entries },
+                Ok(other) => Msg::Failed(format!("unexpected reply {other:?}")),
+                Err(e) => Msg::Failed(e.to_string()),
+            };
+            let _ = input.send(AppMsg::Files { node, msg });
+        });
+    }
+
+    /// Reads the start of the file called `name` in the folder shown. It
+    /// arrives as [`Msg::Opened`].
+    fn open(&self, name: String, core: &Client, sender: &ComponentSender<App>) {
+        let Some(session) = self.session.running() else {
+            return self.show_error(Some("Not connected."));
+        };
+        let command = Command::ReadFile {
+            session,
+            path: join(&self.path, &name),
+            limit: Some(viewer::LIMIT),
+        };
+        let (core, input, node) = (core.clone(), sender.input_sender().clone(), self.node);
+        runtime().spawn(async move {
+            let msg = match core.execute(command).await {
+                // Decoded here, away from the GTK thread.
+                Ok(Response::File { data, size }) => Msg::Opened {
+                    name,
+                    contents: viewer::Contents::new(&data, size),
+                },
                 Ok(other) => Msg::Failed(format!("unexpected reply {other:?}")),
                 Err(e) => Msg::Failed(e.to_string()),
             };
