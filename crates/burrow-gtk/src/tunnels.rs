@@ -4,7 +4,7 @@
 //! by autostart or by another client shows up the same as one started
 //! here.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -149,8 +149,9 @@ pub fn status_text(status: &Status) -> (String, Option<&'static str>) {
     }
 }
 
-/// Replaces `page`'s children with the tunnel's settings, state and
-/// buttons.
+/// Shows the tunnel's settings, state and buttons in `page`. The widgets
+/// are built on the first call for a page and updated on later ones, so
+/// focus and selected text survive a change of state.
 pub fn fill(
     page: &gtk::Box,
     node: &Node,
@@ -159,84 +160,232 @@ pub fn fill(
     autostart: bool,
     actions: &Actions,
 ) {
-    // Redrawing destroys the focused widget. GTK would then focus the
-    // first value and select its text, so focus goes to the first button.
-    let had_focus = page.focus_child().is_some();
-    while let Some(child) = page.first_child() {
-        page.remove(&child);
-    }
+    let tab = PAGES.with_borrow(|pages| {
+        pages
+            .get(&node.id)
+            .filter(|tab| tab.page.upgrade().as_ref() == Some(page))
+            .cloned()
+    });
+    let tab = tab.unwrap_or_else(|| TunnelPage::build(page, node.id));
+    tab.update(node, nodes, status, autostart, actions);
+}
 
-    let title = gtk::Label::new(Some(&node.name));
-    title.set_xalign(0.0);
-    title.add_css_class("page-title");
-    page.append(&title);
+thread_local! {
+    /// The widgets of each open tunnel tab. GTK runs on one thread, and
+    /// `fill` is only given the page, so this is where it finds them again.
+    static PAGES: RefCell<HashMap<NodeId, Rc<TunnelPage>>> = RefCell::default();
+}
 
-    let grid = gtk::Grid::builder()
-        .row_spacing(4)
-        .column_spacing(16)
-        .margin_top(8)
-        .build();
-    let (state, class) = status_text(status);
-    let mut rows = describe(node, nodes);
-    rows.push(("State", state));
-    for (row, (label, value)) in rows.into_iter().enumerate() {
-        let label = gtk::Label::new(Some(label));
-        label.set_xalign(0.0);
-        label.set_yalign(0.0);
-        label.add_css_class("dim");
-        let value = gtk::Label::new(Some(&value));
-        value.set_xalign(0.0);
-        value.set_wrap(true);
-        value.set_selectable(true);
-        if let Some(class) = class.filter(|_| row == 3) {
-            value.add_css_class(class);
+/// The widgets of one tunnel tab, and the actions its buttons run.
+struct TunnelPage {
+    page: glib::WeakRef<gtk::Box>,
+    title: gtk::Label,
+    /// The values next to "Listens on", "Forwards to", "Through" and
+    /// "State".
+    values: Vec<gtk::Label>,
+    stale: gtk::Label,
+    /// Start, or Stop while the tunnel runs. One button, so it keeps the
+    /// focus when it is pressed from the keyboard.
+    toggle: gtk::Button,
+    restart: gtk::Button,
+    autostart: gtk::CheckButton,
+    /// Set while the checkbox is changed to match the core, so that isn't
+    /// taken for the user's choice.
+    quiet: Cell<bool>,
+    running: Cell<bool>,
+    actions: RefCell<Option<Actions>>,
+}
+
+impl TunnelPage {
+    fn build(page: &gtk::Box, id: NodeId) -> Rc<TunnelPage> {
+        while let Some(child) = page.first_child() {
+            page.remove(&child);
         }
-        grid.attach(&label, 0, row as i32, 1, 1);
-        grid.attach(&value, 1, row as i32, 1, 1);
-    }
-    page.append(&grid);
 
-    if status.stale && status.running().is_some() {
-        let note = gtk::Label::new(Some(
+        let title = gtk::Label::new(None);
+        title.set_xalign(0.0);
+        title.add_css_class("page-title");
+        page.append(&title);
+
+        let grid = gtk::Grid::builder()
+            .row_spacing(4)
+            .column_spacing(16)
+            .margin_top(8)
+            .build();
+        let mut values = Vec::new();
+        for (row, name) in ["Listens on", "Forwards to", "Through", "State"]
+            .into_iter()
+            .enumerate()
+        {
+            let label = gtk::Label::new(Some(name));
+            label.set_xalign(0.0);
+            label.set_yalign(0.0);
+            label.add_css_class("dim");
+            let value = gtk::Label::new(None);
+            value.set_xalign(0.0);
+            value.set_wrap(true);
+            value.set_selectable(true);
+            grid.attach(&label, 0, row as i32, 1, 1);
+            grid.attach(&value, 1, row as i32, 1, 1);
+            values.push(value);
+        }
+        page.append(&grid);
+
+        let stale = gtk::Label::new(Some(
             "The settings changed while the tunnel was running. Restart it to use them.",
         ));
-        note.set_xalign(0.0);
-        note.set_wrap(true);
-        note.add_css_class("warning-text");
-        page.append(&note);
+        stale.set_xalign(0.0);
+        stale.set_wrap(true);
+        stale.add_css_class("warning-text");
+        stale.set_visible(false);
+        page.append(&stale);
+
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        buttons.set_margin_top(12);
+        let toggle = gtk::Button::new();
+        let restart = gtk::Button::with_label("Restart");
+        restart.add_css_class("suggested-action");
+        let edit = gtk::Button::with_label("Edit…");
+        buttons.append(&toggle);
+        buttons.append(&restart);
+        buttons.append(&edit);
+        page.append(&buttons);
+
+        let autostart = gtk::CheckButton::with_label("Start with Burrow on this computer");
+        autostart.set_margin_top(6);
+        page.append(&autostart);
+
+        let tab = Rc::new(TunnelPage {
+            page: page.downgrade(),
+            title,
+            values,
+            stale,
+            toggle: toggle.clone(),
+            restart: restart.clone(),
+            autostart: autostart.clone(),
+            quiet: Cell::new(false),
+            running: Cell::new(false),
+            actions: RefCell::new(None),
+        });
+
+        // The handlers hold the page weakly: it holds them through its
+        // buttons.
+        let weak = Rc::downgrade(&tab);
+        let run = move |pick: fn(&TunnelPage, &Actions) -> Rc<dyn Fn()>| {
+            let weak = weak.clone();
+            move |_: &gtk::Button| {
+                let Some(tab) = weak.upgrade() else { return };
+                // Taken out of the borrow first, as the action may draw
+                // the page again.
+                let action = tab.actions.borrow().as_ref().map(|a| pick(&tab, a));
+                if let Some(action) = action {
+                    action();
+                }
+            }
+        };
+        toggle.connect_clicked(run(|tab, actions| {
+            if tab.running.get() {
+                actions.stop.clone()
+            } else {
+                actions.start.clone()
+            }
+        }));
+        restart.connect_clicked(run(|_, actions| actions.restart.clone()));
+        edit.connect_clicked(run(|_, actions| actions.edit.clone()));
+        autostart.connect_toggled({
+            let weak = Rc::downgrade(&tab);
+            move |check| {
+                let Some(tab) = weak.upgrade() else { return };
+                if tab.quiet.get() {
+                    return;
+                }
+                let action = tab
+                    .actions
+                    .borrow()
+                    .as_ref()
+                    .map(|a| a.set_autostart.clone());
+                if let Some(action) = action {
+                    action(check.is_active());
+                }
+            }
+        });
+
+        page.connect_destroy(move |page| {
+            PAGES.with_borrow_mut(|pages| {
+                let ours = pages
+                    .get(&id)
+                    .is_some_and(|tab| tab.page.upgrade().is_none_or(|shown| shown == *page));
+                if ours {
+                    pages.remove(&id);
+                }
+            });
+        });
+        PAGES.with_borrow_mut(|pages| pages.insert(id, tab.clone()));
+        tab
     }
 
-    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    buttons.set_margin_top(12);
-    let button = |label: &str, action: &Rc<dyn Fn()>| {
-        let button = gtk::Button::with_label(label);
-        let action = action.clone();
-        button.connect_clicked(move |_| action());
-        button
-    };
-    if status.running().is_some() {
-        buttons.append(&button("Stop", &actions.stop));
-        if status.stale {
-            let restart = button("Restart", &actions.restart);
-            restart.add_css_class("suggested-action");
-            buttons.append(&restart);
+    fn update(
+        &self,
+        node: &Node,
+        nodes: &HashMap<NodeId, Node>,
+        status: &Status,
+        autostart: bool,
+        actions: &Actions,
+    ) {
+        *self.actions.borrow_mut() = Some(Actions {
+            start: actions.start.clone(),
+            stop: actions.stop.clone(),
+            restart: actions.restart.clone(),
+            edit: actions.edit.clone(),
+            set_autostart: actions.set_autostart.clone(),
+        });
+
+        set_text(&self.title, &node.name);
+        let (state, class) = status_text(status);
+        let mut texts: Vec<String> = describe(node, nodes).into_iter().map(|(_, v)| v).collect();
+        texts.push(state);
+        for (value, text) in self.values.iter().zip(&texts) {
+            set_text(value, text);
         }
-    } else {
-        let start = button("Start", &actions.start);
-        start.add_css_class("suggested-action");
-        buttons.append(&start);
-    }
-    buttons.append(&button("Edit…", &actions.edit));
-    page.append(&buttons);
+        let state = &self.values[3];
+        for old in ["running", "error-text"] {
+            if Some(old) != class {
+                state.remove_css_class(old);
+            }
+        }
+        if let Some(class) = class {
+            state.add_css_class(class);
+        }
 
-    let check = gtk::CheckButton::with_label("Start with Burrow on this computer");
-    check.set_margin_top(6);
-    check.set_active(autostart);
-    let set_autostart = actions.set_autostart.clone();
-    check.connect_toggled(move |check| set_autostart(check.is_active()));
-    page.append(&check);
-    if had_focus {
-        buttons.child_focus(gtk::DirectionType::TabForward);
+        let running = status.running().is_some();
+        self.running.set(running);
+        self.stale.set_visible(status.stale && running);
+        self.toggle
+            .set_label(if running { "Stop" } else { "Start" });
+        if running {
+            self.toggle.remove_css_class("suggested-action");
+        } else {
+            self.toggle.add_css_class("suggested-action");
+        }
+        let restart = running && status.stale;
+        if !restart && self.restart.has_focus() {
+            self.toggle.grab_focus();
+        }
+        self.restart.set_visible(restart);
+
+        if self.autostart.is_active() != autostart {
+            self.quiet.set(true);
+            self.autostart.set_active(autostart);
+            self.quiet.set(false);
+        }
+    }
+}
+
+/// Sets a label's text only when it changed, as setting it clears the
+/// selection in it.
+fn set_text(label: &gtk::Label, text: &str) {
+    if label.label() != text {
+        label.set_label(text);
     }
 }
 
