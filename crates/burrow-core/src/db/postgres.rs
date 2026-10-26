@@ -51,6 +51,16 @@ const ATTEMPTS: usize = 3;
 /// Longer values are cut short in query results. Exports are not.
 const MAX_CELL: usize = 64 * 1024;
 
+/// The most a query's kept rows may take as JSON. A reply goes over the
+/// daemon's socket as one line, and a line over its limit drops the
+/// connection, so a query that gets here is stopped as at the row limit.
+/// Counted as JSON rather than as text, since escaping can make a value
+/// six times longer.
+const MAX_RESULT: usize = 32 << 20;
+
+// The rows fit one reply, with room for column names and the rest.
+const _: () = assert!(MAX_RESULT <= crate::ipc::MAX_LINE / 2);
+
 /// What a database node's props describe.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Spec {
@@ -389,6 +399,26 @@ fn cell(text: &str) -> String {
     format!("{}…", &text[..end])
 }
 
+/// What a row takes in a reply as JSON, with its brackets and separators,
+/// counting escapes as serde_json writes them.
+fn row_len(values: &[Option<String>]) -> usize {
+    let value = |value: &Option<String>| match value {
+        None => "null,".len(),
+        Some(text) => {
+            let escaped: usize = text
+                .bytes()
+                .map(|b| match b {
+                    b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+                    0..0x20 => 6,
+                    _ => 1,
+                })
+                .sum();
+            escaped + "\"\",".len()
+        }
+    };
+    "[],".len() + values.iter().map(value).sum::<usize>()
+}
+
 /// Whether the session's role can act on the server beyond its data,
 /// which a read-only transaction doesn't stop. Membership counts as much as
 /// being: a member of a superuser role can `SET ROLE` to it inside a `DO`
@@ -457,6 +487,9 @@ impl Handle {
         let started = Instant::now();
         let mut result = QueryResult::default();
         let mut cancelling: Option<JoinHandle<()>> = None;
+        // What the kept rows take as JSON, across all statements.
+        let mut bytes = 0;
+        let mut full = false;
         match self.client.simple_query_raw(sql).await {
             Err(error) => result.error = Some(query_error(&error)),
             Ok(stream) => {
@@ -472,10 +505,22 @@ impl Handle {
                         }
                         Ok(SimpleQueryMessage::Row(row)) => {
                             let statement = current.get_or_insert_with(StatementResult::default);
-                            if statement.rows.len() < limit {
-                                let values = (0..row.len()).map(|i| row.get(i).map(cell)).collect();
-                                statement.rows.push(values);
-                            } else {
+                            let mut kept = false;
+                            if !full && statement.rows.len() < limit {
+                                let values: Vec<Option<String>> =
+                                    (0..row.len()).map(|i| row.get(i).map(cell)).collect();
+                                let size = row_len(&values);
+                                // Once one row doesn't fit, none after it is
+                                // kept either, even from a later statement
+                                // that starts before the cancel arrives.
+                                full = bytes + size > MAX_RESULT;
+                                if !full {
+                                    bytes += size;
+                                    statement.rows.push(values);
+                                    kept = true;
+                                }
+                            }
+                            if !kept {
                                 statement.truncated = true;
                                 if cancelling.is_none() {
                                     let handle = self.clone();
@@ -901,5 +946,22 @@ mod tests {
         assert!(cut.ends_with('…'));
         assert!(cut.len() <= MAX_CELL + '…'.len_utf8());
         assert_eq!(cell("short"), "short");
+    }
+
+    #[test]
+    fn a_row_is_measured_as_its_json_at_least() {
+        let rows = [
+            vec![],
+            vec![None, Some(String::new())],
+            vec![Some("plain é".into()), Some("\"\\\n\t".into())],
+            vec![Some("\u{0}\u{1b}\u{7f}".into())],
+        ];
+        for row in rows {
+            let json = serde_json::to_string(&row).unwrap();
+            // The count includes a separator the last value doesn't have.
+            assert!(row_len(&row) >= json.len(), "{json}");
+            assert!(row_len(&row) <= json.len() + 1 + row.len(), "{json}");
+        }
+        assert_eq!(row_len(&[Some("\u{1}".into())]), "[\"\\u0001\"],".len() + 1);
     }
 }

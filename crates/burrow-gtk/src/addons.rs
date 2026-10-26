@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use burrow_core::{AddonInfo, AddonState, Block, FormInput, FormValue, View};
 use relm4::gtk;
+use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
 use crate::dialogs;
@@ -361,17 +362,17 @@ pub fn review(parent: &impl IsA<gtk::Window>, addon: &AddonInfo, approve: impl F
     content.append(&buttons);
     window.set_child(Some(&content));
 
-    ok.connect_clicked({
-        let window = window.clone();
+    // The window is held weakly by everything inside it, or it would keep
+    // itself alive after closing.
+    ok.connect_clicked(glib::clone!(
+        #[weak]
+        window,
         move |_| {
             window.close();
             approve();
         }
-    });
-    cancel.connect_clicked({
-        let window = window.clone();
-        move |_| window.close()
-    });
+    ));
+    dialogs::close_on_cancel(&window, &cancel);
     dialogs::close_on_escape(&window);
     window.present();
     cancel.grab_focus();
@@ -419,21 +420,33 @@ pub fn manage(
         row.append(&labels);
 
         let id = addon.id.clone();
+        // The window is held weakly by everything inside it, or it would
+        // keep itself alive after closing.
         let button = if usable(addon) {
             let button = gtk::Button::with_label("Revoke");
-            let (window, revoke) = (window.clone(), revoke.clone());
-            button.connect_clicked(move |_| {
-                window.close();
-                revoke(id.clone());
-            });
+            button.connect_clicked(glib::clone!(
+                #[weak]
+                window,
+                #[strong]
+                revoke,
+                move |_| {
+                    window.close();
+                    revoke(id.clone());
+                }
+            ));
             button
         } else {
             let button = gtk::Button::with_label("Review…");
-            let (window, review) = (window.clone(), review.clone());
-            button.connect_clicked(move |_| {
-                window.close();
-                review(id.clone());
-            });
+            button.connect_clicked(glib::clone!(
+                #[weak]
+                window,
+                #[strong]
+                review,
+                move |_| {
+                    window.close();
+                    review(id.clone());
+                }
+            ));
             button
         };
         button.set_valign(gtk::Align::Center);

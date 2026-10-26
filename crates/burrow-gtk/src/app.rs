@@ -6,19 +6,19 @@
 //! core, including after edits made outside Burrow.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use burrow_core::ipc::{self, Client, Role};
 use burrow_core::{
-    AddonInfo, Alert, Capability, Command, Event, FormValue, Grant, GrantShown, Node, NodeId,
-    NodePatch, POSTGRES_KIND, Problem, Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SessionId,
-    SessionInfo, SessionKind, SessionState, TunnelShown, View,
+    AddonInfo, Alert, Capability, Command, Event, FOLDER_KIND, FormValue, Grant, GrantShown, Node,
+    NodeId, NodePatch, POSTGRES_KIND, Problem, Prompt, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND,
+    SessionId, SessionInfo, SessionKind, SessionState, TunnelShown, View,
 };
 use relm4::gtk::prelude::*;
-use relm4::gtk::{gdk, gio, glib, graphene};
+use relm4::gtk::{gdk, gio, glib};
 use relm4::{Component, ComponentParts, ComponentSender, gtk};
 use tokio::sync::broadcast::error::RecvError;
 use vte4::TerminalExt;
@@ -32,6 +32,7 @@ use crate::monitor::{self, Monitor};
 use crate::palette::{self, Item};
 use crate::remote::{self, Remote, Unclaimed};
 use crate::runtime::runtime;
+use crate::session;
 use crate::settings::{Theme, UiSettings};
 use crate::sidebar;
 use crate::terminal;
@@ -48,6 +49,9 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// How long a message from an addon stays in the status bar.
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 
+/// How many errors the status bar's list keeps.
+const MAX_ERRORS: usize = 50;
+
 /// What "New …" creates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NewKind {
@@ -58,6 +62,32 @@ pub enum NewKind {
     /// A kind owned by an addon.
     Addon(String),
 }
+
+/// The kinds Burrow knows itself: their id, what "New …" calls them, and
+/// what it creates.
+const BUILT_IN_KINDS: [(&str, &str, NewKind); 4] = [
+    (FOLDER_KIND, "folder", NewKind::Folder),
+    (SSH_HOST_KIND, "SSH host", NewKind::SshHost),
+    (SSH_TUNNEL_KIND, "SSH tunnel", NewKind::SshTunnel),
+    (POSTGRES_KIND, "PostgreSQL database", NewKind::Database),
+];
+
+impl NewKind {
+    /// The kind of node it creates.
+    fn kind(&self) -> &str {
+        match self {
+            NewKind::Folder => FOLDER_KIND,
+            NewKind::SshHost => SSH_HOST_KIND,
+            NewKind::SshTunnel => SSH_TUNNEL_KIND,
+            NewKind::Database => POSTGRES_KIND,
+            NewKind::Addon(kind) => kind,
+        }
+    }
+}
+
+/// How long after "New …" a node of that kind, created in that folder,
+/// counts as the one the user made. Its dialog can stay open a while.
+const NEW_NODE_WAIT: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug)]
 pub enum AppMsg {
@@ -83,9 +113,11 @@ pub enum AppMsg {
     Failed(String),
 
     // From the user.
-    RowActivated(i32),
+    RowActivated(NodeId),
+    /// A context menu for a sidebar row, or for the empty space when `node`
+    /// is `None`, pointing at `x`, `y` in the sidebar pane.
     ContextMenu {
-        row: Option<i32>,
+        node: Option<NodeId>,
         x: f64,
         y: f64,
     },
@@ -97,8 +129,19 @@ pub enum AppMsg {
     Open(NodeId),
     Rename(NodeId),
     Delete(NodeId),
+    /// Moves a node into a folder, or to the top level.
+    MoveNode {
+        id: NodeId,
+        parent: Option<NodeId>,
+    },
+    /// Asks which folder to move a node to.
+    MoveTo(NodeId),
+    /// Asks which colour to mark a node with.
+    Colour(NodeId),
     RenameSelected,
     DeleteSelected,
+    /// Moves the keyboard focus to the sidebar, showing it if it's hidden.
+    FocusSidebar,
     CloseTab(TabKey),
     CloseCurrentTab,
     /// Moves to the next (`1`) or previous (`-1`) tab, wrapping around.
@@ -110,14 +153,14 @@ pub enum AppMsg {
         title: String,
     },
     TerminalExited(u32),
-    /// The core accepted `open_terminal` for an SSH host tab.
+    /// The core accepted `open_terminal` for an SSH shell tab.
     SessionStarted {
-        node: NodeId,
+        tab: TabKey,
         session: SessionId,
     },
     /// `open_terminal` itself failed.
     SessionFailed {
-        node: NodeId,
+        tab: TabKey,
         error: String,
     },
     SessionOutput {
@@ -127,16 +170,23 @@ pub enum AppMsg {
     SessionOutputEnded {
         session: SessionId,
     },
-    /// Typed into an SSH host tab.
+    /// Typed into an SSH shell tab.
     RemoteInput {
-        node: NodeId,
+        tab: TabKey,
         data: Vec<u8>,
     },
     RemoteResize {
-        node: NodeId,
+        tab: TabKey,
         cols: u16,
         rows: u16,
     },
+    /// The title the shell on an SSH host set, as it arrived.
+    RemoteTitle {
+        tab: TabKey,
+        title: String,
+    },
+    /// Opens another shell on an SSH host.
+    NewShell(NodeId),
     /// Opens an SSH host's file panel.
     OpenFiles(NodeId),
     /// Opens an SSH host's monitor.
@@ -195,6 +245,10 @@ pub enum AppMsg {
     /// An addon's reply to `Invoke`, shown in the status bar.
     Notice(String),
     ClearNotice(u32),
+    /// Empties the status bar's list of errors.
+    ClearErrors,
+    /// The window was asked to close.
+    CloseRequested,
     ManageAddons,
     ReviewAddon(String),
     RevokeAddon(String),
@@ -207,12 +261,69 @@ pub enum AppMsg {
     OpenConfigFolder,
 }
 
+impl AppMsg {
+    /// Whether the user did this, rather than the core or a timer. A user
+    /// action clears the error in the status bar, which nothing else does
+    /// but a newer error: events arrive every few seconds and would wipe
+    /// it before it could be read. Messages that can come either way, such
+    /// as a panel's own messages, don't count.
+    fn is_user_action(&self) -> bool {
+        matches!(
+            self,
+            AppMsg::RowActivated(_)
+                | AppMsg::ContextMenu { .. }
+                | AppMsg::New { .. }
+                | AppMsg::Open(_)
+                | AppMsg::Rename(_)
+                | AppMsg::MoveNode { .. }
+                | AppMsg::MoveTo(_)
+                | AppMsg::Colour(_)
+                | AppMsg::Delete(_)
+                | AppMsg::RenameSelected
+                | AppMsg::DeleteSelected
+                | AppMsg::FocusSidebar
+                | AppMsg::CloseTab(_)
+                | AppMsg::CloseCurrentTab
+                | AppMsg::SwitchTab(_)
+                | AppMsg::NewTerminal(_)
+                | AppMsg::NewShell(_)
+                | AppMsg::OpenFiles(_)
+                | AppMsg::OpenMonitor(_)
+                | AppMsg::StartTunnel(_)
+                | AppMsg::StopTunnel(_)
+                | AppMsg::RestartTunnel(_)
+                | AppMsg::EditTunnel(_)
+                | AppMsg::EditDatabase(_)
+                | AppMsg::EditGrant(_)
+                | AppMsg::SetAutostart { .. }
+                | AppMsg::Invoke { .. }
+                | AppMsg::ClearErrors
+                | AppMsg::CloseRequested
+                | AppMsg::ManageAddons
+                | AppMsg::ReviewAddon(_)
+                | AppMsg::RevokeAddon(_)
+                | AppMsg::OpenAddonsFolder
+                | AppMsg::ShowPalette
+                | AppMsg::ToggleSidebar
+                | AppMsg::ShowSettings
+                | AppMsg::SetTheme(_)
+                | AppMsg::ReloadConfig
+                | AppMsg::OpenConfigFolder
+        )
+    }
+}
+
 /// What a tab shows. Node tabs follow their node; terminal tabs belong to
-/// no node and are numbered as they open.
+/// no node. Shells and terminals are numbered as they open, and numbers
+/// are never reused, so a late reply for a closed tab can't reach a new
+/// one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TabKey {
+    /// A node's own tab. SSH hosts have shells instead.
     Node(NodeId),
-    /// An SSH host's file panel. The host's own tab is its terminal.
+    /// A shell on an SSH host. A host can have several.
+    Shell(NodeId, u32),
+    /// An SSH host's file panel.
     Files(NodeId),
     /// An SSH host's monitor.
     Monitor(NodeId),
@@ -222,16 +333,48 @@ pub enum TabKey {
 impl TabKey {
     fn node(self) -> Option<NodeId> {
         match self {
-            TabKey::Node(id) | TabKey::Files(id) | TabKey::Monitor(id) => Some(id),
+            TabKey::Node(id) | TabKey::Shell(id, _) | TabKey::Files(id) | TabKey::Monitor(id) => {
+                Some(id)
+            }
             TabKey::Terminal(_) => None,
         }
     }
 }
 
 struct Tab {
-    /// A `gtk::Box` for node tabs, a [`terminal::page`] for terminals.
     page: gtk::Widget,
     title: gtk::Label,
+    panel: Panel,
+}
+
+/// What a tab shows, with the state it keeps.
+enum Panel {
+    /// An SSH host's shell.
+    Shell(Remote),
+    Files(Files),
+    Monitor(Monitor),
+    Database(Database),
+    Tunnel(Rc<tunnels::TunnelPage>),
+    /// The box an addon draws its view in.
+    View(gtk::Box),
+    /// A node Burrow can't open, described by [`fill_page`].
+    Placeholder(gtk::Box),
+    /// A local shell. VTE runs it, so there is nothing to keep.
+    Terminal,
+}
+
+impl Panel {
+    /// The state of the tab's own session, for panels that run one.
+    /// Tunnels run whether or not their tab is open, so theirs isn't.
+    fn session(&self) -> Option<session::State> {
+        match self {
+            Panel::Shell(remote) => Some(remote.state),
+            Panel::Files(panel) => Some(panel.session.state),
+            Panel::Monitor(panel) => Some(panel.session.state),
+            Panel::Database(panel) => Some(panel.session.state),
+            Panel::Tunnel(_) | Panel::View(_) | Panel::Placeholder(_) | Panel::Terminal => None,
+        }
+    }
 }
 
 pub struct App {
@@ -239,34 +382,28 @@ pub struct App {
     config_dir: PathBuf,
     settings: UiSettings,
     nodes: HashMap<NodeId, Node>,
-    expanded: HashSet<NodeId>,
     problems: Vec<Problem>,
     addons: Vec<AddonInfo>,
+    /// The error the status bar shows, until the user does something or a
+    /// newer error replaces it.
     error: Option<String>,
+    /// Recent errors, for the list behind the status bar's errors button.
+    errors: ErrorLog,
+    /// The daemon went away and a new connection isn't up yet.
+    reconnecting: bool,
     /// A message from an addon, and a counter so an old timer does not
     /// clear a newer one.
     notice: Option<String>,
     notice_id: u32,
     tabs: HashMap<TabKey, Tab>,
-    next_terminal: u32,
-    /// SSH host tabs, by node.
-    remotes: HashMap<NodeId, Remote>,
-    /// File panels, by SSH host node.
-    files: HashMap<NodeId, Files>,
-    /// Monitors, by SSH host node.
-    monitors: HashMap<NodeId, Monitor>,
-    /// Database tabs, by node.
-    databases: HashMap<NodeId, Database>,
-    /// Tabs drawn by addons: the box their view goes in, by node.
-    views: HashMap<NodeId, gtk::Box>,
+    /// The number the next shell or terminal tab gets.
+    next_tab: u32,
     unclaimed: Unclaimed,
     /// Whether a `list_sessions` to place an unknown session's prompt is
     /// on its way.
     looking_up: bool,
     /// Every tunnel that has run, by node, whether or not its tab is open.
     tunnels: HashMap<NodeId, tunnels::Status>,
-    /// Tunnel tabs: the box their page is drawn in, by node.
-    tunnel_pages: HashMap<NodeId, gtk::Box>,
     /// Tunnels to start again once their session has closed.
     restarting: HashSet<NodeId>,
     /// Tunnels that start with Burrow.
@@ -279,20 +416,46 @@ pub struct App {
     /// another client answers first. A `RefCell` because prompts are asked
     /// while a tab's panel is borrowed.
     prompts: RefCell<HashMap<(SessionId, u32), dialogs::Dismiss>>,
-    sidebar_dirty: bool,
+    /// The kind and folder "New …" was last asked for, and when, so the
+    /// node it makes is selected when it arrives. The SSH host dialog sends
+    /// its command itself, so the reply can't be waited for instead.
+    creating: Option<(String, Option<NodeId>, Instant)>,
 }
 
 pub struct Widgets {
     sidebar_pane: gtk::Box,
-    list: gtk::ListBox,
-    /// The node shown in each sidebar row, by row index.
-    row_ids: Vec<NodeId>,
+    sidebar: sidebar::Sidebar,
     content: gtk::Stack,
     notebook: gtk::Notebook,
     new_button: gtk::MenuButton,
     status: gtk::Label,
     problems_button: gtk::MenuButton,
     problems_list: gtk::Label,
+    errors_button: gtk::MenuButton,
+    errors_list: gtk::Label,
+}
+
+/// The errors the status bar has shown, oldest first, with the time each
+/// arrived. Only the newest is on the status line, and a burst of them
+/// would otherwise replace one another before they could be read.
+#[derive(Default)]
+struct ErrorLog(VecDeque<(String, String)>);
+
+impl ErrorLog {
+    fn push(&mut self, time: String, message: String) {
+        if self.0.len() == MAX_ERRORS {
+            self.0.pop_front();
+        }
+        self.0.push_back((time, message));
+    }
+
+    /// One line per error, newest first.
+    fn text(&self) -> String {
+        (self.0.iter().rev())
+            .map(|(time, message)| format!("{time}  {message}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 impl Component for App {
@@ -322,40 +485,46 @@ impl Component for App {
         listen(&core, &sender);
         load(&core, &sender);
 
-        let error = stale_daemon(&core);
         let widgets = build(&window, &sender);
         widgets.sidebar_pane.set_visible(settings.sidebar_visible);
         add_shortcuts(&window, &sender);
+        // Only `App` knows what is open, so it decides, and destroys the
+        // window itself once it may close.
+        window.connect_close_request({
+            let sender = sender.clone();
+            move |_| {
+                sender.input(AppMsg::CloseRequested);
+                glib::Propagation::Stop
+            }
+        });
 
-        let model = App {
+        let mut model = App {
             core,
             config_dir,
             settings,
             nodes: HashMap::new(),
-            expanded: HashSet::new(),
             problems: Vec::new(),
             addons: Vec::new(),
-            error,
+            error: None,
+            errors: ErrorLog::default(),
+            reconnecting: false,
             notice: None,
             notice_id: 0,
             tabs: HashMap::new(),
-            next_terminal: 1,
-            remotes: HashMap::new(),
-            files: HashMap::new(),
-            monitors: HashMap::new(),
-            databases: HashMap::new(),
-            views: HashMap::new(),
+            next_tab: 1,
             unclaimed: Unclaimed::default(),
             looking_up: false,
             tunnels: HashMap::new(),
-            tunnel_pages: HashMap::new(),
             restarting: HashSet::new(),
             autostart: HashSet::new(),
             monitoring: HashSet::new(),
             alerts: Vec::new(),
             prompts: RefCell::default(),
-            sidebar_dirty: false,
+            creating: None,
         };
+        if let Some(error) = stale_daemon(&model.core) {
+            model.fail(error);
+        }
         model.apply_theme();
         model.refresh_status(&widgets);
         ComponentParts { model, widgets }
@@ -368,6 +537,9 @@ impl Component for App {
         sender: ComponentSender<Self>,
         window: &Self::Root,
     ) {
+        if message.is_user_action() {
+            self.error = None;
+        }
         match message {
             AppMsg::Loaded {
                 nodes,
@@ -399,30 +571,28 @@ impl Component for App {
             }
             AppMsg::Resync => load(&self.core, &sender),
             AppMsg::Disconnected => {
-                self.error = Some("Lost the connection to burrowd. Reconnecting…".to_string());
+                self.reconnecting = true;
+                // It would read as why reconnecting fails. The list keeps it.
+                self.error = None;
             }
             AppMsg::Reconnected(client) => self.reconnected(client, window, &sender),
-            AppMsg::Failed(error) => self.error = Some(error),
+            AppMsg::Failed(error) => self.fail(error),
 
-            AppMsg::RowActivated(index) => {
-                if let Some(&id) = widgets.row_ids.get(index as usize) {
-                    self.activate(id, widgets, &sender);
-                }
-            }
-            AppMsg::ContextMenu { row, x, y } => {
-                let id = row.and_then(|i| widgets.row_ids.get(i as usize).copied());
-                if let Some(row) = row.and_then(|i| widgets.list.row_at_index(i)) {
-                    widgets.list.select_row(Some(&row));
-                }
-                self.context_menu(id, x, y, widgets, &sender);
-            }
+            AppMsg::RowActivated(id) => self.activate(id, widgets, &sender),
+            AppMsg::ContextMenu { node, x, y } => self.context_menu(node, x, y, widgets, &sender),
             AppMsg::New { kind, parent } => {
                 let parent = parent.unwrap_or_else(|| self.selection_folder(widgets));
+                self.creating = Some((kind.kind().to_string(), parent, Instant::now()));
                 self.new_node(kind, parent, window, &sender);
             }
             AppMsg::Open(id) => self.open_tab(id, widgets, &sender),
             AppMsg::Rename(id) => self.rename(id, window, &sender),
             AppMsg::Delete(id) => self.delete(id, window, &sender),
+            AppMsg::MoveNode { id, parent } => {
+                execute(&self.core, &sender, Command::MoveNode { id, parent });
+            }
+            AppMsg::MoveTo(id) => self.move_to(id, window, &sender),
+            AppMsg::Colour(id) => self.colour(id, window, &sender),
             AppMsg::RenameSelected => {
                 if let Some(id) = selected(widgets) {
                     self.rename(id, window, &sender);
@@ -432,6 +602,14 @@ impl Component for App {
                 if let Some(id) = selected(widgets) {
                     self.delete(id, window, &sender);
                 }
+            }
+            AppMsg::FocusSidebar => {
+                if !self.settings.sidebar_visible {
+                    self.settings.sidebar_visible = true;
+                    widgets.sidebar_pane.set_visible(true);
+                    self.save_settings();
+                }
+                widgets.sidebar.focus();
             }
             AppMsg::CloseTab(key) => self.close_tab(key, widgets),
             AppMsg::CloseCurrentTab => {
@@ -460,10 +638,13 @@ impl Component for App {
                 }
             }
             AppMsg::TerminalExited(id) => self.close_tab(TabKey::Terminal(id), widgets),
-            AppMsg::SessionStarted { node, session } => {
-                match self.remotes.get_mut(&node) {
-                    Some(remote) if remote.state == remote::State::Starting => {
-                        remote.state = remote::State::Running(session);
+            AppMsg::SessionStarted { tab, session } => {
+                match self.tabs.get_mut(&tab) {
+                    Some(Tab {
+                        panel: Panel::Shell(remote),
+                        ..
+                    }) if remote.state == session::State::Starting => {
+                        remote.state = session::State::Running(session);
                         // Sizes seen while starting had no session to go to.
                         let (cols, rows) = terminal::size(&remote.terminal);
                         execute(
@@ -483,66 +664,84 @@ impl Component for App {
                     _ => execute(&self.core, &sender, Command::CloseSession { session }),
                 }
             }
-            AppMsg::SessionFailed { node, error } => {
-                if let Some(remote) = self.remotes.get_mut(&node) {
+            AppMsg::SessionFailed { tab, error } => {
+                if let Some(remote) = self.shell(tab) {
                     remote.terminal.feed(remote::failure(&error).as_bytes());
-                    remote.state = remote::State::Closed;
+                    remote.state = session::State::Closed;
                 }
             }
             AppMsg::SessionOutput { session, data } => {
-                if let Some(remote) = self.remote_for(session) {
+                if let Some(remote) = self.shell_running(session) {
                     remote.terminal.feed(&data);
                 }
             }
             AppMsg::SessionOutputEnded { session } => {
-                if let Some(remote) = self
-                    .remotes
-                    .values_mut()
-                    .find(|r| r.state == remote::State::Running(session))
-                {
+                if let Some(remote) = self.shell_running(session) {
                     remote.ending.output_ended = true;
                     remote.finish_if_done();
                 }
             }
-            AppMsg::RemoteInput { node, data } => {
-                let Some(remote) = self.remotes.get_mut(&node) else {
+            AppMsg::RemoteInput { tab, data } => {
+                let (
+                    Some(node),
+                    Some(Tab {
+                        panel: Panel::Shell(remote),
+                        ..
+                    }),
+                ) = (tab.node(), self.tabs.get_mut(&tab))
+                else {
                     return;
                 };
                 match remote.state {
-                    remote::State::Running(session) => execute(
+                    session::State::Running(session) => execute(
                         &self.core,
                         &sender,
                         Command::WriteTerminal { session, data },
                     ),
-                    remote::State::Closed if data.contains(&b'\r') => {
+                    session::State::Closed if data.contains(&b'\r') => {
                         remote.terminal.feed(b"\r\n");
-                        remote.state = remote::State::Starting;
-                        remote::start(&self.core, node, &remote.terminal, &sender);
+                        remote.state = session::State::Starting;
+                        remote::start(&self.core, tab, node, &remote.terminal, &sender);
                     }
                     _ => {}
                 }
             }
-            AppMsg::RemoteResize { node, cols, rows } => {
-                if let Some(&Remote {
-                    state: remote::State::Running(session),
+            AppMsg::RemoteResize { tab, cols, rows } => {
+                let panel = self.tabs.get(&tab).map(|t| &t.panel);
+                if let Some(Panel::Shell(Remote {
+                    state: session::State::Running(session),
                     ..
-                }) = self.remotes.get(&node)
+                })) = panel
                 {
                     let command = Command::ResizeTerminal {
-                        session,
+                        session: *session,
                         cols,
                         rows,
                     };
                     execute(&self.core, &sender, command);
                 }
             }
+            AppMsg::RemoteTitle { tab, title } => {
+                // VTE reports a title after the output that set it, which
+                // can be after the shell has ended.
+                if let Some(remote) = self.shell(tab)
+                    && matches!(remote.state, session::State::Running(_))
+                {
+                    // The server sets it.
+                    remote.title = Some(files::printable(&title));
+                }
+            }
+            AppMsg::NewShell(id) => self.new_shell(id, widgets, &sender),
             AppMsg::OpenFiles(id) => self.open_files(id, widgets, &sender),
             AppMsg::Files {
                 node,
-                msg: files::Msg::Started(session),
-            } => match self.files.get_mut(&node) {
-                Some(panel) if panel.state == remote::State::Starting => {
-                    panel.state = remote::State::Running(session);
+                msg: files::Msg::Session(session::Msg::Started(session)),
+            } => match self.tabs.get_mut(&TabKey::Files(node)) {
+                Some(Tab {
+                    panel: Panel::Files(panel),
+                    ..
+                }) if panel.session.state == session::State::Starting => {
+                    panel.session.state = session::State::Running(session);
                     for event in self.unclaimed.claim(session) {
                         self.session_event(event, window, &sender);
                     }
@@ -551,17 +750,24 @@ impl Component for App {
                 _ => execute(&self.core, &sender, Command::CloseSession { session }),
             },
             AppMsg::Files { node, msg } => {
-                if let Some(panel) = self.files.get_mut(&node) {
+                if let Some(Tab {
+                    panel: Panel::Files(panel),
+                    ..
+                }) = self.tabs.get_mut(&TabKey::Files(node))
+                {
                     panel.update(msg, &self.core, window, &sender);
                 }
             }
             AppMsg::OpenMonitor(id) => self.open_monitor(id, widgets, &sender),
             AppMsg::Monitor {
                 node,
-                msg: monitor::Msg::Started(session),
-            } => match self.monitors.get_mut(&node) {
-                Some(panel) if panel.state == remote::State::Starting => {
-                    panel.state = remote::State::Running(session);
+                msg: monitor::Msg::Session(session::Msg::Started(session)),
+            } => match self.tabs.get_mut(&TabKey::Monitor(node)) {
+                Some(Tab {
+                    panel: Panel::Monitor(panel),
+                    ..
+                }) if panel.session.state == session::State::Starting => {
+                    panel.session.state = session::State::Running(session);
                     // A background monitor may have connected long ago,
                     // so no "connected" event is coming.
                     panel.fetch_history(&self.core, &sender);
@@ -577,12 +783,16 @@ impl Component for App {
                 msg: monitor::Msg::SetBackground(on),
             } => self.set_monitoring(node, on, window, &sender),
             AppMsg::Monitor { node, msg } => {
-                if let Some(panel) = self.monitors.get_mut(&node) {
+                if let Some(Tab {
+                    panel: Panel::Monitor(panel),
+                    ..
+                }) = self.tabs.get_mut(&TabKey::Monitor(node))
+                {
                     panel.update(msg, &self.core, &sender);
                 }
             }
             AppMsg::MonitoringFailed(error) => {
-                self.error = Some(error);
+                self.fail(error);
                 self.refresh_monitors();
             }
             AppMsg::StartTunnel(node) => {
@@ -603,10 +813,13 @@ impl Component for App {
             AppMsg::EditTunnel(node) => self.edit_tunnel(Some(node), None, window, &sender),
             AppMsg::Database {
                 node,
-                msg: database::Msg::Started(session),
-            } => match self.databases.get_mut(&node) {
-                Some(panel) if panel.state == remote::State::Starting => {
-                    panel.state = remote::State::Running(session);
+                msg: database::Msg::Session(session::Msg::Started(session)),
+            } => match self.tabs.get_mut(&TabKey::Node(node)) {
+                Some(Tab {
+                    panel: Panel::Database(panel),
+                    ..
+                }) if panel.session.state == session::State::Starting => {
+                    panel.session.state = session::State::Running(session);
                     for event in self.unclaimed.claim(session) {
                         self.session_event(event, window, &sender);
                     }
@@ -615,7 +828,11 @@ impl Component for App {
                 _ => execute(&self.core, &sender, Command::CloseSession { session }),
             },
             AppMsg::Database { node, msg } => {
-                if let Some(panel) = self.databases.get_mut(&node) {
+                if let Some(Tab {
+                    panel: Panel::Database(panel),
+                    ..
+                }) = self.tabs.get_mut(&TabKey::Node(node))
+                {
                     panel.update(msg, &self.core, window, &sender);
                 }
             }
@@ -623,13 +840,13 @@ impl Component for App {
             AppMsg::EditGrant(node) => {
                 let (core, input) = (self.core.clone(), sender.input_sender().clone());
                 runtime().spawn(async move {
-                    let message = match core.execute(Command::ListGrants).await {
+                    let message = match run(&core, Command::ListGrants).await {
                         Ok(Response::Grants { grants }) => AppMsg::GrantLoaded {
                             node,
                             grant: grants.into_iter().find(|g| g.node == node),
                         },
                         Ok(_) => return,
-                        Err(e) => AppMsg::Failed(e.to_string()),
+                        Err(error) => AppMsg::Failed(error),
                     };
                     let _ = input.send(message);
                 });
@@ -648,14 +865,13 @@ impl Component for App {
                         enabled,
                         expect,
                     };
-                    if let Err(e) = core.execute(command).await {
-                        let error = e.to_string();
+                    if let Err(error) = run(&core, command).await {
                         let _ = input.send(AppMsg::AutostartFailed { node, error });
                     }
                 });
             }
             AppMsg::AutostartFailed { node, error } => {
-                self.error = Some(error);
+                self.fail(error);
                 self.refresh_tunnel(node, &sender);
             }
             AppMsg::LoadView(id) => self.load_view(id, &sender),
@@ -674,18 +890,17 @@ impl Component for App {
                 };
                 let (core, input) = (self.core.clone(), sender.input_sender().clone());
                 runtime().spawn(async move {
-                    let message = match core.execute(command).await {
+                    let message = match run(&core, command).await {
                         Ok(Response::Invoked {
                             message: Some(message),
                         }) => AppMsg::Notice(message),
                         Ok(_) => return,
-                        Err(e) => AppMsg::Failed(e.to_string()),
+                        Err(error) => AppMsg::Failed(error),
                     };
                     let _ = input.send(message);
                 });
             }
             AppMsg::Notice(message) => {
-                self.error = None;
                 self.notice = Some(message);
                 self.notice_id += 1;
                 let (id, sender) = (self.notice_id, sender.clone());
@@ -698,6 +913,11 @@ impl Component for App {
                     self.notice = None;
                 }
             }
+            AppMsg::ClearErrors => {
+                self.errors = ErrorLog::default();
+                widgets.errors_button.popdown();
+            }
+            AppMsg::CloseRequested => self.close_window(window),
             AppMsg::ManageAddons => {
                 let review = {
                     let sender = sender.clone();
@@ -761,7 +981,9 @@ impl Component for App {
             }
         }
 
-        self.rebuild_sidebar(widgets);
+        // Tunnels start and stop in many places; checking here, against
+        // what the sidebar last showed, catches them all.
+        widgets.sidebar.set_running(self.running());
         widgets
             .content
             .set_visible_child_name(if self.tabs.is_empty() {
@@ -769,6 +991,7 @@ impl Component for App {
             } else {
                 "tabs"
             });
+        self.refresh_tabs();
         self.refresh_status(widgets);
     }
 }
@@ -830,7 +1053,7 @@ impl App {
         for key in gone {
             self.close_tab(key, widgets);
         }
-        self.sidebar_dirty = true;
+        widgets.sidebar.replace(&self.nodes, &self.icons());
     }
 
     /// Switches to a new daemon after the old one went away. What ran in
@@ -842,20 +1065,21 @@ impl App {
         sender: &ComponentSender<Self>,
     ) {
         self.core = client;
-        self.error = stale_daemon(&self.core);
+        self.reconnecting = false;
+        // Why reconnecting failed is over now; the list still has it.
+        self.error = None;
+        if let Some(error) = stale_daemon(&self.core) {
+            self.fail(error);
+        }
         // Their sessions are gone, and no answer could reach them.
         for (_, dialog) in self.prompts.get_mut().drain() {
             dialog.dismiss();
         }
         // Sessions ended with the daemon that ran them. Tunnels are settled
         // by the reload; the rest are only known here.
-        let ended: Vec<(NodeId, SessionId)> = (self.remotes.iter())
-            .map(|(node, r)| (*node, &r.state))
-            .chain(self.files.iter().map(|(node, p)| (*node, &p.state)))
-            .chain(self.monitors.iter().map(|(node, p)| (*node, &p.state)))
-            .chain(self.databases.iter().map(|(node, p)| (*node, &p.state)))
-            .filter_map(|(node, state)| match state {
-                remote::State::Running(session) => Some((node, *session)),
+        let ended: Vec<(NodeId, SessionId)> = (self.tabs.iter())
+            .filter_map(|(key, tab)| match tab.panel.session() {
+                Some(session::State::Running(session)) => Some((key.node()?, session)),
                 _ => None,
             })
             .collect();
@@ -872,68 +1096,56 @@ impl App {
         }
         listen(&self.core, sender);
         load(&self.core, sender);
+        sender.input(AppMsg::Notice("Connected to burrowd again".to_string()));
     }
 
-    /// Redraws the sidebar when something marked it dirty, keeping the
-    /// selection and the focus where they were.
-    fn rebuild_sidebar(&mut self, widgets: &mut Widgets) {
-        if !self.sidebar_dirty {
-            return;
+    /// Whether `node` is the one "New …" in this window was asked for.
+    fn made_here(&mut self, node: &Node) -> bool {
+        let Some((kind, parent, since)) = &self.creating else {
+            return false;
+        };
+        let made = *kind == node.kind && *parent == node.parent && since.elapsed() < NEW_NODE_WAIT;
+        if made {
+            self.creating = None;
         }
-        self.sidebar_dirty = false;
-        let selection = selected(widgets);
-        // Rebuilding destroys the focused row; remember whether the sidebar
-        // had focus so keyboard use (arrows, Delete) carries on.
-        let had_focus = widgets.list.focus_child().is_some();
-        let running: HashSet<NodeId> = self
-            .tunnels
+        made
+    }
+
+    /// The nodes the sidebar marks as running: tunnels that are up.
+    fn running(&self) -> HashSet<NodeId> {
+        self.tunnels
             .iter()
             .filter(|(_, status)| status.is_up())
             .map(|(id, _)| *id)
-            .collect();
-        let look = sidebar::Look {
-            expanded: &self.expanded,
-            icons: &self.icons(),
-            running: &running,
-        };
-        widgets.row_ids = sidebar::rebuild(&widgets.list, &self.nodes, &look);
-        let row = selection
-            .and_then(|id| widgets.row_ids.iter().position(|&r| r == id))
-            .and_then(|index| widgets.list.row_at_index(index as i32));
-        if let Some(row) = row {
-            widgets.list.select_row(Some(&row));
-            if had_focus {
-                row.grab_focus();
-            }
-        }
+            .collect()
     }
 
     fn apply_event(&mut self, event: Event, widgets: &Widgets, sender: &ComponentSender<Self>) {
-        self.error = None;
         match event {
             Event::NodeCreated { node } => {
-                // Show where the new node went.
-                if let Some(parent) = node.parent {
-                    self.expanded.insert(parent);
+                widgets.sidebar.insert(&node, &self.icons());
+                if self.made_here(&node) {
+                    widgets.sidebar.show_new(node.id);
+                } else if let Some(parent) = node.parent {
+                    // Show where a node made elsewhere went, without taking
+                    // the selection.
+                    widgets.sidebar.expand(parent);
                 }
                 self.nodes.insert(node.id, node);
-                self.sidebar_dirty = true;
             }
             Event::NodeUpdated { node } => {
                 let id = node.id;
-                if let Some(tab) = self.tabs.get(&TabKey::Files(id)) {
-                    set_tab_title(&tab.title, &files_title(&node.name));
-                }
-                if let Some(tab) = self.tabs.get(&TabKey::Monitor(id)) {
-                    set_tab_title(&tab.title, &monitor_title(&node.name));
-                }
-                if let Some(tab) = self.tabs.get(&TabKey::Node(id)) {
-                    set_tab_title(&tab.title, &node.name);
-                    if !self.tunnel_pages.contains_key(&id)
-                        && !self.databases.contains_key(&id)
-                        && let Some(page) = tab.page.downcast_ref::<gtk::Box>()
-                    {
-                        fill_page(page, &node, &self.nodes);
+                let kind = self.kind_label(&node.kind);
+                for (key, tab) in self.tabs.iter().filter(|(key, _)| key.node() == Some(id)) {
+                    let title = match (key, &tab.panel) {
+                        (TabKey::Files(_), _) => files_title(&node.name),
+                        (TabKey::Monitor(_), _) => monitor_title(&node.name),
+                        (_, Panel::Shell(remote)) => shell_title(&node.name, remote.number),
+                        _ => node.name.clone(),
+                    };
+                    set_tab_title(&tab.title, &title);
+                    if let Panel::Placeholder(page) = &tab.panel {
+                        fill_page(page, &node, &kind, &self.nodes);
                     }
                 }
                 // A running tunnel keeps the settings it started with.
@@ -946,25 +1158,25 @@ impl App {
                 {
                     status.stale = true;
                 }
+                widgets.sidebar.update(&node, &self.icons());
                 self.nodes.insert(id, node);
-                self.sidebar_dirty = true;
                 // Tunnel pages name the host they go through.
                 self.refresh_tunnels(sender);
                 // The addon draws from the node, so ask it again.
-                if self.views.contains_key(&id) {
-                    self.load_view(id, sender);
-                }
+                self.load_view(id, sender);
             }
             Event::NodeDeleted { id } => {
                 self.nodes.remove(&id);
-                self.views.remove(&id);
-                self.expanded.remove(&id);
                 self.tunnels.remove(&id);
                 self.restarting.remove(&id);
-                self.close_tab(TabKey::Node(id), widgets);
-                self.close_tab(TabKey::Files(id), widgets);
-                self.close_tab(TabKey::Monitor(id), widgets);
-                self.sidebar_dirty = true;
+                let tabs: Vec<TabKey> = (self.tabs.keys())
+                    .filter(|key| key.node() == Some(id))
+                    .copied()
+                    .collect();
+                for key in tabs {
+                    self.close_tab(key, widgets);
+                }
+                widgets.sidebar.remove(id);
                 self.refresh_tunnels(sender);
             }
             Event::ProblemsChanged { problems } => self.problems = problems,
@@ -995,14 +1207,22 @@ impl App {
             Event::MonitorSample {
                 session, sample, ..
             } => {
-                let running = remote::State::Running(session);
-                if let Some(panel) = self.monitors.values_mut().find(|p| p.state == running) {
+                let tab = self.tab_of(session).and_then(|key| self.tabs.get_mut(&key));
+                if let Some(Tab {
+                    panel: Panel::Monitor(panel),
+                    ..
+                }) = tab
+                {
                     panel.sample(&sample, &self.core, sender);
                 }
             }
             Event::MonitorUnits { session, units, .. } => {
-                let running = remote::State::Running(session);
-                if let Some(panel) = self.monitors.values_mut().find(|p| p.state == running) {
+                let tab = self.tab_of(session).and_then(|key| self.tabs.get_mut(&key));
+                if let Some(Tab {
+                    panel: Panel::Monitor(panel),
+                    ..
+                }) = tab
+                {
                     panel.set_units(units);
                 }
             }
@@ -1017,11 +1237,15 @@ impl App {
             } => {
                 // A transfer's last events can come after its session
                 // ended, so the panel showing it comes first.
-                let running = remote::State::Running(session);
-                let panel = self
-                    .files
-                    .values_mut()
-                    .find(|p| p.has_transfer(transfer) || p.state == running);
+                let running = session::State::Running(session);
+                let panel = (self.tabs.values_mut()).find_map(|tab| match &mut tab.panel {
+                    Panel::Files(panel)
+                        if panel.has_transfer(transfer) || panel.session.state == running =>
+                    {
+                        Some(panel)
+                    }
+                    _ => None,
+                });
                 if let Some(panel) = panel {
                     panel.transfer_changed(transfer, &state, &self.core, sender);
                 }
@@ -1040,15 +1264,14 @@ impl App {
         let usable = |list: &[AddonInfo], kind: &str| {
             addons::owner(list, kind).map(|a| (a.id.clone(), addons::usable(a)))
         };
-        let stale: Vec<NodeId> = self
-            .views
-            .keys()
+        let stale: Vec<NodeId> = (self.tabs.iter())
+            .filter(|(_, tab)| matches!(tab.panel, Panel::View(_)))
+            .filter_map(|(key, _)| key.node())
             .filter(|id| {
                 self.nodes.get(id).is_none_or(|node| {
                     usable(&self.addons, &node.kind) != usable(&addons, &node.kind)
                 })
             })
-            .copied()
             .collect();
         self.addons = addons;
         for id in stale {
@@ -1057,7 +1280,7 @@ impl App {
         widgets
             .new_button
             .set_popover(Some(&menu_popover(self.new_entries(None, ""), sender)));
-        self.sidebar_dirty = true;
+        widgets.sidebar.set_icons(&self.icons());
     }
 
     /// The icon for each addon kind.
@@ -1072,26 +1295,50 @@ impl App {
     /// "New …" entries for folders, SSH hosts and the kinds of approved
     /// addons. `suffix` follows each label, such as " here".
     fn new_entries(&self, parent: Option<Option<NodeId>>, suffix: &str) -> Vec<(String, AppMsg)> {
-        let mut kinds = vec![
-            ("folder".to_string(), NewKind::Folder),
-            ("SSH host".to_string(), NewKind::SshHost),
-            ("SSH tunnel".to_string(), NewKind::SshTunnel),
-            ("PostgreSQL database".to_string(), NewKind::Database),
-        ];
+        let mut kinds: Vec<(String, NewKind)> = (BUILT_IN_KINDS.iter())
+            .map(|(_, label, kind)| (label.to_string(), kind.clone()))
+            .collect();
         for addon in self.addons.iter().filter(|a| addons::usable(a)) {
             for kind in &addon.kinds {
                 kinds.push((kind.label.clone(), NewKind::Addon(kind.kind.clone())));
             }
         }
+        // Each opens a dialog.
         kinds
             .into_iter()
-            .map(|(label, kind)| (format!("New {label}{suffix}"), AppMsg::New { kind, parent }))
+            .map(|(label, kind)| {
+                (
+                    format!("New {label}{suffix}…"),
+                    AppMsg::New { kind, parent },
+                )
+            })
             .collect()
     }
 
-    /// Asks the node's addon for its view, or explains why it can't.
+    /// What to call a node's kind, such as "SSH host": the raw kind only
+    /// when no addon names it.
+    fn kind_label(&self, kind: &str) -> String {
+        let built_in = BUILT_IN_KINDS.iter().find(|(id, ..)| *id == kind);
+        let label = built_in.map(|(_, label, _)| *label).or_else(|| {
+            (self.addons.iter().flat_map(|a| &a.kinds))
+                .find(|k| k.kind == kind)
+                .map(|k| k.label.as_str())
+        });
+        label.map_or_else(|| kind.to_string(), sentence_case)
+    }
+
+    /// The box an addon draws `id`'s view in, if its tab is open.
+    fn view_page(&self, id: NodeId) -> Option<&gtk::Box> {
+        match &self.tabs.get(&TabKey::Node(id))?.panel {
+            Panel::View(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Asks the node's addon for its view, or explains why it can't, if
+    /// the node's tab shows a view.
     fn load_view(&self, id: NodeId, sender: &ComponentSender<Self>) {
-        let (Some(page), Some(node)) = (self.views.get(&id), self.nodes.get(&id)) else {
+        let (Some(page), Some(node)) = (self.view_page(id), self.nodes.get(&id)) else {
             return;
         };
         let Some(addon) = addons::owner(&self.addons, &node.kind) else {
@@ -1121,7 +1368,7 @@ impl App {
     }
 
     fn show_view(&self, id: NodeId, result: Result<View, String>, sender: &ComponentSender<Self>) {
-        let (Some(page), Some(node)) = (self.views.get(&id), self.nodes.get(&id)) else {
+        let (Some(page), Some(node)) = (self.view_page(id), self.nodes.get(&id)) else {
             return;
         };
         let Some(addon) = addons::owner(&self.addons, &node.kind) else {
@@ -1148,10 +1395,50 @@ impl App {
         }
     }
 
-    fn remote_for(&self, session: SessionId) -> Option<&Remote> {
-        self.remotes
-            .values()
-            .find(|r| r.state == remote::State::Running(session))
+    /// Dims the titles of tabs whose session has ended. A shell's tooltip
+    /// adds the title its shell set, as a local terminal's tab shows its
+    /// shell's, while the shell runs.
+    fn refresh_tabs(&self) {
+        for tab in self.tabs.values() {
+            if tab.panel.session() == Some(session::State::Closed) {
+                tab.title.add_css_class("dim");
+            } else {
+                tab.title.remove_css_class("dim");
+            }
+            if let Panel::Shell(remote) = &tab.panel {
+                let label = tab.title.label();
+                let tooltip = match &remote.title {
+                    Some(title) => Some(format!("{label}\n{title}")),
+                    None => title_tooltip(&label).map(str::to_string),
+                };
+                // Setting it, even to the same text, would redraw it on
+                // every burst of output.
+                if tab.title.tooltip_text().as_deref() != tooltip.as_deref() {
+                    tab.title.set_tooltip_text(tooltip.as_deref());
+                }
+            }
+        }
+    }
+
+    /// The tab whose own session is `session`.
+    fn tab_of(&self, session: SessionId) -> Option<TabKey> {
+        let running = Some(session::State::Running(session));
+        (self.tabs.iter())
+            .find(|(_, tab)| tab.panel.session() == running)
+            .map(|(key, _)| *key)
+    }
+
+    fn shell(&mut self, key: TabKey) -> Option<&mut Remote> {
+        match &mut self.tabs.get_mut(&key)?.panel {
+            Panel::Shell(remote) => Some(remote),
+            _ => None,
+        }
+    }
+
+    /// The shell running `session`.
+    fn shell_running(&mut self, session: SessionId) -> Option<&mut Remote> {
+        let key = self.tab_of(session)?;
+        self.shell(key)
     }
 
     fn session_event(
@@ -1183,42 +1470,7 @@ impl App {
             self.ask(session, &prompt, window, sender);
             return;
         }
-        let running = remote::State::Running(session);
-        if let Some(panel) = self.databases.values_mut().find(|p| p.state == running) {
-            match event {
-                Event::SessionChanged { state, .. } => {
-                    panel.session_changed(&state, &self.core, sender)
-                }
-                Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
-                _ => {}
-            }
-            return;
-        }
-        if let Some(panel) = self.monitors.values_mut().find(|p| p.state == running) {
-            match event {
-                Event::SessionChanged { state, .. } => {
-                    panel.session_changed(&state, &self.core, sender)
-                }
-                Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
-                _ => {}
-            }
-            return;
-        }
-        if let Some(panel) = self.files.values_mut().find(|p| p.state == running) {
-            match event {
-                Event::SessionChanged { state, .. } => {
-                    panel.session_changed(&state, &self.core, sender)
-                }
-                Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
-                _ => {}
-            }
-            return;
-        }
-        let Some(remote) = self
-            .remotes
-            .values_mut()
-            .find(|r| r.state == remote::State::Running(session))
-        else {
+        let Some(key) = self.tab_of(session) else {
             // A prompt from a session nobody here started, such as a
             // tunnel that started with Burrow before its first event
             // arrived. Look up whose it is.
@@ -1229,8 +1481,18 @@ impl App {
             self.unclaimed.hold(session, event);
             return;
         };
-        match event {
-            Event::SessionChanged { state, .. } => {
+        let state = match event {
+            Event::SessionChanged { state, .. } => state,
+            Event::PromptRequested { prompt, .. } => {
+                return self.ask(session, &prompt, window, sender);
+            }
+            _ => return,
+        };
+        let Some(tab) = self.tabs.get_mut(&key) else {
+            return;
+        };
+        match &mut tab.panel {
+            Panel::Shell(remote) => {
                 let text = remote::status_text(&state);
                 if matches!(state, SessionState::Closed { .. }) {
                     remote.ending.status = Some(text.unwrap_or_default());
@@ -1239,8 +1501,10 @@ impl App {
                     remote.terminal.feed(text.as_bytes());
                 }
             }
-            Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
-            _ => {}
+            Panel::Files(panel) => panel.session_changed(&state, &self.core, sender),
+            Panel::Monitor(panel) => panel.session_changed(&state, &self.core, sender),
+            Panel::Database(panel) => panel.session_changed(&state, &self.core, sender),
+            Panel::Tunnel(_) | Panel::View(_) | Panel::Placeholder(_) | Panel::Terminal => {}
         }
     }
 
@@ -1313,7 +1577,6 @@ impl App {
                 }
             }
         }
-        self.sidebar_dirty = true;
         self.refresh_tunnels(sender);
     }
 
@@ -1336,19 +1599,21 @@ impl App {
         if closed && self.restarting.remove(&node) {
             execute(&self.core, sender, Command::StartTunnel { node });
         }
-        self.sidebar_dirty = true;
         self.refresh_tunnel(node, sender);
     }
 
     fn refresh_tunnels(&self, sender: &ComponentSender<Self>) {
-        for &id in self.tunnel_pages.keys() {
-            self.refresh_tunnel(id, sender);
+        for key in self.tabs.keys() {
+            if let TabKey::Node(id) = key {
+                self.refresh_tunnel(*id, sender);
+            }
         }
     }
 
     /// Draws a tunnel's tab again, if it is open.
     fn refresh_tunnel(&self, id: NodeId, sender: &ComponentSender<Self>) {
-        let (Some(page), Some(node)) = (self.tunnel_pages.get(&id), self.nodes.get(&id)) else {
+        let panel = self.tabs.get(&TabKey::Node(id)).map(|tab| &tab.panel);
+        let (Some(Panel::Tunnel(tunnel)), Some(node)) = (panel, self.nodes.get(&id)) else {
             return;
         };
         let send = |message: AppMsg| -> Rc<dyn Fn()> {
@@ -1367,7 +1632,7 @@ impl App {
         };
         let status = self.tunnels.get(&id).cloned().unwrap_or_default();
         let autostart = self.autostart.contains(&id);
-        tunnels::fill(page, node, &self.nodes, &status, autostart, &actions);
+        tunnel.fill(node, &self.nodes, &status, autostart, &actions);
     }
 
     /// Creates a tunnel in `parent`, or edits the tunnel `id`.
@@ -1422,7 +1687,7 @@ impl App {
             };
             let (core, input) = (core.clone(), input.clone());
             runtime().spawn(async move {
-                let result = match core.execute(command).await {
+                let result = match run(&core, command).await {
                     // Only the settings saved here: a file that changed
                     // meanwhile makes this fail rather than be approved.
                     Ok(Response::Node { node }) if autostart => {
@@ -1431,12 +1696,12 @@ impl App {
                             enabled: true,
                             expect: saved,
                         };
-                        core.execute(command).await
+                        run(&core, command).await
                     }
                     other => other,
                 };
-                if let Err(e) = result {
-                    let _ = input.send(AppMsg::Failed(e.to_string()));
+                if let Err(error) = result {
+                    let _ = input.send(AppMsg::Failed(error));
                 }
             });
         });
@@ -1489,10 +1754,7 @@ impl App {
             return;
         };
         if node.is_folder() {
-            if !self.expanded.remove(&id) {
-                self.expanded.insert(id);
-            }
-            self.sidebar_dirty = true;
+            widgets.sidebar.toggle(id);
         } else {
             self.open_tab_now(id, widgets, sender);
         }
@@ -1500,12 +1762,7 @@ impl App {
 
     fn open_tab(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
         // Reveal the node in the sidebar, then open it.
-        let mut parent = self.nodes.get(&id).and_then(|n| n.parent);
-        while let Some(folder) = parent {
-            self.expanded.insert(folder);
-            parent = self.nodes.get(&folder).and_then(|n| n.parent);
-        }
-        self.sidebar_dirty = true;
+        widgets.sidebar.reveal(id);
         if self.nodes.get(&id).is_some_and(|n| !n.is_folder()) {
             self.open_tab_now(id, widgets, sender);
         }
@@ -1513,61 +1770,40 @@ impl App {
 
     fn open_tab_now(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
         let key = TabKey::Node(id);
-        if let Some(tab) = self.tabs.get(&key) {
-            if let Some(index) = widgets.notebook.page_num(&tab.page) {
-                widgets.notebook.set_current_page(Some(index));
-            }
+        if self.show_tab(key, widgets) {
             return;
         }
         let Some(node) = self.nodes.get(&id) else {
             return;
         };
-        let icon = sidebar::icon_name(node, false, &self.icons()).to_string();
-        let (icon, name) = (icon.as_str(), node.name.clone());
         if node.kind == SSH_HOST_KIND {
-            let term = terminal::remote(
-                |_| {},
-                {
-                    let sender = sender.clone();
-                    move |data| sender.input(AppMsg::RemoteInput { node: id, data })
-                },
-                {
-                    let sender = sender.clone();
-                    move |cols, rows| {
-                        sender.input(AppMsg::RemoteResize {
-                            node: id,
-                            cols,
-                            rows,
-                        })
-                    }
-                },
-            );
-            let page = terminal::page(&term);
-            self.add_tab(key, page.upcast(), icon, &name, widgets, sender);
-            term.grab_focus();
-            remote::start(&self.core, id, &term, sender);
-            self.remotes.insert(id, Remote::new(term));
+            // The shell opened first.
+            let shell = (self.tabs.keys())
+                .filter_map(|key| match key {
+                    TabKey::Shell(node, n) if *node == id => Some(*n),
+                    _ => None,
+                })
+                .min();
+            if !shell.is_some_and(|n| self.show_tab(TabKey::Shell(id, n), widgets)) {
+                self.new_shell(id, widgets, sender);
+            }
             return;
         }
+        let icon = sidebar::icon_name(node, false, &self.icons()).to_string();
+        let (icon, name) = (icon.as_str(), node.name.clone());
         if node.kind == POSTGRES_KIND {
             let panel = Database::new(id, sender);
-            self.add_tab(
-                key,
-                panel.page.clone().upcast(),
-                icon,
-                &name,
-                widgets,
-                sender,
-            );
+            let page = panel.page.clone().upcast();
             database::start(&self.core, id, sender);
-            self.databases.insert(id, panel);
+            let panel = Panel::Database(panel);
+            self.add_tab(key, page, panel, icon, &name, widgets, sender);
             return;
         }
         if node.kind == SSH_TUNNEL_KIND {
-            let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
-            page.add_css_class("tunnel-view");
-            self.add_tab(key, page.clone().upcast(), icon, &name, widgets, sender);
-            self.tunnel_pages.insert(id, page);
+            let tunnel = tunnels::TunnelPage::new();
+            let page = tunnel.page.clone().upcast();
+            let panel = Panel::Tunnel(tunnel);
+            self.add_tab(key, page, panel, icon, &name, widgets, sender);
             self.refresh_tunnel(id, sender);
             return;
         }
@@ -1578,22 +1814,93 @@ impl App {
                 .child(&page)
                 .hscrollbar_policy(gtk::PolicyType::Never)
                 .build();
-            self.add_tab(key, scroller.upcast(), icon, &name, widgets, sender);
-            self.views.insert(id, page);
+            let panel = Panel::View(page);
+            self.add_tab(key, scroller.upcast(), panel, icon, &name, widgets, sender);
             self.load_view(id, sender);
             return;
         }
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        fill_page(&page, node, &self.nodes);
-        self.add_tab(key, page.upcast(), icon, &name, widgets, sender);
+        fill_page(&page, node, &self.kind_label(&node.kind), &self.nodes);
+        let panel = Panel::Placeholder(page.clone());
+        self.add_tab(key, page.upcast(), panel, icon, &name, widgets, sender);
+    }
+
+    /// Switches to the tab `key`. Returns whether it is open.
+    fn show_tab(&self, key: TabKey, widgets: &Widgets) -> bool {
+        let Some(tab) = self.tabs.get(&key) else {
+            return false;
+        };
+        if let Some(index) = widgets.notebook.page_num(&tab.page) {
+            widgets.notebook.set_current_page(Some(index));
+        }
+        true
+    }
+
+    /// Opens a new shell on the SSH host `id`.
+    fn new_shell(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
+        let Some(node) = self.nodes.get(&id).filter(|n| n.kind == SSH_HOST_KIND) else {
+            return;
+        };
+        let tab = TabKey::Shell(id, self.next_tab);
+        self.next_tab += 1;
+        // The lowest number not shown on another of the host's shells.
+        let taken: HashSet<u32> = (self.tabs.iter())
+            .filter_map(|(key, t)| match (key, &t.panel) {
+                (TabKey::Shell(node, _), Panel::Shell(remote)) if *node == id => {
+                    Some(remote.number)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut number = 1;
+        while taken.contains(&number) {
+            number += 1;
+        }
+        let term = terminal::remote(
+            {
+                let sender = sender.clone();
+                move |title| sender.input(AppMsg::RemoteTitle { tab, title })
+            },
+            {
+                let sender = sender.clone();
+                move |data| sender.input(AppMsg::RemoteInput { tab, data })
+            },
+            {
+                let sender = sender.clone();
+                move |cols, rows| sender.input(AppMsg::RemoteResize { tab, cols, rows })
+            },
+        );
+        // The host's other tabs, a click away rather than in its context
+        // menu. The buttons leave the focus in the terminal.
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        bar.add_css_class("shell-bar");
+        for (label, message) in [
+            ("Files", AppMsg::OpenFiles(id)),
+            ("Monitor", AppMsg::OpenMonitor(id)),
+            ("New shell", AppMsg::NewShell(id)),
+        ] {
+            let button = gtk::Button::with_label(label);
+            button.add_css_class("flat");
+            button.set_focus_on_click(false);
+            send_on_click(&button, sender, message);
+            bar.append(&button);
+        }
+        let scroller = terminal::page(&term);
+        scroller.set_vexpand(true);
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page.append(&bar);
+        page.append(&scroller);
+        remote::start(&self.core, tab, id, &term, sender);
+        term.grab_focus();
+        let icon = sidebar::icon_name(node, false, &self.icons()).to_string();
+        let title = shell_title(&node.name, number);
+        let panel = Panel::Shell(Remote::new(term, number));
+        self.add_tab(tab, page.upcast(), panel, &icon, &title, widgets, sender);
     }
 
     fn open_files(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
         let key = TabKey::Files(id);
-        if let Some(tab) = self.tabs.get(&key) {
-            if let Some(index) = widgets.notebook.page_num(&tab.page) {
-                widgets.notebook.set_current_page(Some(index));
-            }
+        if self.show_tab(key, widgets) {
             return;
         }
         let Some(node) = self.nodes.get(&id).filter(|n| n.kind == SSH_HOST_KIND) else {
@@ -1602,17 +1909,14 @@ impl App {
         let title = files_title(&node.name);
         let panel = Files::new(id, sender);
         let page = panel.page.clone().upcast();
-        self.add_tab(key, page, "folder-remote-symbolic", &title, widgets, sender);
         files::start(&self.core, id, sender);
-        self.files.insert(id, panel);
+        let (panel, icon) = (Panel::Files(panel), "folder-remote-symbolic");
+        self.add_tab(key, page, panel, icon, &title, widgets, sender);
     }
 
     fn open_monitor(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
         let key = TabKey::Monitor(id);
-        if let Some(tab) = self.tabs.get(&key) {
-            if let Some(index) = widgets.notebook.page_num(&tab.page) {
-                widgets.notebook.set_current_page(Some(index));
-            }
+        if self.show_tab(key, widgets) {
             return;
         }
         let Some(node) = self.nodes.get(&id).filter(|n| n.kind == SSH_HOST_KIND) else {
@@ -1622,19 +1926,28 @@ impl App {
         let panel = Monitor::new(id, sender);
         let page = panel.page.clone().upcast();
         let icon = "utilities-system-monitor-symbolic";
-        self.add_tab(key, page, icon, &title, widgets, sender);
         monitor::start(&self.core, id, sender);
-        self.monitors.insert(id, panel);
+        self.add_tab(
+            key,
+            page,
+            Panel::Monitor(panel),
+            icon,
+            &title,
+            widgets,
+            sender,
+        );
         self.refresh_monitors();
     }
 
     /// Shows each monitor tab whether its host is monitored in the
     /// background, and its alerts.
     fn refresh_monitors(&mut self) {
-        for (node, panel) in &mut self.monitors {
-            panel.set_background(self.monitoring.contains(node));
-            let alerts: Vec<&Alert> = self.alerts.iter().filter(|a| a.node == *node).collect();
-            panel.set_alerts(&alerts);
+        for (key, tab) in &mut self.tabs {
+            if let (TabKey::Monitor(node), Panel::Monitor(panel)) = (key, &mut tab.panel) {
+                panel.set_background(self.monitoring.contains(node));
+                let alerts: Vec<&Alert> = self.alerts.iter().filter(|a| a.node == *node).collect();
+                panel.set_alerts(&alerts);
+            }
         }
     }
 
@@ -1653,8 +1966,8 @@ impl App {
         let (core, input) = (self.core.clone(), sender.input_sender().clone());
         let send = move |command: Command| {
             runtime().spawn(async move {
-                if let Err(e) = core.execute(command).await {
-                    let _ = input.send(AppMsg::MonitoringFailed(e.to_string()));
+                if let Err(error) = run(&core, command).await {
+                    let _ = input.send(AppMsg::MonitoringFailed(error));
                 }
             });
         };
@@ -1701,8 +2014,8 @@ impl App {
         widgets: &Widgets,
         sender: &ComponentSender<Self>,
     ) {
-        let id = self.next_terminal;
-        self.next_terminal += 1;
+        let id = self.next_tab;
+        self.next_tab += 1;
         let shell = shell.unwrap_or_else(terminal::default_shell);
         let term = terminal::new(
             &shell,
@@ -1718,10 +2031,12 @@ impl App {
         let page = terminal::page(&term);
         let key = TabKey::Terminal(id);
         let name = terminal::shell_name(&shell);
+        let icon = "utilities-terminal-symbolic";
         self.add_tab(
             key,
             page.upcast(),
-            "utilities-terminal-symbolic",
+            Panel::Terminal,
+            icon,
             name,
             widgets,
             sender,
@@ -1729,10 +2044,12 @@ impl App {
         term.grab_focus();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_tab(
         &mut self,
         key: TabKey,
         page: gtk::Widget,
+        panel: Panel,
         icon: &str,
         name: &str,
         widgets: &Widgets,
@@ -1750,36 +2067,32 @@ impl App {
         tab_label.append(&title);
         tab_label.append(&close);
 
+        // Middle-click closes a tab, as in browsers and other terminals.
+        let middle_click = gtk::GestureClick::new();
+        middle_click.set_button(gdk::BUTTON_MIDDLE);
+        middle_click.connect_released({
+            let sender = sender.clone();
+            move |_, _, _, _| sender.input(AppMsg::CloseTab(key))
+        });
+        tab_label.add_controller(middle_click);
+
         let notebook = &widgets.notebook;
         let index = notebook.append_page(&page, Some(&tab_label));
         notebook.set_tab_reorderable(&page, true);
         notebook.set_current_page(Some(index));
 
         send_on_click(&close, sender, AppMsg::CloseTab(key));
-        self.tabs.insert(key, Tab { page, title });
+        self.tabs.insert(key, Tab { page, title, panel });
     }
 
     fn close_tab(&mut self, key: TabKey, widgets: &Widgets) {
-        if let Some(tab) = self.tabs.remove(&key) {
-            close_page(&widgets.notebook, &tab.page);
-        }
-        if let TabKey::Node(id) = key {
-            self.views.remove(&id);
-            self.tunnel_pages.remove(&id);
-        }
+        let Some(tab) = self.tabs.remove(&key) else {
+            return;
+        };
+        close_page(&widgets.notebook, &tab.page);
         // A session still starting is closed when its id arrives. Closing
         // a file panel's session stops its transfers too.
-        let state = match key {
-            TabKey::Node(id) => self
-                .remotes
-                .remove(&id)
-                .map(|r| r.state)
-                .or_else(|| self.databases.remove(&id).map(|d| d.state)),
-            TabKey::Files(id) => self.files.remove(&id).map(|f| f.state),
-            TabKey::Monitor(id) => self.monitors.remove(&id).map(|m| m.state),
-            TabKey::Terminal(_) => None,
-        };
-        if let Some(remote::State::Running(session)) = state {
+        if let Some(session::State::Running(session)) = tab.panel.session() {
             let core = self.core.clone();
             runtime().spawn(async move {
                 let _ = core.execute(Command::CloseSession { session }).await;
@@ -1868,10 +2181,13 @@ impl App {
         let Some(node) = self.nodes.get(&id) else {
             return;
         };
+        // The core closes the sessions of every node it deletes.
         let detail = if node.is_folder() {
-            "Everything inside it is deleted too, along with any saved passwords."
+            "Everything inside it is deleted too, along with any saved passwords. \
+             Anything running on what it holds, such as a terminal or a tunnel, stops."
         } else {
-            "Its saved passwords are removed from the keyring too."
+            "Its saved passwords are removed from the keyring too. Anything running \
+             on it, such as a terminal or a tunnel, stops."
         };
         let (core, sender) = (self.core.clone(), sender.clone());
         dialogs::confirm(
@@ -1892,6 +2208,35 @@ impl App {
         );
     }
 
+    /// "Move to…", for keyboard users and long lists, where dragging is
+    /// awkward.
+    fn move_to(&self, id: NodeId, window: &gtk::ApplicationWindow, sender: &ComponentSender<Self>) {
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        let choices = sidebar::move_choices(&self.nodes, id);
+        let (core, sender) = (self.core.clone(), sender.clone());
+        sidebar::move_dialog(window, node, choices, move |parent| {
+            execute(&core, &sender, Command::MoveNode { id, parent });
+        });
+    }
+
+    fn colour(&self, id: NodeId, window: &gtk::ApplicationWindow, sender: &ComponentSender<Self>) {
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        let (core, sender, current) = (self.core.clone(), sender.clone(), node.color.clone());
+        sidebar::colour_dialog(window, node, move |color| {
+            if color != current {
+                let patch = NodePatch {
+                    color: Some(color),
+                    ..Default::default()
+                };
+                execute(&core, &sender, Command::UpdateNode { id, patch });
+            }
+        });
+    }
+
     fn context_menu(
         &self,
         id: Option<NodeId>,
@@ -1909,6 +2254,7 @@ impl App {
             Some(node) => {
                 entries.push(("Open".into(), AppMsg::Open(node.id)));
                 if node.kind == SSH_HOST_KIND {
+                    entries.push(("New shell".into(), AppMsg::NewShell(node.id)));
                     entries.push(("Browse files".into(), AppMsg::OpenFiles(node.id)));
                     entries.push(("Monitor".into(), AppMsg::OpenMonitor(node.id)));
                 }
@@ -1945,21 +2291,17 @@ impl App {
         }
         if let Some(node) = node {
             entries.push(("Rename…".into(), AppMsg::Rename(node.id)));
+            entries.push(("Move to…".into(), AppMsg::MoveTo(node.id)));
+            entries.push(("Colour…".into(), AppMsg::Colour(node.id)));
             entries.push(("Delete…".into(), AppMsg::Delete(node.id)));
         }
         let popover = menu_popover(entries, sender);
-        // Parented to the pane, not the list: the list is rebuilt wholesale
-        // on every change, and `ListBox::remove_all` never returns while a
-        // child that isn't a row is parented to it. A rebuild can land while
-        // the menu is open ("Open" reveals the node's folders, and events
-        // arrive at any time), and the window would hang.
-        let point = graphene::Point::new(x as f32, y as f32);
-        let point = widgets
-            .list
-            .compute_point(&widgets.sidebar_pane, &point)
-            .unwrap_or(point);
+        // Parented to the pane, never to the list view: the view owns its
+        // children and adds and removes them as rows come and go, and a
+        // popover among a list's children once hung the window when the
+        // list changed while the menu was open (commit 9fa1e36).
         popover.set_parent(&widgets.sidebar_pane);
-        let (x, y) = (point.x() as i32, point.y() as i32);
+        let (x, y) = (x as i32, y as i32);
         popover.set_pointing_to(Some(&gdk::Rectangle::new(x, y, 1, 1)));
         popover.connect_closed(|popover| {
             // Unparented once the signal has returned, not inside it.
@@ -2025,6 +2367,15 @@ impl App {
                  programs on the database server.",
             );
         }
+        if node.kind == SSH_HOST_KIND {
+            details.push_str(&format!(
+                "\n\n“{}” amounts to running commands, since it can change \
+                 ~/.ssh/authorized_keys or shell start-up files. Give it as carefully \
+                 as “{}”.",
+                capability_label(Capability::FilesWrite),
+                capability_label(Capability::Exec),
+            ));
+        }
         let offered = capabilities(&node.kind);
         let options = offered
             .iter()
@@ -2062,8 +2413,8 @@ impl App {
             command("Toggle sidebar", AppMsg::ToggleSidebar),
             command("Reload config", AppMsg::ReloadConfig),
             command("Open config folder", AppMsg::OpenConfigFolder),
-            command("Manage addons", AppMsg::ManageAddons),
-            command("Settings", AppMsg::ShowSettings),
+            command("Manage addons…", AppMsg::ManageAddons),
+            command("Settings…", AppMsg::ShowSettings),
         ]);
         for addon in self.addons.iter().filter(|a| addons::usable(a)) {
             items.extend(addon.commands.iter().map(|c| Item {
@@ -2092,6 +2443,11 @@ impl App {
                     let subtitle = sidebar::location(&self.nodes, node);
                     [
                         Item {
+                            title: format!("New shell: {}", node.name),
+                            subtitle: subtitle.clone(),
+                            message: AppMsg::NewShell(node.id),
+                        },
+                        Item {
                             title: format!("Browse files: {}", node.name),
                             subtitle: subtitle.clone(),
                             message: AppMsg::OpenFiles(node.id),
@@ -2107,17 +2463,45 @@ impl App {
         items.extend(nodes.into_iter().map(|node| {
             Item {
                 title: node.name.clone(),
-                subtitle: [node.kind.as_str(), &sidebar::location(&self.nodes, node)]
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(" · "),
+                subtitle: [
+                    self.kind_label(&node.kind),
+                    sidebar::location(&self.nodes, node),
+                ]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · "),
                 message: AppMsg::Open(node.id),
             }
         }));
         let sender = sender.clone();
         palette::show(window, items, move |message| sender.input(message));
+    }
+
+    /// Closes the window, first asking when that would end terminals: local
+    /// shells end with the window, and burrowd closes this client's SSH
+    /// sessions when it goes.
+    fn close_window(&self, window: &gtk::ApplicationWindow) {
+        let open = (self.tabs.values())
+            .filter(|tab| match &tab.panel {
+                Panel::Shell(remote) => matches!(remote.state, session::State::Running(_)),
+                Panel::Terminal => true,
+                _ => false,
+            })
+            .count();
+        if open == 0 {
+            window.destroy();
+            return;
+        }
+        let detail = if open == 1 {
+            "A terminal is open. Closing Burrow ends it.".to_string()
+        } else {
+            format!("{open} terminals are open. Closing Burrow ends them.")
+        };
+        let target = window.clone();
+        dialogs::confirm(window, "Close Burrow?", &detail, "Close", move || {
+            target.destroy()
+        });
     }
 
     fn apply_theme(&self) {
@@ -2138,31 +2522,57 @@ impl App {
 
     fn save_settings(&mut self) {
         if let Err(e) = self.settings.save(&self.config_dir) {
-            self.error = Some(format!("Could not save settings: {e}"));
+            self.fail(format!("Could not save settings: {e}"));
         }
     }
 
+    /// Shows `error` in the status bar until the user does something or a
+    /// newer error replaces it, and keeps it in the errors list.
+    fn fail(&mut self, error: String) {
+        let time = glib::DateTime::now_local()
+            .and_then(|now| now.format("%H:%M:%S"))
+            .map(|time| time.to_string())
+            .unwrap_or_default();
+        self.errors.push(time, error.clone());
+        self.error = Some(error);
+    }
+
     fn refresh_status(&self, widgets: &Widgets) {
-        match (&self.error, &self.notice) {
-            (Some(error), _) => {
-                widgets.status.set_label(error);
-                widgets.status.add_css_class("error");
-            }
-            (None, Some(notice)) => {
-                widgets.status.set_label(notice);
-                widgets.status.remove_css_class("error");
-            }
-            (None, None) => {
-                let leaves = self.nodes.values().filter(|n| !n.is_folder()).count();
-                let folders = self.nodes.len() - leaves;
-                widgets.status.set_label(&format!(
-                    "{leaves} {} · {folders} {}",
-                    plural(leaves, "item", "items"),
-                    plural(folders, "folder", "folders"),
-                ));
-                widgets.status.remove_css_class("error");
-            }
+        let (text, is_error) = if self.reconnecting {
+            // Stays up until the new connection is, with why the last try
+            // failed beside it.
+            let lost = "Lost the connection to burrowd. Reconnecting…";
+            let text = match &self.error {
+                Some(error) => format!("{lost} ({error})"),
+                None => lost.to_string(),
+            };
+            (text, true)
+        } else if let Some(error) = &self.error {
+            (error.clone(), true)
+        } else if let Some(notice) = &self.notice {
+            (notice.clone(), false)
+        } else {
+            let leaves = self.nodes.values().filter(|n| !n.is_folder()).count();
+            let folders = self.nodes.len() - leaves;
+            let text = format!(
+                "{leaves} {} · {folders} {}",
+                plural(leaves, "item", "items"),
+                plural(folders, "folder", "folders"),
+            );
+            (text, false)
+        };
+        widgets.status.set_label(&text);
+        if is_error {
+            widgets.status.add_css_class("error");
+        } else {
+            widgets.status.remove_css_class("error");
         }
+        let errors = self.errors.0.len();
+        widgets.errors_button.set_visible(errors > 0);
+        widgets
+            .errors_button
+            .set_label(&format!("{errors} {}", plural(errors, "error", "errors")));
+        widgets.errors_list.set_label(&self.errors.text());
         widgets
             .problems_button
             .set_visible(!self.problems.is_empty());
@@ -2187,10 +2597,47 @@ impl App {
 fn execute(core: &Client, sender: &ComponentSender<App>, command: Command) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
-        if let Err(e) = core.execute(command).await {
-            let _ = input.send(AppMsg::Failed(e.to_string()));
+        if let Err(error) = run(&core, command).await {
+            let _ = input.send(AppMsg::Failed(error));
         }
     });
+}
+
+/// Runs a command, naming it in the error, so that "permission denied"
+/// says what was denied.
+async fn run(core: &Client, command: Command) -> Result<Response, String> {
+    let name = command_name(&command);
+    core.execute(command)
+        .await
+        .map_err(|e| format!("{name}: {e}"))
+}
+
+/// The command's `type` as the API names it, such as `start_tunnel`. It is
+/// read from the start of the command's `Debug` text, and the writer stops
+/// there, so a command carrying a file's bytes isn't formatted whole.
+fn command_name(command: &Command) -> String {
+    use std::fmt::Write;
+
+    /// serde's `snake_case` of the variant name.
+    struct Name(String);
+    impl Write for Name {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            for c in text.chars() {
+                if !c.is_ascii_alphanumeric() {
+                    return Err(std::fmt::Error);
+                }
+                if c.is_ascii_uppercase() && !self.0.is_empty() {
+                    self.0.push('_');
+                }
+                self.0.push(c.to_ascii_lowercase());
+            }
+            Ok(())
+        }
+    }
+    let mut name = Name(String::new());
+    // Fails, on purpose, at the first character after the name.
+    let _ = write!(name, "{command:?}");
+    name.0
 }
 
 /// Loads the full node list, problems, addons, sessions and autostart
@@ -2199,35 +2646,35 @@ fn load(core: &Client, sender: &ComponentSender<App>) {
     let (core, input) = (core.clone(), sender.input_sender().clone());
     runtime().spawn(async move {
         let result = async {
-            let nodes = match core.execute(Command::ListNodes).await? {
+            let nodes = match run(&core, Command::ListNodes).await? {
                 Response::Nodes { nodes } => nodes,
                 _ => Vec::new(),
             };
-            let problems = match core.execute(Command::ListProblems).await? {
+            let problems = match run(&core, Command::ListProblems).await? {
                 Response::Problems { problems } => problems,
                 _ => Vec::new(),
             };
-            let addons = match core.execute(Command::ListAddons).await? {
+            let addons = match run(&core, Command::ListAddons).await? {
                 Response::Addons { addons } => addons,
                 _ => Vec::new(),
             };
-            let sessions = match core.execute(Command::ListSessions).await? {
+            let sessions = match run(&core, Command::ListSessions).await? {
                 Response::Sessions { sessions } => sessions,
                 _ => Vec::new(),
             };
-            let autostart = match core.execute(Command::ListAutostart).await? {
+            let autostart = match run(&core, Command::ListAutostart).await? {
                 Response::Autostart { nodes } => nodes,
                 _ => Vec::new(),
             };
-            let monitoring = match core.execute(Command::ListMonitoring).await? {
+            let monitoring = match run(&core, Command::ListMonitoring).await? {
                 Response::Monitoring { nodes } => nodes,
                 _ => Vec::new(),
             };
-            let alerts = match core.execute(Command::ListAlerts).await? {
+            let alerts = match run(&core, Command::ListAlerts).await? {
                 Response::Alerts { alerts } => alerts,
                 _ => Vec::new(),
             };
-            Ok::<_, burrow_core::Error>(AppMsg::Loaded {
+            Ok::<_, String>(AppMsg::Loaded {
                 nodes,
                 problems,
                 addons,
@@ -2238,7 +2685,7 @@ fn load(core: &Client, sender: &ComponentSender<App>) {
             })
         }
         .await;
-        let _ = input.send(result.unwrap_or_else(|e| AppMsg::Failed(e.to_string())));
+        let _ = input.send(result.unwrap_or_else(AppMsg::Failed));
     });
 }
 
@@ -2273,6 +2720,7 @@ fn listen(core: &Client, sender: &ComponentSender<App>) {
         if input.send(AppMsg::Disconnected).is_err() {
             return;
         }
+        let mut last = String::new();
         loop {
             match ipc::connect(Role::Gui).await {
                 Ok(client) => {
@@ -2280,7 +2728,16 @@ fn listen(core: &Client, sender: &ComponentSender<App>) {
                     return;
                 }
                 Err(e) => {
-                    eprintln!("burrow: could not reach burrowd: {e}");
+                    let error = format!("could not reach burrowd: {e}");
+                    eprintln!("burrow: {error}");
+                    // Only a new reason: one every two seconds would push
+                    // everything else out of the errors list.
+                    if error != last {
+                        if input.send(AppMsg::Failed(error.clone())).is_err() {
+                            return; // The window is gone.
+                        }
+                        last = error;
+                    }
                     tokio::time::sleep(RECONNECT_DELAY).await;
                 }
             }
@@ -2329,8 +2786,7 @@ fn capability_label(capability: Capability) -> &'static str {
 }
 
 fn selected(widgets: &Widgets) -> Option<NodeId> {
-    let row = widgets.list.selected_row()?;
-    widgets.row_ids.get(row.index() as usize).copied()
+    widgets.sidebar.selected()
 }
 
 fn close_page(notebook: &gtk::Notebook, page: &gtk::Widget) {
@@ -2342,10 +2798,19 @@ fn close_page(notebook: &gtk::Notebook, page: &gtk::Widget) {
 /// Long titles (a shell's working folder, say) are cut short with "…".
 /// Notebooks give tab labels only their minimum width, and an ellipsized
 /// label's minimum is just the "…", so the minimum is set to fit the text.
+/// A title that is cut short shows in full on hover.
 fn set_tab_title(label: &gtk::Label, title: &str) {
-    const MAX_CHARS: usize = 24;
     label.set_label(title);
-    label.set_width_chars(title.chars().count().min(MAX_CHARS) as i32);
+    label.set_width_chars(title.chars().count().min(MAX_TITLE_CHARS) as i32);
+    label.set_tooltip_text(title_tooltip(title));
+}
+
+/// How many characters of a tab's title show before it is cut short.
+const MAX_TITLE_CHARS: usize = 24;
+
+/// A tab title's tooltip: the title, if it is cut short.
+fn title_tooltip(title: &str) -> Option<&str> {
+    (title.chars().count() > MAX_TITLE_CHARS).then_some(title)
 }
 
 /// A tunnel's settings as the window shows them, for `set_autostart`:
@@ -2360,11 +2825,22 @@ fn shown(nodes: &HashMap<NodeId, Node>, props: &toml::Table) -> Option<TunnelSho
     })
 }
 
-/// The title of an SSH host's file panel tab.
+/// The title of an SSH host's shell tab: the host for the first, and a
+/// number for the rest.
+fn shell_title(host: &str, number: u32) -> String {
+    if number == 1 {
+        host.to_string()
+    } else {
+        format!("{host} ({number})")
+    }
+}
+
+/// The title of an SSH host's monitor tab.
 fn monitor_title(host: &str) -> String {
     format!("{host} monitor")
 }
 
+/// The title of an SSH host's file panel tab.
 fn files_title(host: &str) -> String {
     format!("{host} files")
 }
@@ -2373,8 +2849,17 @@ fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 { one } else { many }
 }
 
+/// `text` with its first letter capitalised, as "Folder" for "folder".
+fn sentence_case(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
 /// Placeholder page for a node until its addon provides a real view.
-fn fill_page(page: &gtk::Box, node: &Node, nodes: &HashMap<NodeId, Node>) {
+/// `kind` names the node's kind, as [`App::kind_label`] does.
+fn fill_page(page: &gtk::Box, node: &Node, kind: &str, nodes: &HashMap<NodeId, Node>) {
     while let Some(child) = page.first_child() {
         page.remove(&child);
     }
@@ -2389,9 +2874,9 @@ fn fill_page(page: &gtk::Box, node: &Node, nodes: &HashMap<NodeId, Node>) {
 
     let location = sidebar::location(nodes, node);
     let subtitle = gtk::Label::new(Some(&if location.is_empty() {
-        node.kind.clone()
+        kind.to_string()
     } else {
-        format!("{} · {location}", node.kind)
+        format!("{kind} · {location}")
     }));
     subtitle.set_xalign(0.0);
     subtitle.add_css_class("dim");
@@ -2430,13 +2915,17 @@ fn menu_popover(
         if let Some(child) = button.child().and_downcast::<gtk::Label>() {
             child.set_xalign(0.0);
         }
-        button.connect_clicked({
-            let (popover, sender) = (popover.clone(), sender.clone());
+        // Weak: the button is inside the popover.
+        button.connect_clicked(glib::clone!(
+            #[weak]
+            popover,
+            #[strong]
+            sender,
             move |_| {
                 popover.popdown();
                 sender.input(message.clone());
             }
-        });
+        ));
         column.append(&button);
     }
     popover.set_child(Some(&column));
@@ -2465,7 +2954,7 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
             ("Reload config", AppMsg::ReloadConfig),
             ("Open config folder", AppMsg::OpenConfigFolder),
             ("Addons…", AppMsg::ManageAddons),
-            ("Settings    Ctrl+,", AppMsg::ShowSettings),
+            ("Settings…    Ctrl+,", AppMsg::ShowSettings),
         ],
         sender,
     )));
@@ -2477,49 +2966,8 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
     window.set_titlebar(Some(&header));
 
     // Sidebar.
-    let list = gtk::ListBox::new();
-    list.add_css_class("navigation-sidebar");
-    list.set_selection_mode(gtk::SelectionMode::Single);
-    list.connect_row_activated({
-        let sender = sender.clone();
-        move |_, row| sender.input(AppMsg::RowActivated(row.index()))
-    });
-    let right_click = gtk::GestureClick::new();
-    right_click.set_button(gdk::BUTTON_SECONDARY);
-    right_click.connect_pressed({
-        let (sender, list) = (sender.clone(), list.clone());
-        move |_, _, x, y| {
-            let row = list.row_at_y(y as i32).map(|r| r.index());
-            sender.input(AppMsg::ContextMenu { row, x, y });
-        }
-    });
-    list.add_controller(right_click);
-    // Delete and F2 only apply while the sidebar has focus, so they never
-    // eat a keypress meant for a text field or a terminal.
-    let keys = gtk::EventControllerKey::new();
-    keys.connect_key_pressed({
-        let sender = sender.clone();
-        move |_, key, _, _| {
-            let message = match key {
-                gdk::Key::Delete => AppMsg::DeleteSelected,
-                gdk::Key::F2 => AppMsg::RenameSelected,
-                _ => return glib::Propagation::Proceed,
-            };
-            sender.input(message);
-            glib::Propagation::Stop
-        }
-    });
-    list.add_controller(keys);
-
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&list)
-        .vexpand(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .build();
-    let sidebar_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    sidebar_pane.add_css_class("sidebar");
-    sidebar_pane.set_size_request(240, -1);
-    sidebar_pane.append(&scroller);
+    let sidebar = sidebar::Sidebar::new(sender);
+    let sidebar_pane = sidebar.pane.clone();
 
     // Tabs, with a welcome page when none are open.
     let notebook = gtk::Notebook::new();
@@ -2566,9 +3014,43 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
     problems_button.add_css_class("warning");
     problems_button.set_popover(Some(&problems_popover));
     problems_button.set_visible(false);
+
+    let errors_list = gtk::Label::new(None);
+    errors_list.set_xalign(0.0);
+    errors_list.set_selectable(true);
+    errors_list.set_wrap(true);
+    errors_list.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    errors_list.set_max_width_chars(72);
+    let errors_scroller = gtk::ScrolledWindow::builder()
+        .child(&errors_list)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_width(true)
+        .propagate_natural_height(true)
+        .max_content_height(320)
+        .build();
+    let clear_errors = gtk::Button::with_label("Clear");
+    clear_errors.set_halign(gtk::Align::End);
+    send_on_click(&clear_errors, sender, AppMsg::ClearErrors);
+    let errors_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    errors_content.set_margin_top(8);
+    errors_content.set_margin_bottom(8);
+    errors_content.set_margin_start(8);
+    errors_content.set_margin_end(8);
+    errors_content.append(&errors_scroller);
+    errors_content.append(&clear_errors);
+    let errors_popover = gtk::Popover::new();
+    errors_popover.set_child(Some(&errors_content));
+    let errors_button = gtk::MenuButton::new();
+    errors_button.add_css_class("flat");
+    errors_button.add_css_class("error");
+    errors_button.set_tooltip_text(Some("Recent errors"));
+    errors_button.set_popover(Some(&errors_popover));
+    errors_button.set_visible(false);
+
     let statusbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     statusbar.add_css_class("statusbar");
     statusbar.append(&status);
+    statusbar.append(&errors_button);
     statusbar.append(&problems_button);
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -2578,14 +3060,15 @@ fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>) -> Widg
 
     Widgets {
         sidebar_pane,
-        list,
-        row_ids: Vec::new(),
+        sidebar,
         content,
         notebook,
         new_button,
         status,
         problems_button,
         problems_list,
+        errors_button,
+        errors_list,
     }
 }
 
@@ -2600,8 +3083,12 @@ fn welcome() -> gtk::Box {
         ("Ctrl+Shift+T", "New terminal"),
         ("Ctrl+Shift+P", "Command palette"),
         ("Ctrl+Shift+B", "Toggle sidebar"),
+        ("Ctrl+Shift+S", "Focus sidebar"),
         ("Ctrl+Shift+W", "Close tab"),
         ("F2", "Rename the selected item"),
+        // Not keys, but the two things the window doesn't show by itself.
+        ("+", "Add a host, tunnel or database"),
+        ("Right-click", "Open a host's files or monitor"),
     ] {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let key = gtk::Label::new(Some(keys));
@@ -2634,11 +3121,16 @@ fn add_shortcuts(window: &gtk::ApplicationWindow, sender: &ComponentSender<App>)
         ("<Control><Shift>t", AppMsg::NewTerminal(None)),
         ("<Control><Shift>p", AppMsg::ShowPalette),
         ("<Control><Shift>b", AppMsg::ToggleSidebar),
+        // A terminal keeps Tab for itself, so this is the way back.
+        ("<Control><Shift>s", AppMsg::FocusSidebar),
         ("<Control><Shift>w", AppMsg::CloseCurrentTab),
         ("<Control><Shift>r", AppMsg::ReloadConfig),
         ("<Control>comma", AppMsg::ShowSettings),
         ("<Control>Page_Down", AppMsg::SwitchTab(1)),
         ("<Control>Page_Up", AppMsg::SwitchTab(-1)),
+        ("<Control>Tab", AppMsg::SwitchTab(1)),
+        // GTK matches this to the ISO_Left_Tab that Shift+Tab sends.
+        ("<Control><Shift>Tab", AppMsg::SwitchTab(-1)),
     ];
     for (trigger, message) in shortcuts {
         let sender = sender.clone();
@@ -2690,4 +3182,46 @@ fn show_settings(window: &gtk::ApplicationWindow, current: Theme, sender: &Compo
     dialog.set_child(Some(&grid));
     dialogs::close_on_escape(&dialog);
     dialog.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_named_as_the_api_names_them() {
+        assert_eq!(command_name(&Command::ListNodes), "list_nodes");
+        let node = NodeId::new();
+        assert_eq!(command_name(&Command::StartTunnel { node }), "start_tunnel");
+        let close = Command::CloseSession {
+            session: SessionId(7),
+        };
+        assert_eq!(command_name(&close), "close_session");
+    }
+
+    #[test]
+    fn shells_after_the_first_are_numbered() {
+        assert_eq!(shell_title("web", 1), "web");
+        assert_eq!(shell_title("web", 2), "web (2)");
+    }
+
+    #[test]
+    fn kind_labels_start_with_a_capital() {
+        assert_eq!(sentence_case("folder"), "Folder");
+        assert_eq!(sentence_case("SSH host"), "SSH host");
+        assert_eq!(sentence_case(""), "");
+    }
+
+    #[test]
+    fn the_error_log_keeps_the_newest() {
+        let mut log = ErrorLog::default();
+        for n in 0..MAX_ERRORS + 10 {
+            log.push(format!("t{n}"), format!("error {n}"));
+        }
+        assert_eq!(log.0.len(), MAX_ERRORS);
+        let text = log.text();
+        let first = text.lines().next().unwrap();
+        assert_eq!(first, format!("t{0}  error {0}", MAX_ERRORS + 9));
+        assert!(!text.contains("error 9\n") && text.ends_with("error 10"));
+    }
 }

@@ -122,20 +122,58 @@ async fn the_mcp_bridge_reads_the_sidebar_but_changes_nothing() {
         let error = mcp.execute(command).await.unwrap_err();
         assert!(error.to_string().contains("MCP bridge may not"), "{error}");
     }
+    let other = Client::connect(&socket, Role::Mcp).await.unwrap();
+    assert!(other.execute(Command::ListNodes).await.is_ok());
 
-    // Every command is in the audit log; a refused one by its type only.
-    let log = std::fs::read_to_string(dir.path().join("state/mcp-audit.log")).unwrap();
-    let lines: Vec<serde_json::Value> = log
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(lines.len(), 7);
+    // Every command is in the audit log; a refused one by its type only,
+    // and without a rule.
+    let lines = audit_log(dir.path());
+    assert_eq!(lines.len(), 8);
     assert_eq!(lines[0]["ok"], true);
+    assert_eq!(lines[0]["rule"], "run");
     assert_eq!(
         lines[1]["command"],
         serde_json::json!({"type": "create_node"})
     );
     assert_eq!(lines[1]["ok"], false);
+    assert!(lines[1].get("rule").is_none());
+    // Each bridge's lines carry its own connection.
+    assert!(lines[0]["connection"].is_u64());
+    assert_eq!(lines[1]["connection"], lines[0]["connection"]);
+    assert_ne!(lines[7]["connection"], lines[0]["connection"]);
+}
+
+/// The lines of the MCP bridge's audit log.
+fn audit_log(dir: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(dir.join("state/mcp-audit.log"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mcp_audit_log_keeps_five_old_files() {
+    let dir = TempDir::new().unwrap();
+    let socket = serve(core(dir.path()), dir.path());
+    let log = dir.path().join("state/mcp-audit.log");
+    let old = |n: u32| log.with_extension(format!("log.{n}"));
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    // Full, at the size docs/API.md gives.
+    std::fs::write(&log, vec![b'\n'; 8 << 20]).unwrap();
+    for n in 1..=5 {
+        std::fs::write(old(n), format!("{n}\n")).unwrap();
+    }
+
+    let mcp = Client::connect(&socket, Role::Mcp).await.unwrap();
+    mcp.execute(Command::ListNodes).await.unwrap();
+    assert_eq!(audit_log(dir.path()).len(), 1);
+    assert_eq!(std::fs::metadata(old(1)).unwrap().len(), 8 << 20);
+    for n in 2..=5 {
+        let moved = std::fs::read_to_string(old(n)).unwrap();
+        assert_eq!(moved, format!("{}\n", n - 1));
+    }
+    assert!(!old(6).exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -342,6 +380,34 @@ async fn the_mcp_bridge_runs_commands_only_where_granted() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("files-read"), "{error}");
+
+    // The audit log ties a session to the node it was opened on.
+    let capabilities = [
+        burrow_core::Capability::Exec,
+        burrow_core::Capability::FilesRead,
+    ];
+    grant(&gui, &node, &capabilities).await;
+    let Response::Session { session } = mcp
+        .execute(Command::OpenFiles { node: node.id })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a session");
+    };
+    let _ = mcp
+        .execute(Command::ListDir {
+            session,
+            path: String::new(),
+        })
+        .await;
+    let lines = audit_log(server.dir.path());
+    let opened = &lines[lines.len() - 2];
+    assert_eq!(opened["command"]["node"], node.id.to_string());
+    assert_eq!(opened["session"], serde_json::json!(session));
+    assert_eq!(
+        lines[lines.len() - 1]["command"]["session"],
+        opened["session"]
+    );
 
     // A node file pointed elsewhere keeps its id but loses the grant.
     let mut props = node.props.clone();

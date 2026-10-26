@@ -26,13 +26,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::{AddonInfo, AddonState, Event, FormValue, Node, Problem, View};
 use crate::engine::Core;
 use crate::error::{Error, Result};
-use crate::tree::write_atomic;
+use crate::pins::Pinned;
 
 #[cfg(test)]
 pub(crate) use manifest::load as load_manifest;
@@ -43,16 +43,12 @@ use rpc::Process;
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-/// The state file holding approvals: addon id to approved fingerprint.
-#[derive(Default, Serialize, Deserialize)]
-struct Grants {
-    #[serde(default)]
-    approved: BTreeMap<String, String>,
-}
-
 pub(crate) struct Host {
     dir: PathBuf,
-    grants_path: PathBuf,
+    /// Addon id to the fingerprint the user approved, in the state file's
+    /// `[approved]` table. Changed only while `state` is held, so a check
+    /// under that lock sees the addon and its approval together.
+    approvals: Pinned<String, String>,
     /// Holds each addon's writable data folder, by id.
     data_dir: PathBuf,
     state: Mutex<State>,
@@ -67,7 +63,6 @@ struct State {
     /// Which addon owns each kind.
     kinds: HashMap<String, String>,
     problems: Vec<Problem>,
-    grants: Grants,
     next_generation: u64,
 }
 
@@ -84,10 +79,12 @@ struct Failure {
 }
 
 impl Host {
-    pub fn new(dir: PathBuf, grants_path: PathBuf, data_dir: PathBuf) -> Host {
+    pub fn new(dir: PathBuf, approvals_path: PathBuf, data_dir: PathBuf) -> Host {
+        // `rescan` reads the file again and reports it if it is broken.
+        let (approvals, _) = Pinned::load(approvals_path, "approved");
         Host {
             dir,
-            grants_path,
+            approvals,
             data_dir,
             state: Mutex::default(),
             starting: Mutex::default(),
@@ -107,16 +104,16 @@ impl Host {
     /// Blocking: reads files and hashes programs.
     pub fn rescan(&self) -> bool {
         let (manifests, mut problems) = manifest::scan(&self.dir);
-        let grants = match read_grants(&self.grants_path) {
-            Ok(grants) => grants,
-            Err(problem) => {
-                problems.push(problem);
-                Grants::default()
-            }
-        };
-
         let mut state = self.state();
-        let before = state.infos();
+        let before = state.infos(&self.approvals);
+        // Read after `before`, under `state`, so a change to the approvals
+        // alone still counts as a change.
+        if let Some(message) = self.approvals.reload() {
+            problems.push(Problem {
+                path: self.approvals.path().to_path_buf(),
+                message,
+            });
+        }
         let mut old = std::mem::take(&mut state.addons);
         let mut kinds = HashMap::new();
         // Addons are taken in id order, so when two claim a kind the one
@@ -151,16 +148,14 @@ impl Host {
         }
         state.kinds = kinds;
         state.problems = problems;
-        state.grants = grants;
         // Stop whatever is no longer approved.
-        let State { addons, grants, .. } = &mut *state;
-        for addon in addons.values_mut() {
-            if !grants.allows(&addon.manifest) {
+        for addon in state.addons.values_mut() {
+            if !approved(&self.approvals, &addon.manifest) {
                 addon.process = None;
             }
         }
         drop(old);
-        state.infos() != before
+        state.infos(&self.approvals) != before
     }
 
     pub fn problems(&self) -> Vec<Problem> {
@@ -168,7 +163,7 @@ impl Host {
     }
 
     pub fn infos(&self) -> Vec<AddonInfo> {
-        self.state().infos()
+        self.state().infos(&self.approvals)
     }
 
     /// The addon that owns `kind`.
@@ -186,9 +181,9 @@ impl Host {
             .ok_or_else(|| Error::AddonNotFound(id.to_string()))
     }
 
-    /// Records an approval. Blocking: writes the grants file.
+    /// Records an approval. Blocking: writes the approvals file.
     pub fn approve(&self, id: &str, fingerprint: &str) -> Result<()> {
-        let mut state = self.state();
+        let state = self.state();
         let addon = state
             .addons
             .get(id)
@@ -199,13 +194,8 @@ impl Host {
                 format!("addon {id} changed since it was listed; review it again"),
             ));
         }
-        let mut grants = std::mem::take(&mut state.grants);
-        grants
-            .approved
-            .insert(id.to_string(), fingerprint.to_string());
-        let written = write_grants(&self.grants_path, &grants);
-        state.grants = grants;
-        written
+        self.approvals
+            .insert(id.to_string(), fingerprint.to_string())
     }
 
     /// Withdraws an approval and stops the addon. Blocking.
@@ -217,11 +207,7 @@ impl Host {
             .ok_or_else(|| Error::AddonNotFound(id.to_string()))?;
         addon.process = None;
         addon.failure = None;
-        let mut grants = std::mem::take(&mut state.grants);
-        grants.approved.remove(id);
-        let written = write_grants(&self.grants_path, &grants);
-        state.grants = grants;
-        written
+        self.approvals.remove(&id.to_string())
     }
 
     /// Asks the addon for a node's view, starting it if needed.
@@ -317,12 +303,11 @@ impl Host {
         };
         {
             let mut state = self.state();
-            let State { addons, grants, .. } = &mut *state;
-            match addons.get_mut(id) {
+            match state.addons.get_mut(id) {
                 // Revoked or rescanned meanwhile: dropping `process` stops it.
                 Some(addon)
                     if addon.manifest.fingerprint == manifest.fingerprint
-                        && grants.allows(manifest) =>
+                        && approved(&self.approvals, manifest) =>
                 {
                     addon.process = Some(process.clone());
                 }
@@ -344,7 +329,7 @@ impl Host {
             .get(id)
             .filter(|a| a.manifest.fingerprint == fingerprint)
             .ok_or_else(|| Error::AddonNotApproved(id.to_string()))?;
-        if !state.grants.allows(&addon.manifest) {
+        if !approved(&self.approvals, &addon.manifest) {
             return Err(Error::AddonNotApproved(id.to_string()));
         }
         if let Some(process) = &addon.process {
@@ -412,14 +397,14 @@ impl Addon {
 }
 
 impl State {
-    fn infos(&self) -> Vec<AddonInfo> {
+    fn infos(&self, approvals: &Pinned<String, String>) -> Vec<AddonInfo> {
         self.addons
             .values()
             .map(|addon| {
                 let m = &addon.manifest;
-                let state = if !self.grants.allows(m) {
+                let state = if !approved(approvals, m) {
                     AddonState::NeedsApproval {
-                        changed: self.grants.approved.contains_key(&m.id),
+                        changed: approvals.contains(&m.id),
                     }
                 } else if addon.process.is_some() {
                     AddonState::Running
@@ -447,10 +432,8 @@ impl State {
     }
 }
 
-impl Grants {
-    fn allows(&self, manifest: &Manifest) -> bool {
-        self.approved.get(&manifest.id) == Some(&manifest.fingerprint)
-    }
+fn approved(approvals: &Pinned<String, String>, manifest: &Manifest) -> bool {
+    approvals.get(&manifest.id).as_ref() == Some(&manifest.fingerprint)
 }
 
 fn addon_error(manifest: &Manifest, message: String) -> Error {
@@ -460,25 +443,74 @@ fn addon_error(manifest: &Manifest, message: String) -> Error {
     }
 }
 
-fn read_grants(path: &Path) -> std::result::Result<Grants, Problem> {
-    let problem = |message: String| Problem {
-        path: path.to_path_buf(),
-        message,
-    };
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).map_err(|e| problem(e.message().to_string())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Grants::default()),
-        Err(e) => Err(problem(e.to_string())),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn write_grants(path: &Path, grants: &Grants) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    /// A host for an addons folder holding one addon, `probe`.
+    fn host_with_addon(dir: &Path) -> Host {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = dir.join("addons/probe");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("addon.toml"),
+            "id = \"probe\"\nname = \"Probe\"\nversion = \"0.1.0\"\napi = \"1\"\n\
+             permissions = [\"nodes:read\"]\n\
+             [backend]\ncommand = \"probe\"\nprotocol = \"jsonrpc-stdio\"\n",
+        )
+        .unwrap();
+        std::fs::write(folder.join("probe"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(folder.join("probe"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        Host::new(
+            dir.join("addons"),
+            dir.join("addons.toml"),
+            dir.join("data"),
+        )
     }
-    let text = toml::to_string_pretty(grants).map_err(|e| Error::Encode {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
-    write_atomic(path, &text)
+
+    fn state(host: &Host) -> AddonState {
+        host.infos()[0].state.clone()
+    }
+
+    /// The file as Burrow wrote it before the stores were shared. Every
+    /// tester's approvals are in such a file, so a change in its shape
+    /// would stop their addons until they approve them again.
+    #[test]
+    fn reads_and_writes_approvals_as_burrow_always_has() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("addons.toml");
+        let host = host_with_addon(dir.path());
+        host.rescan();
+        let fingerprint = host.manifest("probe").unwrap().fingerprint.clone();
+        let old_file = format!("[approved]\nprobe = \"{fingerprint}\"\n");
+        std::fs::write(&path, &old_file).unwrap();
+        host.rescan();
+        assert_eq!(state(&host), AddonState::Ready);
+
+        host.revoke("probe").unwrap();
+        assert_eq!(state(&host), AddonState::NeedsApproval { changed: false });
+        host.approve("probe", &fingerprint).unwrap();
+        assert_eq!(state(&host), AddonState::Ready);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old_file);
+    }
+
+    /// Unlike the other choices, a broken approvals file is shown to the
+    /// user, since it is why their addons stopped.
+    #[test]
+    fn a_broken_approvals_file_is_a_problem_and_approves_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("addons.toml");
+        let host = host_with_addon(dir.path());
+        host.rescan();
+        let fingerprint = host.manifest("probe").unwrap().fingerprint.clone();
+        std::fs::write(&path, format!("approved = [\nprobe = \"{fingerprint}\"\n")).unwrap();
+        host.rescan();
+        assert!(
+            host.problems().iter().any(|p| p.path == path),
+            "{:?}",
+            host.problems()
+        );
+        assert_eq!(state(&host), AddonState::NeedsApproval { changed: false });
+    }
 }

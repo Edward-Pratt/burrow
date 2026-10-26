@@ -9,6 +9,7 @@ use crate::api::{
     API_VERSION, AlertKind, Capability, Command, Event, Grant, Node, NodeId, POSTGRES_KIND,
     Problem, Response, SSH_HOST_KIND, SSH_TUNNEL_KIND, SecretValue, SessionId, SessionKind, View,
 };
+use crate::class::AddonRule;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::grants::{self, Grants};
@@ -89,7 +90,7 @@ struct Inner {
     /// The tree's problems; the addon host keeps its own.
     tree_problems: Mutex<Vec<Problem>>,
     /// Both together, as last announced.
-    problems: Mutex<Vec<Problem>>,
+    problems: Announced<Vec<Problem>>,
     addons: Host,
     events: broadcast::Sender<Event>,
     secrets: Arc<dyn SecretStore>,
@@ -100,11 +101,11 @@ struct Inner {
     /// Which hosts burrow-agent may be put on.
     agents: Agents,
     /// The tunnels starting with Burrow, as last announced.
-    autostart_nodes: Mutex<Vec<NodeId>>,
+    autostart_nodes: Announced<Vec<NodeId>>,
     /// Which hosts are monitored in the background.
     monitoring: Pins,
     /// Those hosts, as last announced.
-    monitoring_nodes: Mutex<Vec<NodeId>>,
+    monitoring_nodes: Announced<Vec<NodeId>>,
     /// Their history on disk.
     trends: Trends,
     /// What their monitors found wrong.
@@ -115,7 +116,7 @@ struct Inner {
     /// Where each command the MCP bridge sends is recorded.
     audit_log: PathBuf,
     /// The grants, as last announced.
-    grants_shown: Mutex<Vec<Grant>>,
+    grants_shown: Announced<Vec<Grant>>,
     history: db::History,
     ssh_config: Option<PathBuf>,
     /// Held while a host is added, so two never interleave their checks
@@ -140,7 +141,7 @@ impl Core {
             inner: Arc::new(Inner {
                 tree: Mutex::new(tree),
                 tree_problems: Mutex::new(tree_problems),
-                problems: Mutex::new(problems),
+                problems: Announced::new(problems),
                 addons,
                 events,
                 secrets: options.secrets,
@@ -149,23 +150,27 @@ impl Core {
                 transfers: Transfers::default(),
                 autostart: Autostart::load(options.state_dir.join("autostart.toml")),
                 agents: Agents::load(options.state_dir.join("agent.toml")),
-                autostart_nodes: Mutex::default(),
+                autostart_nodes: Announced::new(Vec::new()),
                 monitoring: Pins::load(options.state_dir.join("monitoring.toml")),
-                monitoring_nodes: Mutex::default(),
+                monitoring_nodes: Announced::new(Vec::new()),
                 trends: Trends::new(options.state_dir.join("monitor")),
                 alerts: Alerts::default(),
                 monitor_waits: Mutex::default(),
                 grants: Grants::load(options.state_dir.join("mcp.toml")),
                 audit_log: options.state_dir.join("mcp-audit.log"),
-                grants_shown: Mutex::default(),
+                grants_shown: Announced::new(Vec::new()),
                 history: db::History::new(options.state_dir.join("history")),
                 ssh_config: options.ssh_config,
                 adding_host: tokio::sync::Mutex::default(),
             }),
         };
-        *core.inner.autostart_nodes.lock().unwrap() = core.inner.autostart_enabled();
-        *core.inner.monitoring_nodes.lock().unwrap() = core.inner.monitoring_enabled();
-        *core.inner.grants_shown.lock().unwrap() = core.inner.grants.list(&core.inner.lookup());
+        // Nobody has subscribed yet, so there is no one to tell.
+        let inner = &core.inner;
+        inner.autostart_nodes.refresh(inner.autostart_enabled());
+        inner.monitoring_nodes.refresh(inner.monitoring_enabled());
+        inner
+            .grants_shown
+            .refresh(inner.grants.list(&inner.lookup()));
         Ok(core)
     }
 
@@ -211,24 +216,12 @@ impl Core {
         let sessions = &self.inner.sessions;
         let (session, input) = match command {
             Command::OpenTerminal { node, cols, rows } => {
-                let node = self.inner.tree().get(node)?.node.clone();
-                if node.kind != SSH_HOST_KIND {
-                    return Err(Error::invalid(
-                        "node",
-                        format!("{} is a {}, not an SSH host", node.name, node.kind),
-                    ));
-                }
+                let node = self.node_of_kind(node, SSH_HOST_KIND)?;
                 let session = ssh::open_terminal(self, node, cols, rows);
                 return Ok(Response::Session { session });
             }
             Command::StartTunnel { node } => {
-                let node = self.node(node)?;
-                if node.kind != SSH_TUNNEL_KIND {
-                    return Err(Error::invalid(
-                        "node",
-                        format!("{} is a {}, not an SSH tunnel", node.name, node.kind),
-                    ));
-                }
+                let node = self.node_of_kind(node, SSH_TUNNEL_KIND)?;
                 let session = match sessions.find(node.id, SessionKind::Tunnel) {
                     Some(session) => session,
                     None => ssh::open_tunnel(self, node),
@@ -240,13 +233,7 @@ impl Core {
                 command,
                 timeout,
             } => {
-                let node = self.node(node)?;
-                if node.kind != SSH_HOST_KIND {
-                    return Err(Error::invalid(
-                        "node",
-                        format!("{} is a {}, not an SSH host", node.name, node.kind),
-                    ));
-                }
+                let node = self.node_of_kind(node, SSH_HOST_KIND)?;
                 let result = ssh::exec::start(self, node, command, timeout)?
                     .await
                     .map_err(|_| Error::Remote("the command was stopped".to_string()))?
@@ -254,13 +241,7 @@ impl Core {
                 return Ok(Response::Exec { result });
             }
             Command::OpenFiles { node } => {
-                let node = self.node(node)?;
-                if node.kind != SSH_HOST_KIND {
-                    return Err(Error::invalid(
-                        "node",
-                        format!("{} is a {}, not an SSH host", node.name, node.kind),
-                    ));
-                }
+                let node = self.node_of_kind(node, SSH_HOST_KIND)?;
                 let session = ssh::open_files(self, node);
                 return Ok(Response::Session { session });
             }
@@ -361,13 +342,7 @@ impl Core {
                 return Ok(Response::Ok);
             }
             Command::OpenDatabase { node } => {
-                let node = self.node(node)?;
-                if node.kind != POSTGRES_KIND {
-                    return Err(Error::invalid(
-                        "node",
-                        format!("{} is a {}, not a database", node.name, node.kind),
-                    ));
-                }
+                let node = self.node_of_kind(node, POSTGRES_KIND)?;
                 let session = db::open(self, node);
                 return Ok(Response::Session { session });
             }
@@ -503,13 +478,7 @@ impl Core {
     /// an agent the user already let Burrow put there, which is how the MCP
     /// bridge opens one.
     pub(crate) fn open_monitor(&self, node: NodeId, install: bool) -> Result<SessionId> {
-        let node = self.node(node)?;
-        if node.kind != SSH_HOST_KIND {
-            return Err(Error::invalid(
-                "node",
-                format!("{} is a {}, not an SSH host", node.name, node.kind),
-            ));
-        }
+        let node = self.node_of_kind(node, SSH_HOST_KIND)?;
         if let Some(session) = self.inner.sessions.background(node.id) {
             return Ok(session);
         }
@@ -631,9 +600,40 @@ impl Core {
     pub(crate) fn audit(&self, entry: &serde_json::Value) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        use std::time::Instant;
+        /// Past this size the log moves to `mcp-audit.log.1`, and the older
+        /// ones along to at most `.5`. A bridge flooding the log to push
+        /// out what it did earlier has to write five times this.
+        const MAX: u64 = 8 << 20;
+        const KEPT: u32 = 5;
+        /// Filling the log twice within this is unusual enough to say so.
+        const BURST: Duration = Duration::from_secs(600);
+        // Requests run on tasks of their own. Two that both found the log
+        // full would both move it, and the second would push a log of one
+        // line along in place of a full one. Holds when the log last moved.
+        static WRITING: Mutex<Option<Instant>> = Mutex::new(None);
+        let mut moved = WRITING.lock().unwrap_or_else(|e| e.into_inner());
         let path = &self.inner.audit_log;
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
+        }
+        if std::fs::metadata(path).is_ok_and(|meta| meta.len() >= MAX) {
+            if moved.is_some_and(|at| at.elapsed() < BURST) {
+                tracing::warn!(
+                    "the MCP audit log filled up twice within {} minutes; its oldest \
+                     lines are being dropped",
+                    BURST.as_secs() / 60
+                );
+            }
+            *moved = Some(Instant::now());
+            let old = |n: u32| path.with_extension(format!("log.{n}"));
+            for n in (1..KEPT).rev() {
+                // Most are missing until the log has filled that often.
+                let _ = std::fs::rename(old(n), old(n + 1));
+            }
+            if let Err(e) = std::fs::rename(path, old(1)) {
+                tracing::warn!("could not move {} aside: {e}", path.display());
+            }
         }
         let written = std::fs::OpenOptions::new()
             .append(true)
@@ -667,6 +667,11 @@ impl Core {
 
     pub(crate) fn node(&self, id: NodeId) -> Result<Node> {
         Ok(self.inner.tree().get(id)?.node.clone())
+    }
+
+    /// The node `id`, which must be of `kind`.
+    pub(crate) fn node_of_kind(&self, id: NodeId, kind: &str) -> Result<Node> {
+        self.inner.node_of_kind(id, kind)
     }
 
     pub(crate) fn transfers(&self) -> &Transfers {
@@ -792,11 +797,7 @@ impl Inner {
     /// Announces a change in which tunnels start with Burrow, such as an
     /// edit that withdrew a consent. Called with the tree unlocked.
     fn check_autostart(&self) {
-        let nodes = self.autostart_enabled();
-        let mut current = self.autostart_nodes.lock().unwrap();
-        if *current != nodes {
-            current.clone_from(&nodes);
-            drop(current);
+        if let Some(nodes) = self.autostart_nodes.refresh(self.autostart_enabled()) {
             self.emit(Event::AutostartChanged { nodes });
         }
     }
@@ -811,10 +812,7 @@ impl Inner {
     fn check_monitoring(&self) {
         let nodes = self.monitoring_enabled();
         self.sessions.stop_background(&nodes);
-        let mut current = self.monitoring_nodes.lock().unwrap();
-        if *current != nodes {
-            current.clone_from(&nodes);
-            drop(current);
+        if let Some(nodes) = self.monitoring_nodes.refresh(nodes) {
             self.emit(Event::MonitoringChanged { nodes });
         }
     }
@@ -822,26 +820,13 @@ impl Inner {
     /// Announces a change in what the MCP bridge may do, such as an edit
     /// that made a grant stale. Called with the tree unlocked.
     fn check_grants(&self) {
-        let grants = self.grants.list(&self.lookup());
-        let mut current = self.grants_shown.lock().unwrap();
-        if *current != grants {
-            current.clone_from(&grants);
-            drop(current);
+        if let Some(grants) = self.grants_shown.refresh(self.grants.list(&self.lookup())) {
             self.emit(Event::GrantsChanged { grants });
         }
     }
 
     fn execute(&self, command: Command) -> Result<Response> {
-        let changes_tree = matches!(
-            command,
-            Command::CreateNode { .. }
-                | Command::UpdateNode { .. }
-                | Command::MoveNode { .. }
-                | Command::DeleteNode { .. }
-                | Command::SetAutostart { .. }
-                | Command::SetMonitoring { .. }
-                | Command::SetGrant { .. }
-        );
+        let changes_tree = command.class().changes_tree;
         let response = self.execute_inner(command);
         if changes_tree {
             self.check_autostart();
@@ -958,7 +943,7 @@ impl Inner {
                 Ok(Response::Ok)
             }
             Command::ListAutostart => Ok(Response::Autostart {
-                nodes: self.autostart_nodes.lock().unwrap().clone(),
+                nodes: self.autostart_nodes.get(),
             }),
             Command::SetAutostart {
                 node,
@@ -970,23 +955,9 @@ impl Inner {
                 // the lock while saving would invert the autostart lock's
                 // order, so the consent is pinned to this snapshot instead:
                 // a change after it withdraws the consent as usual.
-                let snapshot: Vec<Node> = {
-                    let tree = self.tree();
-                    let node = tree.get(node)?.node.clone();
-                    let via = node.props.get("via").and_then(|v| v.as_str());
-                    let host = via
-                        .and_then(|via| via.parse().ok())
-                        .and_then(|id| tree.get(NodeId(id)).ok())
-                        .map(|e| e.node.clone());
-                    std::iter::once(node).chain(host).collect()
-                };
+                let snapshot = self.snapshot_with_via(node)?;
                 let node = &snapshot[0];
-                if node.kind != SSH_TUNNEL_KIND {
-                    return Err(Error::invalid(
-                        "node",
-                        format!("{} is a {}, not an SSH tunnel", node.name, node.kind),
-                    ));
-                }
+                check_kind(node, SSH_TUNNEL_KIND)?;
                 if enabled {
                     let expect = expect.ok_or_else(|| {
                         Error::invalid("expect", "enabling needs the settings the user was shown")
@@ -1008,13 +979,7 @@ impl Inner {
                 Ok(Response::Ok)
             }
             Command::MonitorTrend { node, range } => {
-                let node = self.tree().get(node)?.node.clone();
-                if node.kind != SSH_HOST_KIND {
-                    return Err(Error::invalid(
-                        "node",
-                        format!("{} is a {}, not an SSH host", node.name, node.kind),
-                    ));
-                }
+                let node = self.node_of_kind(node, SSH_HOST_KIND)?;
                 Ok(Response::Trend {
                     points: self.trends.points(node.id, range, trend::now()),
                 })
@@ -1023,7 +988,7 @@ impl Inner {
                 alerts: self.alerts.list(),
             }),
             Command::ListMonitoring => Ok(Response::Monitoring {
-                nodes: self.monitoring_nodes.lock().unwrap().clone(),
+                nodes: self.monitoring_nodes.get(),
             }),
             Command::SetMonitoring {
                 node,
@@ -1032,23 +997,9 @@ impl Inner {
             } => {
                 // Read under one lock, as for grants, so the choice covers
                 // a host and a `via` that existed together.
-                let snapshot: Vec<Node> = {
-                    let tree = self.tree();
-                    let node = tree.get(node)?.node.clone();
-                    let via = node.props.get("via").and_then(|v| v.as_str());
-                    let via = via
-                        .and_then(|via| via.parse().ok())
-                        .and_then(|id| tree.get(NodeId(id)).ok())
-                        .map(|e| e.node.clone());
-                    std::iter::once(node).chain(via).collect()
-                };
+                let snapshot = self.snapshot_with_via(node)?;
                 let node = &snapshot[0];
-                if node.kind != SSH_HOST_KIND {
-                    return Err(Error::invalid(
-                        "node",
-                        format!("{} is a {}, not an SSH host", node.name, node.kind),
-                    ));
-                }
+                check_kind(node, SSH_HOST_KIND)?;
                 let lookup = |id| snapshot.iter().find(|n| n.id == id).cloned();
                 if enabled {
                     let expect = expect.ok_or_else(|| {
@@ -1065,7 +1016,7 @@ impl Inner {
                 Ok(Response::Ok)
             }
             Command::ListGrants => Ok(Response::Grants {
-                grants: self.grants_shown.lock().unwrap().clone(),
+                grants: self.grants_shown.get(),
             }),
             Command::SetGrant {
                 node,
@@ -1074,36 +1025,27 @@ impl Inner {
             } => {
                 // Read under one lock, as for autostart, so the grant
                 // covers a node and a `via` that existed together.
-                let snapshot: Vec<Node> = {
-                    let tree = self.tree();
-                    let node = tree.get(node)?.node.clone();
-                    let via = node.props.get("via").and_then(|v| v.as_str());
-                    let via = via
-                        .and_then(|via| via.parse().ok())
-                        .and_then(|id| tree.get(NodeId(id)).ok())
-                        .map(|e| e.node.clone());
-                    std::iter::once(node).chain(via).collect()
-                };
+                let snapshot = self.snapshot_with_via(node)?;
                 let lookup = |id| snapshot.iter().find(|n| n.id == id).cloned();
                 self.grants
                     .set(&lookup, &snapshot[0], capabilities, expect.as_ref())?;
                 Ok(Response::Ok)
             }
             Command::ListProblems => Ok(Response::Problems {
-                problems: self.problems.lock().unwrap().clone(),
+                problems: self.problems.get(),
             }),
             Command::ReloadConfig => {
                 self.reload()?;
                 Ok(Response::Ok)
             }
             Command::ListHistory { node } => {
-                self.database_node(node)?;
+                self.node_of_kind(node, POSTGRES_KIND)?;
                 Ok(Response::History {
                     entries: self.history.list(node),
                 })
             }
             Command::ClearHistory { node } => {
-                self.database_node(node)?;
+                self.node_of_kind(node, POSTGRES_KIND)?;
                 self.history.forget(&[node]);
                 Ok(Response::Ok)
             }
@@ -1141,8 +1083,8 @@ impl Inner {
         }
     }
 
-    /// The permission table for commands sent by addons. Anything not
-    /// listed, such as secrets, sessions and managing addons, is refused.
+    /// Whether an addon may send `command`, by what its class says it
+    /// needs (see [`AddonRule`]) and the addon's permissions and kinds.
     fn permit(&self, manifest: &Manifest, command: &Command) -> Result<()> {
         let need = |permission: Permission| {
             if manifest.has(permission) {
@@ -1164,37 +1106,45 @@ impl Inner {
                 )))
             }
         };
-        match command {
-            Command::Version => Ok(()),
-            Command::ListNodes | Command::GetNode { .. } => need(Permission::NodesRead),
-            Command::CreateNode { kind, .. } => {
+        match command.class().addon {
+            AddonRule::Free => Ok(()),
+            AddonRule::ReadNodes => need(Permission::NodesRead),
+            AddonRule::CreateNode(kind) => {
                 need(Permission::NodesWrite)?;
                 own(kind)
             }
-            Command::UpdateNode { id, .. }
-            | Command::MoveNode { id, .. }
-            | Command::DeleteNode { id, .. } => {
+            AddonRule::ChangeNode(id) => {
                 need(Permission::NodesWrite)?;
-                own(&self.tree().get(*id)?.node.kind)
+                own(&self.tree().get(id)?.node.kind)
             }
-            _ => Err(Error::PermissionDenied(format!(
+            AddonRule::Denied => Err(Error::PermissionDenied(format!(
                 "addons may not send {}",
                 command_name(command)
             ))),
         }
     }
 
-    /// Checks that `id` is a database node.
-    fn database_node(&self, id: NodeId) -> Result<()> {
+    /// The node `id`, which must be of `kind`.
+    fn node_of_kind(&self, id: NodeId, kind: &str) -> Result<Node> {
+        let node = self.tree().get(id)?.node.clone();
+        check_kind(&node, kind)?;
+        Ok(node)
+    }
+
+    /// `id`'s node, then the one its `props.via` names if that exists,
+    /// read under one lock so a choice pinned to both covers settings
+    /// that existed together.
+    fn snapshot_with_via(&self, id: NodeId) -> Result<Vec<Node>> {
         let tree = self.tree();
-        let node = &tree.get(id)?.node;
-        if node.kind != POSTGRES_KIND {
-            return Err(Error::invalid(
-                "node",
-                format!("{} is a {}, not a database", node.name, node.kind),
-            ));
-        }
-        Ok(())
+        let node = tree.get(id)?.node.clone();
+        let via = node
+            .props
+            .get("via")
+            .and_then(|v| v.as_str())
+            .and_then(|via| via.parse().ok())
+            .and_then(|via| tree.get(NodeId(via)).ok())
+            .map(|e| e.node.clone());
+        Ok(std::iter::once(node).chain(via).collect())
     }
 
     fn resolve_secret(&self, id: NodeId, field: &str) -> Result<Option<SecretValue>> {
@@ -1244,12 +1194,35 @@ impl Inner {
         }
         *self.tree_problems.lock().unwrap() = tree_problems.clone();
         let problems = [tree_problems, self.addons.problems()].concat();
-        let mut current = self.problems.lock().unwrap();
-        if *current != problems {
-            current.clone_from(&problems);
+        if let Some(problems) = self.problems.refresh(problems) {
             self.emit(Event::ProblemsChanged { problems });
         }
         Ok(())
+    }
+}
+
+/// A value as clients were last told it, so they hear of it again only
+/// when it changes.
+struct Announced<T>(Mutex<T>);
+
+impl<T: Clone + PartialEq> Announced<T> {
+    fn new(value: T) -> Self {
+        Announced(Mutex::new(value))
+    }
+
+    fn get(&self) -> T {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Records `new`, and hands it back to announce if it differs from
+    /// what was announced last.
+    fn refresh(&self, new: T) -> Option<T> {
+        let mut current = self.0.lock().unwrap();
+        if *current == new {
+            return None;
+        }
+        current.clone_from(&new);
+        Some(new)
     }
 }
 
@@ -1296,6 +1269,25 @@ fn command_name(command: &Command) -> String {
         .unwrap_or_default()
 }
 
+/// Fails unless `node` is of `kind`, saying what it should have been.
+fn check_kind(node: &Node, kind: &str) -> Result<()> {
+    if node.kind == kind {
+        return Ok(());
+    }
+    let wanted = match kind {
+        SSH_HOST_KIND => "an SSH host".to_string(),
+        SSH_TUNNEL_KIND => "an SSH tunnel".to_string(),
+        POSTGRES_KIND => "a database".to_string(),
+        // No command asks for another kind today. A new one that does
+        // gets a plain error rather than a panic.
+        _ => format!("a {kind} node"),
+    };
+    Err(Error::invalid(
+        "node",
+        format!("{} is a {}, not {wanted}", node.name, node.kind),
+    ))
+}
+
 fn validate_field(field: &str) -> Result<()> {
     let ok = !field.is_empty()
         && field
@@ -1327,6 +1319,28 @@ mod tests {
     fn core_is_send_and_sync() {
         fn check<T: Send + Sync + 'static>() {}
         check::<Core>();
+    }
+
+    #[test]
+    fn a_node_of_the_wrong_kind_is_an_error() {
+        let node = Node {
+            id: NodeId::new(),
+            parent: None,
+            kind: crate::api::FOLDER_KIND.into(),
+            name: "work".into(),
+            color: None,
+            props: toml::Table::new(),
+            secrets: Default::default(),
+        };
+        assert!(check_kind(&node, crate::api::FOLDER_KIND).is_ok());
+        let error = check_kind(&node, SSH_HOST_KIND).unwrap_err().to_string();
+        assert!(
+            error.contains("work is a folder, not an SSH host"),
+            "{error}"
+        );
+        // A kind no command asks for yet is still only an error.
+        let error = check_kind(&node, "notes").unwrap_err().to_string();
+        assert!(error.contains("not a notes node"), "{error}");
     }
 
     /// A core with one addon that may read and write nodes.

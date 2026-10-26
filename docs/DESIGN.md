@@ -148,3 +148,4 @@ Built-in features use the same addon API as third-party ones.
 9. `burrow-agent` + monitoring addon
 10. Hosts added in Burrow: a dialog that writes `~/.ssh/config.d/burrow.conf`
 11. Monitoring v2: background monitors, history on disk, alerts and desktop notifications
+12. Architecture and UX review: one store for every pinned approval, each command classified in one place, an audit log with rotation, the sidebar on a list model with drag and drop, one panel type per tab, several shells per host, pages that update in place, a read-only file viewer, and an errors list in the status bar

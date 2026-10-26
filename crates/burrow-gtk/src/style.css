@@ -5,7 +5,7 @@
   border-right: 1px solid alpha(currentColor, 0.12);
 }
 
-.sidebar list {
+.sidebar listview {
   background: transparent;
 }
 
@@ -13,6 +13,33 @@
   padding: 4px 8px;
   margin: 1px 6px;
   border-radius: 6px;
+}
+
+/* 14 px per folder level, with the expander's 4 px spacing. */
+.sidebar treeexpander indent {
+  -gtk-icon-size: 10px;
+}
+
+/* The space a leaf gets in place of a folder's arrow, so names line up.
+   It is the indent just before the row's content. */
+.sidebar treeexpander > indent:nth-last-child(2) {
+  -gtk-icon-size: 16px;
+}
+
+/* Where a dragged row would go: a folder's row, or the whole list for the
+   top level. */
+.sidebar row.drop-target,
+.sidebar listview.drop-target {
+  box-shadow: inset 0 0 0 2px alpha(currentColor, 0.35);
+}
+
+/* A row being dragged. Opaque and square, since without a compositor the
+   transparent parts of a drag icon show black. */
+.sidebar-drag {
+  padding: 6px 10px;
+  background-color: @theme_base_color;
+  color: @theme_fg_color;
+  border: 1px solid alpha(currentColor, 0.25);
 }
 
 .statusbar {
@@ -27,6 +54,10 @@
 
 .statusbar button.warning {
   color: #c88800;
+}
+
+.statusbar button.warning,
+.statusbar button.error {
   padding: 0 6px;
   min-height: 0;
 }
@@ -80,6 +111,10 @@
 
 .dim {
   opacity: 0.65;
+}
+
+.shell-bar {
+  padding: 2px 6px;
 }
 
 .welcome-title {

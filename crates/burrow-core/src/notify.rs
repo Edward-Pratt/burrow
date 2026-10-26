@@ -6,12 +6,13 @@
 //! characters already, and markup is escaped too, because some
 //! notification servers read the body as markup.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use zbus::zvariant::Value;
 
-use crate::api::{Alert, AlertKind, Event};
+use crate::api::{Alert, AlertId, AlertKind, Event};
 use crate::engine::Core;
 use crate::ssh::agent::printable;
 
@@ -26,7 +27,7 @@ const DESKTOP_ENTRY: &str = "dev.burrow.Burrow";
 pub(crate) fn spawn(core: &Core) {
     // Subscribed before the task starts, so an alert raised while it
     // connects still shows.
-    let mut events = core.subscribe();
+    let events = core.subscribe();
     let core = core.clone();
     tokio::spawn(async move {
         let connection = match zbus::Connection::session().await {
@@ -36,21 +37,49 @@ pub(crate) fn spawn(core: &Core) {
                 return;
             }
         };
-        loop {
-            match events.recv().await {
-                Ok(Event::AlertRaised { alert }) => {
-                    let host = core
-                        .node(alert.node)
-                        .map_or_else(|_| "A host".to_string(), |node| node.name);
-                    if let Err(e) = send(&connection, &host, &alert).await {
-                        tracing::warn!("could not show an alert: {e}");
+        run(&core, events, &connection).await;
+    });
+}
+
+/// Shows each alert once, as it is raised. Falling behind the events can
+/// lose an `alert_raised`, so then it lists the alerts that hold, as
+/// `list_alerts` does, and shows those it hasn't yet.
+async fn run(core: &Core, mut events: broadcast::Receiver<Event>, connection: &zbus::Connection) {
+    // The alerts shown that still hold, so none is shown twice.
+    let mut shown: HashSet<AlertId> = HashSet::new();
+    loop {
+        match events.recv().await {
+            Ok(Event::AlertRaised { alert }) => {
+                if shown.insert(alert.id) {
+                    show(core, connection, &alert).await;
+                }
+            }
+            Ok(Event::AlertCleared { alert }) => {
+                shown.remove(&alert.id);
+            }
+            Ok(_) => {}
+            Err(RecvError::Lagged(_)) => {
+                let holding = core.alerts().list();
+                // A clear lost in the gap would otherwise keep its id.
+                shown.retain(|id| holding.iter().any(|alert| alert.id == *id));
+                for alert in holding {
+                    if shown.insert(alert.id) {
+                        show(core, connection, &alert).await;
                     }
                 }
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => return,
             }
+            Err(RecvError::Closed) => return,
         }
-    });
+    }
+}
+
+async fn show(core: &Core, connection: &zbus::Connection, alert: &Alert) {
+    let host = core
+        .node(alert.node)
+        .map_or_else(|_| "A host".to_string(), |node| node.name);
+    if let Err(e) = send(connection, &host, alert).await {
+        tracing::warn!("could not show an alert: {e}");
+    }
 }
 
 /// Shows `alert` on `host` as a notification.
@@ -108,11 +137,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::api::{AlertId, NodeId};
+    use crate::api::NodeId;
+    use crate::engine::CoreOptions;
+    use crate::ssh::alerts::Rule;
+
+    /// What the notification server was sent: app name, summary and body.
+    type Shown = Arc<Mutex<Vec<(String, String, String)>>>;
 
     /// A notification server that keeps what it was sent.
     struct Server {
-        shown: Arc<Mutex<Vec<(String, String, String)>>>,
+        shown: Shown,
     }
 
     #[zbus::interface(name = "org.freedesktop.Notifications")]
@@ -135,10 +169,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn an_alert_is_shown_with_the_server_text_escaped() {
+    /// A connection to a notification server of our own, without a bus,
+    /// the server's end, and what it was sent.
+    async fn notifications() -> (zbus::Connection, zbus::Connection, Shown) {
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        let shown = Arc::default();
+        let shown = Shown::default();
         let server = Server {
             shown: Arc::clone(&shown),
         };
@@ -155,7 +190,12 @@ mod tests {
                 .p2p()
                 .build(),
         );
-        let (_server, client) = (server.unwrap(), client.unwrap());
+        (client.unwrap(), server.unwrap(), shown)
+    }
+
+    #[tokio::test]
+    async fn an_alert_is_shown_with_the_server_text_escaped() {
+        let (client, _server, shown) = notifications().await;
 
         let alert = Alert {
             id: AlertId(1),
@@ -173,6 +213,86 @@ mod tests {
                 "web: a service failed".to_string(),
                 "&lt;b&gt;x&lt;/b&gt;&amp;y.service failed.".to_string()
             )]
+        );
+    }
+
+    /// Waits until the server has been sent `count` notifications, and
+    /// returns their bodies.
+    async fn bodies(shown: &Shown, count: usize) -> Vec<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let bodies: Vec<String> = shown
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, _, body)| body.clone())
+                    .collect();
+                if bodies.len() >= count {
+                    return bodies;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("too few notifications")
+    }
+
+    /// One task runs here, so nothing reads events between two awaits, and
+    /// emitting more than the buffer holds makes the notifier fall behind.
+    #[tokio::test]
+    async fn an_alert_raised_while_behind_still_shows_once() {
+        let (client, _server, shown) = notifications().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let core = Core::open(CoreOptions {
+            config_dir: dir.path().join("config"),
+            state_dir: dir.path().join("state"),
+            secrets: Arc::new(crate::secrets::MemoryStore::new()),
+            ssh_config: None,
+        })
+        .unwrap();
+        let node = NodeId::new();
+        let failed = |units: &[&str]| {
+            units
+                .iter()
+                .map(|unit| AlertKind::UnitFailed {
+                    unit: unit.to_string(),
+                })
+                .collect()
+        };
+        let events = core.subscribe();
+        tokio::spawn({
+            let core = core.clone();
+            async move { run(&core, events, &client).await }
+        });
+
+        core.set_alerts(node, Rule::Units, failed(&["a", "keep"]));
+        assert_eq!(bodies(&shown, 2).await, ["a failed.", "keep failed."]);
+
+        // Lost in the gap: a clears and is raised again, with a new id,
+        // and b is raised. keep still holds and was shown already.
+        core.set_alerts(node, Rule::Units, failed(&["keep"]));
+        core.set_alerts(node, Rule::Units, failed(&["keep", "a", "b"]));
+        for _ in 0..300 {
+            core.emit(Event::ProblemsChanged {
+                problems: Vec::new(),
+            });
+        }
+        assert_eq!(
+            bodies(&shown, 4).await,
+            ["a failed.", "keep failed.", "a failed.", "b failed."]
+        );
+
+        // None of them shows again, and the next alert shows as usual.
+        core.set_alerts(node, Rule::Units, failed(&["keep", "a", "b", "c"]));
+        assert_eq!(
+            bodies(&shown, 5).await,
+            [
+                "a failed.",
+                "keep failed.",
+                "a failed.",
+                "b failed.",
+                "c failed."
+            ]
         );
     }
 }

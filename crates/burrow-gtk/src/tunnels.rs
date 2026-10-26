@@ -4,11 +4,13 @@
 //! by autostart or by another client shows up the same as one started
 //! here.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use burrow_core::{Node, NodeId, SessionId, SessionState};
 use relm4::gtk;
+use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
 use crate::dialogs;
@@ -147,94 +149,207 @@ pub fn status_text(status: &Status) -> (String, Option<&'static str>) {
     }
 }
 
-/// Replaces `page`'s children with the tunnel's settings, state and
-/// buttons.
-pub fn fill(
-    page: &gtk::Box,
-    node: &Node,
-    nodes: &HashMap<NodeId, Node>,
-    status: &Status,
-    autostart: bool,
-    actions: &Actions,
-) {
-    // Redrawing destroys the focused widget. GTK would then focus the
-    // first value and select its text, so focus goes to the first button.
-    let had_focus = page.focus_child().is_some();
-    while let Some(child) = page.first_child() {
-        page.remove(&child);
-    }
+/// A tunnel tab: its settings, state and buttons. The widgets are built
+/// once and updated by [`TunnelPage::fill`], so focus and selected text
+/// survive a change of state.
+pub struct TunnelPage {
+    pub page: gtk::Box,
+    title: gtk::Label,
+    /// The values next to "Listens on", "Forwards to", "Through" and
+    /// "State".
+    values: Vec<gtk::Label>,
+    stale: gtk::Label,
+    /// Only the one that applies can be pressed; the other is greyed out.
+    start: gtk::Button,
+    stop: gtk::Button,
+    restart: gtk::Button,
+    autostart: gtk::CheckButton,
+    /// Set while the checkbox is changed to match the core, so that isn't
+    /// taken for the user's choice.
+    quiet: Cell<bool>,
+    actions: RefCell<Option<Actions>>,
+}
 
-    let title = gtk::Label::new(Some(&node.name));
-    title.set_xalign(0.0);
-    title.add_css_class("page-title");
-    page.append(&title);
+impl TunnelPage {
+    /// An empty page, until the first [`TunnelPage::fill`].
+    pub fn new() -> Rc<TunnelPage> {
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        page.add_css_class("tunnel-view");
 
-    let grid = gtk::Grid::builder()
-        .row_spacing(4)
-        .column_spacing(16)
-        .margin_top(8)
-        .build();
-    let (state, class) = status_text(status);
-    let mut rows = describe(node, nodes);
-    rows.push(("State", state));
-    for (row, (label, value)) in rows.into_iter().enumerate() {
-        let label = gtk::Label::new(Some(label));
-        label.set_xalign(0.0);
-        label.set_yalign(0.0);
-        label.add_css_class("dim");
-        let value = gtk::Label::new(Some(&value));
-        value.set_xalign(0.0);
-        value.set_wrap(true);
-        value.set_selectable(true);
-        if let Some(class) = class.filter(|_| row == 3) {
-            value.add_css_class(class);
+        let title = gtk::Label::new(None);
+        title.set_xalign(0.0);
+        title.add_css_class("page-title");
+        page.append(&title);
+
+        let grid = gtk::Grid::builder()
+            .row_spacing(4)
+            .column_spacing(16)
+            .margin_top(8)
+            .build();
+        let mut values = Vec::new();
+        for (row, name) in ["Listens on", "Forwards to", "Through", "State"]
+            .into_iter()
+            .enumerate()
+        {
+            let label = gtk::Label::new(Some(name));
+            label.set_xalign(0.0);
+            label.set_yalign(0.0);
+            label.add_css_class("dim");
+            let value = gtk::Label::new(None);
+            value.set_xalign(0.0);
+            value.set_wrap(true);
+            value.set_selectable(true);
+            grid.attach(&label, 0, row as i32, 1, 1);
+            grid.attach(&value, 1, row as i32, 1, 1);
+            values.push(value);
         }
-        grid.attach(&label, 0, row as i32, 1, 1);
-        grid.attach(&value, 1, row as i32, 1, 1);
-    }
-    page.append(&grid);
+        page.append(&grid);
 
-    if status.stale && status.running().is_some() {
-        let note = gtk::Label::new(Some(
+        let stale = gtk::Label::new(Some(
             "The settings changed while the tunnel was running. Restart it to use them.",
         ));
-        note.set_xalign(0.0);
-        note.set_wrap(true);
-        note.add_css_class("warning-text");
-        page.append(&note);
-    }
+        stale.set_xalign(0.0);
+        stale.set_wrap(true);
+        stale.add_css_class("warning-text");
+        stale.set_visible(false);
+        page.append(&stale);
 
-    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    buttons.set_margin_top(12);
-    let button = |label: &str, action: &Rc<dyn Fn()>| {
-        let button = gtk::Button::with_label(label);
-        let action = action.clone();
-        button.connect_clicked(move |_| action());
-        button
-    };
-    if status.running().is_some() {
-        buttons.append(&button("Stop", &actions.stop));
-        if status.stale {
-            let restart = button("Restart", &actions.restart);
-            restart.add_css_class("suggested-action");
-            buttons.append(&restart);
-        }
-    } else {
-        let start = button("Start", &actions.start);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        buttons.set_margin_top(12);
+        let start = gtk::Button::with_label("Start");
         start.add_css_class("suggested-action");
+        let stop = gtk::Button::with_label("Stop");
+        let restart = gtk::Button::with_label("Restart");
+        restart.add_css_class("suggested-action");
+        let edit = gtk::Button::with_label("Edit…");
         buttons.append(&start);
-    }
-    buttons.append(&button("Edit…", &actions.edit));
-    page.append(&buttons);
+        buttons.append(&stop);
+        buttons.append(&restart);
+        buttons.append(&edit);
+        page.append(&buttons);
 
-    let check = gtk::CheckButton::with_label("Start with Burrow on this computer");
-    check.set_margin_top(6);
-    check.set_active(autostart);
-    let set_autostart = actions.set_autostart.clone();
-    check.connect_toggled(move |check| set_autostart(check.is_active()));
-    page.append(&check);
-    if had_focus {
-        buttons.child_focus(gtk::DirectionType::TabForward);
+        let autostart = gtk::CheckButton::with_label("Start with Burrow on this computer");
+        autostart.set_margin_top(6);
+        page.append(&autostart);
+
+        let tab = Rc::new(TunnelPage {
+            page,
+            title,
+            values,
+            stale,
+            start: start.clone(),
+            stop: stop.clone(),
+            restart: restart.clone(),
+            autostart: autostart.clone(),
+            quiet: Cell::new(false),
+            actions: RefCell::new(None),
+        });
+
+        // The handlers hold the page weakly: it holds them through its
+        // buttons.
+        let weak = Rc::downgrade(&tab);
+        let run = move |pick: fn(&Actions) -> Rc<dyn Fn()>| {
+            let weak = weak.clone();
+            move |_: &gtk::Button| {
+                let Some(tab) = weak.upgrade() else { return };
+                // Taken out of the borrow first, as the action may draw
+                // the page again.
+                let action = tab.actions.borrow().as_ref().map(pick);
+                if let Some(action) = action {
+                    action();
+                }
+            }
+        };
+        start.connect_clicked(run(|actions| actions.start.clone()));
+        stop.connect_clicked(run(|actions| actions.stop.clone()));
+        restart.connect_clicked(run(|actions| actions.restart.clone()));
+        edit.connect_clicked(run(|actions| actions.edit.clone()));
+        autostart.connect_toggled({
+            let weak = Rc::downgrade(&tab);
+            move |check| {
+                let Some(tab) = weak.upgrade() else { return };
+                if tab.quiet.get() {
+                    return;
+                }
+                let action = tab
+                    .actions
+                    .borrow()
+                    .as_ref()
+                    .map(|a| a.set_autostart.clone());
+                if let Some(action) = action {
+                    action(check.is_active());
+                }
+            }
+        });
+
+        tab
+    }
+
+    /// Shows `node` with its `status`. `actions` are what the buttons run
+    /// from now on.
+    pub fn fill(
+        &self,
+        node: &Node,
+        nodes: &HashMap<NodeId, Node>,
+        status: &Status,
+        autostart: bool,
+        actions: &Actions,
+    ) {
+        *self.actions.borrow_mut() = Some(Actions {
+            start: actions.start.clone(),
+            stop: actions.stop.clone(),
+            restart: actions.restart.clone(),
+            edit: actions.edit.clone(),
+            set_autostart: actions.set_autostart.clone(),
+        });
+
+        set_text(&self.title, &node.name);
+        let (state, class) = status_text(status);
+        let mut texts: Vec<String> = describe(node, nodes).into_iter().map(|(_, v)| v).collect();
+        texts.push(state);
+        for (value, text) in self.values.iter().zip(&texts) {
+            set_text(value, text);
+        }
+        let state = &self.values[3];
+        for old in ["running", "error-text"] {
+            if Some(old) != class {
+                state.remove_css_class(old);
+            }
+        }
+        if let Some(class) = class {
+            state.add_css_class(class);
+        }
+
+        let running = status.running().is_some();
+        self.stale.set_visible(status.stale && running);
+        // A button that is greyed out or hidden while it has the focus
+        // would drop it, so the focus goes to the one that applies now.
+        let (now, then) = if running {
+            (&self.stop, &self.start)
+        } else {
+            (&self.start, &self.stop)
+        };
+        now.set_sensitive(true);
+        let restart = running && status.stale;
+        if then.has_focus() || (!restart && self.restart.has_focus()) {
+            now.grab_focus();
+        }
+        then.set_sensitive(false);
+        self.restart.set_visible(restart);
+
+        if self.autostart.is_active() != autostart {
+            self.quiet.set(true);
+            self.autostart.set_active(autostart);
+            self.quiet.set(false);
+        }
+    }
+}
+
+/// Sets a label's text only when it changed, as setting it clears the
+/// selection in it.
+fn set_text(label: &gtk::Label, text: &str) {
+    if label.label() != text {
+        label.set_label(text);
     }
 }
 
@@ -329,6 +444,47 @@ pub fn edit(
     show_target(&kind);
     kind.connect_selected_notify(show_target);
 
+    // A port forward's local port follows the destination port until the
+    // user picks one, and a proxy's is 1080. Editing a tunnel keeps the
+    // port it has.
+    let local_picked = Rc::new(Cell::new(port.is_some()));
+    let following = Rc::new(Cell::new(false));
+    let follow = Rc::new(glib::clone!(
+        #[weak]
+        kind,
+        #[weak]
+        port_entry,
+        #[weak]
+        target_port_entry,
+        #[strong]
+        local_picked,
+        #[strong]
+        following,
+        move || {
+            if local_picked.get() {
+                return;
+            }
+            let local = if kind.selected() == 0 {
+                local_port_for(target_port_entry.value() as u16)
+            } else {
+                1080
+            };
+            following.set(true);
+            port_entry.set_value(f64::from(local));
+            following.set(false);
+        }
+    ));
+    port_entry.connect_value_changed(move |_| {
+        if !following.get() {
+            local_picked.set(true);
+        }
+    });
+    target_port_entry.connect_value_changed({
+        let follow = follow.clone();
+        move |_| follow()
+    });
+    kind.connect_selected_notify(move |_| follow());
+
     let note = gtk::Label::new(Some(
         "The tunnel listens on this computer only. Programs connect to the local port, \
          and the SSH host makes the onward connection.",
@@ -363,9 +519,19 @@ pub fn edit(
         ok.set_sensitive(false);
     }
 
+    // The window is held weakly by everything inside it, or it would keep
+    // itself alive after closing.
     let submit = Rc::new({
-        let (window, name, error) = (window.clone(), name.clone(), error.clone());
+        let (window, name, error) = (window.downgrade(), name.clone(), error.clone());
+        let (target_entry, port_entry, target_port_entry) = (
+            target_entry.clone(),
+            port_entry.clone(),
+            target_port_entry.clone(),
+        );
         move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
             let fail = |message: &str| {
                 error.set_label(message);
                 error.set_visible(true);
@@ -402,15 +568,26 @@ pub fn edit(
         let submit = submit.clone();
         move |_| submit()
     });
-    name.connect_activate(move |_| submit());
-    cancel.connect_clicked({
-        let window = window.clone();
-        move |_| window.close()
-    });
+    for entry in [&name, &target_entry] {
+        let submit = submit.clone();
+        entry.connect_activate(move |_| submit());
+    }
+    for entry in [&port_entry, &target_port_entry] {
+        let submit = submit.clone();
+        entry.connect_activate(move |_| submit());
+    }
+    dialogs::close_on_cancel(&window, &cancel);
     dialogs::close_on_escape(&window);
 
     window.present();
     name.grab_focus();
+}
+
+/// The local port to suggest for forwarding `target`: the same port, so
+/// programs find the service where they expect it, except below 1024,
+/// where only root may listen, so 80 becomes 8080.
+fn local_port_for(target: u16) -> u16 {
+    if target < 1024 { target + 8000 } else { target }
 }
 
 fn port_button(value: u16) -> gtk::SpinButton {
@@ -458,6 +635,14 @@ mod tests {
             Settings::from_props(&props),
             (Some(via), Some(5433), Some(("db.internal".into(), 5432)))
         );
+    }
+
+    #[test]
+    fn forwards_suggest_the_destination_port_where_one_may_listen() {
+        assert_eq!(local_port_for(5432), 5432);
+        assert_eq!(local_port_for(1024), 1024);
+        assert_eq!(local_port_for(80), 8080);
+        assert_eq!(local_port_for(443), 8443);
     }
 
     #[test]

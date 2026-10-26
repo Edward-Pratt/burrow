@@ -1,5 +1,6 @@
-//! SSH host tabs: a [`terminal::remote`] terminal showing a session the core
-//! runs. The tab outlives its sessions: when one ends, Enter starts another.
+//! SSH shell tabs: a [`terminal::remote`] terminal showing a session the
+//! core runs. A host can have several. The tab outlives its sessions: when
+//! one ends, Enter starts another.
 
 use std::collections::HashMap;
 
@@ -8,8 +9,9 @@ use burrow_core::{Command, Event, NodeId, Response, SessionId, SessionState};
 use relm4::ComponentSender;
 use vte4::TerminalExt;
 
-use crate::app::{App, AppMsg};
+use crate::app::{App, AppMsg, TabKey};
 use crate::runtime::runtime;
+use crate::session::State;
 use crate::terminal;
 
 /// Output is passed to the window in chunks of up to this many bytes, so a
@@ -26,6 +28,11 @@ pub struct Remote {
     /// and the end of its output arrive on different tasks, so the "closed"
     /// message waits until the last output is shown.
     pub ending: Ending,
+    /// The title the shell on the host set, cleaned for showing, for the
+    /// tab's tooltip.
+    pub title: Option<String>,
+    /// Which of its host's shells this is, from 1, for the tab's title.
+    pub number: u32,
 }
 
 #[derive(Default)]
@@ -36,11 +43,13 @@ pub struct Ending {
 }
 
 impl Remote {
-    pub fn new(terminal: vte4::Terminal) -> Remote {
+    pub fn new(terminal: vte4::Terminal, number: u32) -> Remote {
         Remote {
             terminal,
             state: State::Starting,
             ending: Ending::default(),
+            title: None,
+            number,
         }
     }
 
@@ -52,18 +61,11 @@ impl Remote {
         {
             self.terminal.feed(status.as_bytes());
             self.state = State::Closed;
+            // It was the ended shell's.
+            self.title = None;
             self.ending = Ending::default();
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum State {
-    /// `open_terminal` was sent; its session id isn't known yet.
-    Starting,
-    Running(SessionId),
-    /// The last session ended. Enter starts a new one.
-    Closed,
 }
 
 /// Session events that arrived before the tab knew which session was its
@@ -86,10 +88,12 @@ impl Unclaimed {
     }
 }
 
-/// Asks the core for a session on `node`. The reply arrives as
-/// [`AppMsg::SessionStarted`], followed by the session's output.
+/// Asks the core for a session on `node` for the shell tab `tab`. The
+/// reply arrives as [`AppMsg::SessionStarted`], followed by the session's
+/// output.
 pub fn start(
     core: &Client,
+    tab: TabKey,
     node: NodeId,
     terminal: &vte4::Terminal,
     sender: &ComponentSender<App>,
@@ -102,19 +106,16 @@ pub fn start(
             Ok(Response::Session { session }) => session,
             Ok(other) => {
                 let error = format!("unexpected reply {other:?}");
-                let _ = input.send(AppMsg::SessionFailed { node, error });
+                let _ = input.send(AppMsg::SessionFailed { tab, error });
                 return;
             }
             Err(e) => {
                 let error = e.to_string();
-                let _ = input.send(AppMsg::SessionFailed { node, error });
+                let _ = input.send(AppMsg::SessionFailed { tab, error });
                 return;
             }
         };
-        if input
-            .send(AppMsg::SessionStarted { node, session })
-            .is_err()
-        {
+        if input.send(AppMsg::SessionStarted { tab, session }).is_err() {
             return;
         }
         if let Ok(mut output) = core.take_output(session).await {

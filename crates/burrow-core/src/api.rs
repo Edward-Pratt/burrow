@@ -234,7 +234,9 @@ pub struct FileEntry {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session: SessionId,
-    /// The SSH host of a terminal, or the tunnel node of a tunnel.
+    /// The SSH host of a terminal, file, command or monitor session, the
+    /// tunnel node of a tunnel, and the database node of a database
+    /// session.
     pub node: NodeId,
     pub kind: SessionKind,
     #[serde(flatten)]
@@ -587,7 +589,6 @@ pub struct MonitorHistory {
     pub units: Option<Vec<monitor::Unit>>,
 }
 
-/// What a query sent with [`Command::RunQuery`] returned. A query can hold
 /// What a command run with [`Command::Exec`] did. Output is decoded as
 /// UTF-8, with invalid bytes replaced, and each stream is cut at 1 MiB.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -605,6 +606,7 @@ pub struct ExecResult {
     pub timed_out: bool,
 }
 
+/// What a query sent with [`Command::RunQuery`] returned. A query can hold
 /// several statements; each one that finished has an entry in
 /// `statements`, in order. If one failed, `error` says why and the
 /// statements after it did not run.
@@ -614,10 +616,12 @@ pub struct QueryResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<QueryError>,
     /// Set when Burrow stopped the query because it returned more rows
-    /// than the limit. The statement that hit it is `truncated`, and
-    /// anything after it in the same query did not run.
+    /// than the limit, or more than 32 MiB of them as JSON. The statement
+    /// that hit it is `truncated`, and anything after it in the same query
+    /// did not run.
     #[serde(default)]
     pub stopped: bool,
+    /// How long the query took, in milliseconds.
     pub elapsed_ms: u64,
 }
 
@@ -792,9 +796,14 @@ pub enum Command {
         cols: u16,
         rows: u16,
     },
-    /// Sends keyboard input to the remote shell.
+    /// Sends keyboard input to the remote shell. `data` is base64 in
+    /// JSON, and an array of numbers is still accepted.
     WriteTerminal {
         session: SessionId,
+        #[serde(
+            serialize_with = "base64_bytes::serialize",
+            deserialize_with = "base64_bytes::deserialize_either"
+        )]
         data: Vec<u8>,
     },
     ResizeTerminal {
@@ -849,11 +858,6 @@ pub enum Command {
         session: SessionId,
         path: String,
     },
-    /// Copies a remote file or folder to `local`, an absolute path that
-    /// names the copy itself. Fails if `local` exists, unless `overwrite`
-    /// is set: then files are replaced and folders merged. Returns
-    /// [`Response::Transfer`]; progress arrives as
-    /// [`Event::TransferChanged`].
     /// Reads up to `limit` bytes (1 MiB when missing, at most 16 MiB) from
     /// the start of a remote file. Returns [`Response::File`]. For clients
     /// that work with contents rather than local files.
@@ -874,6 +878,11 @@ pub enum Command {
         #[serde(default)]
         overwrite: bool,
     },
+    /// Copies a remote file or folder to `local`, an absolute path that
+    /// names the copy itself. Fails if `local` exists, unless `overwrite`
+    /// is set: then files are replaced and folders merged. Returns
+    /// [`Response::Transfer`]; progress arrives as
+    /// [`Event::TransferChanged`].
     Download {
         session: SessionId,
         remote: String,
@@ -894,12 +903,12 @@ pub enum Command {
         transfer: TransferId,
     },
     /// Runs `command` on an SSH host node without a terminal, as
-    /// `ssh host command` does, and waits for it. `timeout` (60 s when
-    /// missing, at most 3600) covers connecting too. Returns
-    /// [`Response::Exec`].
+    /// `ssh host command` does, and waits for it. `timeout` covers
+    /// connecting too. Returns [`Response::Exec`].
     Exec {
         node: NodeId,
         command: String,
+        /// In seconds: 60 when missing, at most 3600.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout: Option<u32>,
     },
@@ -1221,6 +1230,7 @@ pub enum Event {
 /// Bytes as a base64 string in JSON, rather than an array of numbers.
 mod base64_bytes {
     use data_encoding::BASE64;
+    use serde::de::{self, SeqAccess, Visitor};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
@@ -1232,5 +1242,72 @@ mod base64_bytes {
         BASE64
             .decode(text.as_bytes())
             .map_err(serde::de::Error::custom)
+    }
+
+    /// Base64, or an array of numbers as clients sent for
+    /// [`Command::WriteTerminal`](super::Command::WriteTerminal) before
+    /// it took base64, so those clients still work.
+    pub fn deserialize_either<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        struct Bytes;
+        impl<'de> Visitor<'de> for Bytes {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("base64 or an array of bytes")
+            }
+
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<Vec<u8>, E> {
+                BASE64.decode(text.as_bytes()).map_err(E::custom)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut bytes = Vec::new();
+                while let Some(byte) = seq.next_element()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+        deserializer.deserialize_any(Bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bytes of a `write_terminal` read from `json`.
+    fn written(json: &str) -> serde_json::Result<Vec<u8>> {
+        match serde_json::from_str(json)? {
+            Command::WriteTerminal { data, .. } => Ok(data),
+            other => panic!("expected write_terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_input_is_sent_as_base64_and_read_from_either() {
+        let command = Command::WriteTerminal {
+            session: SessionId(3),
+            data: b"ls\n".to_vec(),
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"write_terminal","session":3,"data":"bHMK"}"#
+        );
+        assert_eq!(written(&json).unwrap(), b"ls\n");
+        let array = r#"{"type":"write_terminal","session":3,"data":[108,115,10]}"#;
+        assert_eq!(written(array).unwrap(), b"ls\n");
+
+        let wrong = [
+            r#"{"type":"write_terminal","session":3,"data":[256]}"#,
+            r#"{"type":"write_terminal","session":3,"data":"not base64"}"#,
+            r#"{"type":"write_terminal","session":3,"data":7}"#,
+        ];
+        for json in wrong {
+            assert!(written(json).is_err(), "{json}");
+        }
     }
 }

@@ -7,6 +7,7 @@
 
 mod addon;
 mod api;
+mod class;
 pub mod daemon;
 mod db;
 pub mod doctor;

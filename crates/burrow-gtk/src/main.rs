@@ -11,6 +11,7 @@ mod monitor;
 mod palette;
 mod remote;
 mod runtime;
+mod session;
 mod settings;
 mod sidebar;
 mod terminal;

@@ -97,7 +97,7 @@ impl Tree {
     fn load_folder(&mut self, dir: &Path, parent: Option<NodeId>, problems: &mut Vec<Problem>) {
         let meta = dir.join(FOLDER_FILE);
         let (file, parsed) = if meta.exists() {
-            match read_node_file(&meta) {
+            match read_node_file(&meta).and_then(|file| loadable(&meta, file)) {
                 Ok(file) => (file, true),
                 Err(p) => {
                     problems.push(p);
@@ -107,6 +107,18 @@ impl Tree {
         } else {
             (NodeFile::default(), true)
         };
+        let name = match file.name {
+            Some(name) => name,
+            None => dir_name(dir),
+        };
+        // Its children have nowhere to go, so they are left out with it.
+        if has_control(&name) {
+            problems.push(problem(
+                dir,
+                "the folder's name has control characters; give it a `name` in _folder.toml",
+            ));
+            return;
+        }
 
         let mut needs_write = !meta.exists();
         let id = self.claim_id(file.id, &mut needs_write);
@@ -116,7 +128,7 @@ impl Tree {
                 id,
                 parent,
                 kind: FOLDER_KIND.to_string(),
-                name: file.name.unwrap_or_else(|| dir_name(dir)),
+                name,
                 color: file.color,
                 props: file.props,
                 secrets: secrets.keys().cloned().collect(),
@@ -137,7 +149,7 @@ impl Tree {
     }
 
     fn load_leaf(&mut self, path: &Path, parent: Option<NodeId>, problems: &mut Vec<Problem>) {
-        let file = match read_node_file(path) {
+        let file = match read_node_file(path).and_then(|file| loadable(path, file)) {
             Ok(file) => file,
             Err(p) => {
                 problems.push(p);
@@ -158,6 +170,17 @@ impl Tree {
                 return;
             }
         };
+        let name = match file.name {
+            Some(name) => name,
+            None => file_label(path),
+        };
+        if has_control(&name) {
+            problems.push(problem(
+                path,
+                "the file's name has control characters; give it a `name` inside",
+            ));
+            return;
+        }
 
         let mut needs_write = false;
         let id = self.claim_id(file.id, &mut needs_write);
@@ -167,7 +190,7 @@ impl Tree {
                 id,
                 parent,
                 kind,
-                name: file.name.unwrap_or_else(|| file_label(path)),
+                name,
                 color: file.color,
                 props: file.props,
                 secrets: secrets.keys().cloned().collect(),
@@ -577,12 +600,28 @@ pub(crate) fn validate_kind(kind: &str) -> Result<()> {
     }
 }
 
+/// `file`, unless its name is unsafe to show. Node files can come from a
+/// shared folder or a dotfiles repo, and a name reaches every client and
+/// error message. Only what is unsafe is refused here, not all that
+/// [`validate_name`] refuses, so a tree with a name that is empty or
+/// oddly spaced still loads as it did.
+fn loadable(path: &Path, file: NodeFile) -> Result<NodeFile, Problem> {
+    if file.name.as_deref().is_some_and(has_control) {
+        return Err(problem(path, "`name` has control characters"));
+    }
+    Ok(file)
+}
+
+fn has_control(name: &str) -> bool {
+    name.chars().any(char::is_control)
+}
+
 pub(crate) fn validate_name(name: String) -> Result<String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err(Error::invalid("name", "must not be empty"));
     }
-    if name.chars().any(char::is_control) {
+    if has_control(&name) {
         return Err(Error::invalid(
             "name",
             "must not contain control characters",
@@ -632,5 +671,56 @@ mod tests {
         assert!(validate_kind("postgres.connection").is_ok());
         assert!(validate_kind("SSH").is_err());
         assert!(validate_kind("").is_err());
+    }
+
+    #[test]
+    fn names_with_control_characters_do_not_load() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let write = |name: &str, body: &str| fs::write(root.join(name), body).unwrap();
+        // These loaded before and still do, though `validate_name` would
+        // trim or refuse them.
+        write(
+            "spaced.toml",
+            "kind = \"note\"\nname = \"  far   apart  \"\n",
+        );
+        write("empty.toml", "kind = \"note\"\nname = \"\"\n");
+        write("plain.toml", "kind = \"note\"\n");
+        // From the file, and from the file's own name.
+        write(
+            "escape.toml",
+            "kind = \"note\"\nname = \"web\\u001b[31m\"\n",
+        );
+        write("bell\u{7}.toml", "kind = \"note\"\n");
+        // A folder's file that names it so is skipped like one that doesn't
+        // parse: the folder loads under its directory's name, and the file
+        // is left as it is.
+        fs::create_dir(root.join("work")).unwrap();
+        write("work/_folder.toml", "name = \"a\\tb\"\n");
+        write("work/inside.toml", "kind = \"note\"\n");
+        // A directory named so is left out with everything in it.
+        fs::create_dir(root.join("odd\u{1b}dir")).unwrap();
+        write("odd\u{1b}dir/hidden.toml", "kind = \"note\"\n");
+
+        let (tree, problems) = Tree::load(root).unwrap();
+        let mut names: Vec<String> = tree.nodes().into_iter().map(|node| node.name).collect();
+        names.sort();
+        assert_eq!(names, ["", "  far   apart  ", "inside", "plain", "work"]);
+        let mut paths: Vec<PathBuf> = problems.iter().map(|p| p.path.clone()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                root.join("bell\u{7}.toml"),
+                root.join("escape.toml"),
+                root.join("odd\u{1b}dir"),
+                root.join("work/_folder.toml"),
+            ]
+        );
+        assert!(problems.iter().all(|p| !has_control(&p.message)));
+        assert_eq!(
+            fs::read_to_string(root.join("work/_folder.toml")).unwrap(),
+            "name = \"a\\tb\"\n"
+        );
     }
 }

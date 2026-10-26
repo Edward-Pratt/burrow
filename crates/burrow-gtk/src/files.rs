@@ -1,10 +1,11 @@
-//! SFTP file panels: a tab that browses an SSH host's files, and copies
-//! files and folders to and from this computer.
+//! SFTP file panels: a tab that browses an SSH host's files, shows what is
+//! in them, and copies files and folders to and from this computer.
 //!
 //! Names come from the server, so they are cleaned up before they are
 //! shown, and checked before they become part of a local path. Remote
 //! paths are always built from the names as the server sent them.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -20,8 +21,10 @@ use relm4::{ComponentSender, gtk};
 
 use crate::app::{App, AppMsg};
 use crate::dialogs;
-use crate::remote::State;
 use crate::runtime::runtime;
+use crate::session::{self, SessionPage, State};
+
+mod viewer;
 
 /// Rows drawn before the rest of a folder is summed up. A list of widgets
 /// gets slow long before a folder gets this big.
@@ -32,16 +35,19 @@ const DONE_TIME: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Debug)]
 pub enum Msg {
-    /// The core accepted `open_files`.
-    Started(SessionId),
-    /// `open_files` itself failed.
-    StartFailed(String),
+    /// `open_files` and what follows.
+    Session(session::Msg),
     Listed {
         path: String,
         entries: Vec<FileEntry>,
     },
     /// A command failed. Shown above the list.
     Failed(String),
+    /// A file's start arrived, to show in a viewer.
+    Opened {
+        name: String,
+        contents: viewer::Contents,
+    },
     /// Lists the folder typed into the path bar.
     GoTyped,
     Up,
@@ -83,24 +89,25 @@ pub enum Msg {
     /// A transfer's button: cancel while it runs, dismiss once it failed.
     TransferButton(TransferId),
     Dismiss(TransferId),
-    Reconnect,
 }
 
 /// One SSH host's file panel.
 pub struct Files {
     node: NodeId,
     pub page: gtk::Box,
-    pub state: State,
+    pub session: SessionPage,
     /// The folder shown, as the server names it. Empty until the first
     /// listing arrives.
     path: String,
     /// The entries shown, in row order.
     entries: Vec<FileEntry>,
     path_entry: gtk::Entry,
-    stack: gtk::Stack,
+    scroller: gtk::ScrolledWindow,
     list: gtk::ListBox,
-    message: gtk::Label,
-    reconnect: gtk::Button,
+    /// The last row, saying how many entries aren't drawn. Hidden while
+    /// they all are.
+    more_row: gtk::ListBoxRow,
+    more: gtk::Label,
     error: gtk::Label,
     /// Buttons that act on the selected entry.
     on_selection: Vec<gtk::Button>,
@@ -242,29 +249,22 @@ impl Files {
             }
         });
         list.add_controller(keys);
+        let more = gtk::Label::new(None);
+        more.add_css_class("dim");
+        let more_row = gtk::ListBoxRow::new();
+        more_row.set_child(Some(&more));
+        more_row.set_activatable(false);
+        more_row.set_selectable(false);
+        more_row.set_visible(false);
+        list.append(&more_row);
         let scroller = gtk::ScrolledWindow::builder()
             .child(&list)
             .vexpand(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
 
-        let message = gtk::Label::new(Some("Connecting…"));
-        message.set_wrap(true);
-        message.set_max_width_chars(60);
-        message.set_selectable(true);
-        let reconnect = button("Reconnect", Msg::Reconnect);
-        reconnect.set_halign(gtk::Align::Center);
-        reconnect.set_visible(false);
-        let message_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        message_page.set_valign(gtk::Align::Center);
-        message_page.append(&message);
-        message_page.append(&reconnect);
-
-        let stack = gtk::Stack::new();
-        stack.add_named(&scroller, Some("list"));
-        stack.add_named(&message_page, Some("message"));
-        stack.set_visible_child_name("message");
-        page.append(&stack);
+        let session = SessionPage::new(&scroller, send(Msg::Session(session::Msg::Reconnect)));
+        page.append(session.widget());
 
         let transfers_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
         page.append(&transfers_box);
@@ -272,26 +272,19 @@ impl Files {
         Files {
             node,
             page,
-            state: State::Starting,
+            session,
             path: String::new(),
             entries: Vec::new(),
             path_entry,
-            stack,
+            scroller,
             list,
-            message,
-            reconnect,
+            more_row,
+            more,
             error,
             on_selection,
             transfers_box,
             transfers: HashMap::new(),
         }
-    }
-
-    /// Shows a message in place of the list.
-    fn show_message(&self, text: &str, can_reconnect: bool) {
-        self.message.set_label(text);
-        self.reconnect.set_visible(can_reconnect);
-        self.stack.set_visible_child_name("message");
     }
 
     fn show_error(&self, error: Option<&str>) {
@@ -306,23 +299,17 @@ impl Files {
         core: &Client,
         sender: &ComponentSender<App>,
     ) {
-        match state {
-            SessionState::Connecting { step } => self.show_message(&format!("{step}…"), false),
-            SessionState::Connected => self.list_dir(self.path.clone(), core, sender),
-            SessionState::Closed { error } => {
-                self.state = State::Closed;
-                // The core cancels them, but their last events can arrive
-                // after this, or not at all.
-                for row in self.transfers.values_mut().filter(|row| !row.ended) {
-                    row.stop("stopped: the connection ended");
-                    row.redraw();
-                }
-                let text = match error {
-                    Some(error) => format!("The connection ended: {}", printable(error)),
-                    None => "The connection ended.".into(),
-                };
-                self.show_message(&text, true);
+        if matches!(state, SessionState::Closed { .. }) {
+            // The core cancels them, but their last events can arrive
+            // after this, or not at all.
+            for row in self.transfers.values_mut().filter(|row| !row.ended) {
+                row.stop("stopped: the connection ended");
+                row.redraw();
             }
+        }
+        let ended = |error: Option<&str>| session::ended("The connection ended", error);
+        if self.session.session_changed(state, ended) {
+            self.list_dir(self.path.clone(), core, sender);
         }
     }
 
@@ -338,25 +325,26 @@ impl Files {
         let node = self.node;
         match msg {
             // Handled by the window, which knows the other sessions.
-            Msg::Started(_) => {}
-            Msg::StartFailed(error) => {
-                self.state = State::Closed;
-                self.show_message(&printable(&error), true);
+            Msg::Session(session::Msg::Started(_)) => {}
+            Msg::Session(session::Msg::StartFailed(error)) => self.session.start_failed(&error),
+            Msg::Session(session::Msg::Reconnect) => {
+                if self.session.reconnect() {
+                    self.show_error(None);
+                    start(core, node, sender);
+                }
             }
             Msg::Listed { path, entries } => {
                 self.show_error(None);
                 // Listing the same folder again keeps what was selected.
-                let keep = self
-                    .selected()
-                    .filter(|_| path == self.path)
-                    .map(|e| e.name.clone());
+                let same = path == self.path;
+                let keep = self.selected().filter(|_| same).map(|e| e.name.clone());
                 self.path = path;
                 self.path_entry.set_text(&printable(&self.path));
-                self.entries = sorted(entries);
-                self.fill_list(keep.as_deref());
-                self.stack.set_visible_child_name("list");
+                self.fill_list(sorted(entries), same, keep.as_deref());
+                self.session.show_content();
             }
             Msg::Failed(error) => self.show_error(Some(&printable(&error))),
+            Msg::Opened { name, contents } => viewer::show(window, &name, &contents),
             Msg::GoTyped => {
                 let typed = self.path_entry.text().trim().to_string();
                 // Unchanged text stands for the real path, which can hold
@@ -384,7 +372,7 @@ impl Files {
                     FileKind::Dir | FileKind::Symlink => {
                         self.list_dir(join(&self.path, &entry.name), core, sender)
                     }
-                    FileKind::File => self.update(Msg::Download, core, window, sender),
+                    FileKind::File => self.open(entry.name.clone(), core, sender),
                     FileKind::Other => {}
                 }
             }
@@ -506,7 +494,7 @@ impl Files {
                 session,
                 label,
             } => {
-                let gone = self.state != State::Running(session);
+                let gone = self.session.state != State::Running(session);
                 let row = self.transfer_row(transfer, sender);
                 row.what = Some(label);
                 // Its session ended before the reply came, so no more
@@ -529,14 +517,6 @@ impl Files {
             Msg::Dismiss(transfer) => {
                 if let Some(row) = self.transfers.remove(&transfer) {
                     self.transfers_box.remove(&row.row);
-                }
-            }
-            Msg::Reconnect => {
-                if self.state == State::Closed {
-                    self.state = State::Starting;
-                    self.show_error(None);
-                    self.show_message("Connecting…", false);
-                    start(core, node, sender);
                 }
             }
         }
@@ -750,13 +730,39 @@ impl Files {
 
     /// Lists `path`, or the home folder when it is empty.
     fn list_dir(&self, path: String, core: &Client, sender: &ComponentSender<App>) {
-        let State::Running(session) = self.state else {
+        let Some(session) = self.session.running() else {
             return;
         };
         let (core, input, node) = (core.clone(), sender.input_sender().clone(), self.node);
         runtime().spawn(async move {
             let msg = match core.execute(Command::ListDir { session, path }).await {
                 Ok(Response::Dir { path, entries }) => Msg::Listed { path, entries },
+                Ok(other) => Msg::Failed(format!("unexpected reply {other:?}")),
+                Err(e) => Msg::Failed(e.to_string()),
+            };
+            let _ = input.send(AppMsg::Files { node, msg });
+        });
+    }
+
+    /// Reads the start of the file called `name` in the folder shown. It
+    /// arrives as [`Msg::Opened`].
+    fn open(&self, name: String, core: &Client, sender: &ComponentSender<App>) {
+        let Some(session) = self.session.running() else {
+            return self.show_error(Some("Not connected."));
+        };
+        let command = Command::ReadFile {
+            session,
+            path: join(&self.path, &name),
+            limit: Some(viewer::LIMIT),
+        };
+        let (core, input, node) = (core.clone(), sender.input_sender().clone(), self.node);
+        runtime().spawn(async move {
+            let msg = match core.execute(command).await {
+                // Decoded here, away from the GTK thread.
+                Ok(Response::File { data, size }) => Msg::Opened {
+                    name,
+                    contents: viewer::Contents::new(&data, size),
+                },
                 Ok(other) => Msg::Failed(format!("unexpected reply {other:?}")),
                 Err(e) => Msg::Failed(e.to_string()),
             };
@@ -771,7 +777,7 @@ impl Files {
         core: &Client,
         sender: &ComponentSender<App>,
     ) {
-        let State::Running(session) = self.state else {
+        let Some(session) = self.session.running() else {
             return;
         };
         let command = command(session);
@@ -792,7 +798,7 @@ impl Files {
         core: &Client,
         sender: &ComponentSender<App>,
     ) {
-        let State::Running(session) = self.state else {
+        let Some(session) = self.session.running() else {
             return self.show_error(Some("Not connected."));
         };
         let command = command(session);
@@ -811,37 +817,61 @@ impl Files {
         });
     }
 
-    /// Draws the entries, selecting the one called `keep`.
-    fn fill_list(&self, keep: Option<&str>) {
-        // Rebuilding destroys the focused row, and GTK would then select
-        // whichever row it focuses next.
+    /// Draws `entries`, selecting the one called `keep`. A new listing of
+    /// the same folder only touches the rows that changed, so the scroll
+    /// position, the selection and the focus stay where they were.
+    fn fill_list(&mut self, entries: Vec<FileEntry>, same_folder: bool, keep: Option<&str>) {
         let had_focus = self.list.focus_child().is_some();
-        self.list.remove_all();
-        for entry in self.entries.iter().take(MAX_ROWS) {
-            self.list.append(&row(entry));
+        let old = if same_folder {
+            shown(&self.entries)
+        } else {
+            self.list.remove_all();
+            self.list.append(&self.more_row);
+            self.scroller.vadjustment().set_value(0.0);
+            &[]
+        };
+        for op in diff(old, shown(&entries)) {
+            match op {
+                Op::Remove(at) => {
+                    if let Some(row) = self.list.row_at_index(at as i32) {
+                        self.list.remove(&row);
+                    }
+                }
+                Op::Insert(at) => {
+                    let row = gtk::ListBoxRow::new();
+                    row.set_child(Some(&row_content(&entries[at])));
+                    self.list.insert(&row, at as i32);
+                }
+                // The row itself stays, and with it the selection and focus.
+                Op::Replace(at) => {
+                    if let Some(row) = self.list.row_at_index(at as i32) {
+                        row.set_child(Some(&row_content(&entries[at])));
+                    }
+                }
+            }
         }
-        if self.entries.len() > MAX_ROWS {
-            let more = gtk::Label::new(Some(&format!(
-                "…and {} more, not shown",
-                self.entries.len() - MAX_ROWS
-            )));
-            more.add_css_class("dim");
-            let row = gtk::ListBoxRow::new();
-            row.set_child(Some(&more));
-            row.set_activatable(false);
-            row.set_selectable(false);
-            self.list.append(&row);
-        }
-        self.list.unselect_all();
+        self.entries = entries;
+        let hidden = self.entries.len().saturating_sub(MAX_ROWS);
+        self.more
+            .set_label(&format!("…and {hidden} more, not shown"));
+        self.more_row.set_visible(hidden > 0);
+
+        // Removing the focused row makes GTK select whichever row it
+        // focuses next, so the selection is set again either way.
         let index = keep.and_then(|name| self.entries.iter().position(|e| e.name == name));
-        if let Some(row) = index
+        match index
             .filter(|&i| i < MAX_ROWS)
             .and_then(|i| self.list.row_at_index(i as i32))
         {
-            self.list.select_row(Some(&row));
-            if had_focus {
-                row.grab_focus();
+            Some(row) => {
+                if !row.is_selected() {
+                    self.list.select_row(Some(&row));
+                }
+                if had_focus && self.list.focus_child().is_none() {
+                    row.grab_focus();
+                }
             }
+            None => self.list.unselect_all(),
         }
         let selected = self.selected().is_some();
         for button in &self.on_selection {
@@ -850,21 +880,61 @@ impl Files {
     }
 }
 
-/// Asks the core for an SFTP session on `node`. The reply arrives as
-/// [`Msg::Started`] or [`Msg::StartFailed`].
+/// Asks the core for an SFTP session on `node`.
 pub fn start(core: &Client, node: NodeId, sender: &ComponentSender<App>) {
-    let (core, input) = (core.clone(), sender.input_sender().clone());
-    runtime().spawn(async move {
-        let msg = match core.execute(Command::OpenFiles { node }).await {
-            Ok(Response::Session { session }) => Msg::Started(session),
-            Ok(other) => Msg::StartFailed(format!("unexpected reply {other:?}")),
-            Err(e) => Msg::StartFailed(e.to_string()),
-        };
-        let _ = input.send(AppMsg::Files { node, msg });
-    });
+    let wrap = move |msg| AppMsg::Files {
+        node,
+        msg: Msg::Session(msg),
+    };
+    session::start(core, Command::OpenFiles { node }, sender, wrap);
 }
 
-fn row(entry: &FileEntry) -> gtk::ListBoxRow {
+/// The entries that get a row.
+fn shown(entries: &[FileEntry]) -> &[FileEntry] {
+    &entries[..entries.len().min(MAX_ROWS)]
+}
+
+/// One step from the rows of one listing to the rows of the next. `at` is
+/// both the row's position at that step and its index in the new entries.
+#[derive(Debug, PartialEq)]
+enum Op {
+    Remove(usize),
+    Insert(usize),
+    Replace(usize),
+}
+
+/// The steps from the rows for `old` to the rows for `new`, both sorted by
+/// [`order`]. Rows for entries that didn't change are left alone.
+fn diff(old: &[FileEntry], new: &[FileEntry]) -> Vec<Op> {
+    let (mut i, mut at, mut ops) = (0, 0, Vec::new());
+    while i < old.len() || at < new.len() {
+        let step = match (old.get(i), new.get(at)) {
+            (Some(a), Some(b)) => order(a, b),
+            (Some(_), None) => Ordering::Less,
+            (None, _) => Ordering::Greater,
+        };
+        match step {
+            Ordering::Less => {
+                ops.push(Op::Remove(at));
+                i += 1;
+            }
+            Ordering::Greater => {
+                ops.push(Op::Insert(at));
+                at += 1;
+            }
+            Ordering::Equal => {
+                if old[i] != new[at] {
+                    ops.push(Op::Replace(at));
+                }
+                i += 1;
+                at += 1;
+            }
+        }
+    }
+    ops
+}
+
+fn row_content(entry: &FileEntry) -> gtk::Box {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let icon = match entry.kind {
         FileKind::Dir => "folder-symbolic",
@@ -897,18 +967,18 @@ fn row(entry: &FileEntry) -> gtk::ListBoxRow {
         .map(String::from)
         .unwrap_or_default();
     content.append(&column(modified, 16));
-    let row = gtk::ListBoxRow::new();
-    row.set_child(Some(&content));
-    row
+    content
 }
 
 /// Folders first, then by name.
+fn order(a: &FileEntry, b: &FileEntry) -> Ordering {
+    (a.kind != FileKind::Dir)
+        .cmp(&(b.kind != FileKind::Dir))
+        .then_with(|| a.name.cmp(&b.name))
+}
+
 fn sorted(mut entries: Vec<FileEntry>) -> Vec<FileEntry> {
-    entries.sort_by(|a, b| {
-        (a.kind != FileKind::Dir)
-            .cmp(&(b.kind != FileKind::Dir))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    entries.sort_by(order);
     entries
 }
 
@@ -1042,15 +1112,18 @@ mod tests {
         assert_eq!(mode(0o640), "rw-r-----");
     }
 
-    #[test]
-    fn folders_sort_first() {
-        let entry = |name: &str, kind| FileEntry {
+    fn entry(name: &str, kind: FileKind) -> FileEntry {
+        FileEntry {
             name: name.into(),
             kind,
             size: 0,
             modified: None,
             permissions: None,
-        };
+        }
+    }
+
+    #[test]
+    fn folders_sort_first() {
         let names: Vec<String> = sorted(vec![
             entry("b.txt", FileKind::File),
             entry("z", FileKind::Dir),
@@ -1060,6 +1133,89 @@ mod tests {
         .map(|e| e.name)
         .collect();
         assert_eq!(names, ["z", "a.txt", "b.txt"]);
+    }
+
+    /// Runs `diff`'s steps on a copy of `old`, as `fill_list` does on rows.
+    fn apply(old: &[FileEntry], new: &[FileEntry]) -> (Vec<FileEntry>, Vec<Op>) {
+        let ops = diff(old, new);
+        let mut rows = old.to_vec();
+        for op in &ops {
+            match *op {
+                Op::Remove(at) => {
+                    rows.remove(at);
+                }
+                Op::Insert(at) => rows.insert(at, new[at].clone()),
+                Op::Replace(at) => rows[at] = new[at].clone(),
+            }
+        }
+        (rows, ops)
+    }
+
+    #[test]
+    fn listing_again_only_touches_what_changed() {
+        let old = sorted(vec![
+            entry("docs", FileKind::Dir),
+            entry("a.txt", FileKind::File),
+            entry("b.txt", FileKind::File),
+            entry("c.txt", FileKind::File),
+        ]);
+        assert_eq!(diff(&old, &old), []);
+
+        let mut grown = entry("b.txt", FileKind::File);
+        grown.size = 10;
+        let new = sorted(vec![
+            entry("docs", FileKind::Dir),
+            entry("aa.txt", FileKind::File),
+            grown,
+            entry("c.txt", FileKind::File),
+            entry("d.txt", FileKind::File),
+        ]);
+        let (rows, ops) = apply(&old, &new);
+        assert_eq!(rows, new);
+        assert_eq!(
+            ops,
+            [Op::Remove(1), Op::Insert(1), Op::Replace(2), Op::Insert(4)]
+        );
+    }
+
+    #[test]
+    fn a_name_that_changes_kind_moves() {
+        let old = sorted(vec![entry("x", FileKind::File), entry("y", FileKind::File)]);
+        let new = sorted(vec![entry("x", FileKind::Dir), entry("y", FileKind::File)]);
+        let (rows, _) = apply(&old, &new);
+        assert_eq!(rows, new);
+    }
+
+    #[test]
+    fn diffs_reach_any_listing() {
+        let all: Vec<FileEntry> = ["a", "b", "c", "d"]
+            .iter()
+            .flat_map(|n| [entry(n, FileKind::File), entry(n, FileKind::Dir)])
+            .collect();
+        // Every pair of subsets, as a stand-in for any two listings.
+        let subset = |bits: u32| {
+            sorted(
+                (0..all.len())
+                    .filter(|i| bits & (1 << i) != 0)
+                    .map(|i| all[i].clone())
+                    .collect(),
+            )
+        };
+        for a in (0..256).step_by(7) {
+            for b in (0..256).step_by(5) {
+                let (old, new) = (subset(a), subset(b));
+                assert_eq!(apply(&old, &new).0, new, "{a:#b} to {b:#b}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_drawn_rows_are_diffed() {
+        let many: Vec<FileEntry> = (0..MAX_ROWS + 5)
+            .map(|i| entry(&format!("{i:05}"), FileKind::File))
+            .collect();
+        assert_eq!(shown(&many).len(), MAX_ROWS);
+        assert_eq!(diff(shown(&many), shown(&many[1..])).len(), 2);
     }
 
     #[cfg(unix)]

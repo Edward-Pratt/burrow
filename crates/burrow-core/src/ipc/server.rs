@@ -7,13 +7,14 @@
 //! SSH channel rather than losing bytes.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use data_encoding::BASE64;
+use data_encoding::{BASE64, HEXLOWER};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
@@ -27,6 +28,7 @@ use super::{
     read_line,
 };
 use crate::api::{API_VERSION, Capability, Command, Event, NodeId, Response, SessionId};
+use crate::class::McpRule;
 use crate::engine::Core;
 use crate::error::{Error, Result};
 
@@ -38,6 +40,13 @@ const OUTPUT_QUEUE: usize = 16;
 
 /// How often an idle daemon checks whether it can stop.
 const IDLE_CHECK: Duration = Duration::from_secs(5);
+
+/// Connections so far, which numbers each one.
+static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The longest string the audit log keeps whole, so a few lines can't
+/// fill the log and push out what came before. See [`cut`].
+const AUDIT_FIELD: usize = 4 << 10;
 
 /// Serves clients on `listener`. With `idle`, it returns once no client
 /// has been connected and no session running for that long; otherwise it
@@ -90,6 +99,8 @@ impl Drop for Connected {
 /// The parts of a connection its tasks share.
 struct Conn {
     core: Core,
+    /// Tells this client's lines in the audit log from another bridge's.
+    id: u64,
     role: OnceLock<Role>,
     control: mpsc::Sender<String>,
     output: mpsc::Sender<String>,
@@ -122,6 +133,7 @@ async fn connection(core: Core, stream: UnixStream, _connected: Connected) {
     tokio::spawn(write_all(write, control_rx, output_rx));
     let conn = Arc::new(Conn {
         core,
+        id: CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1,
         role: OnceLock::new(),
         control,
         output,
@@ -211,13 +223,7 @@ impl Conn {
         match method {
             "execute" => {
                 let command: Command = parse(params)?;
-                let owns = matches!(
-                    command,
-                    Command::OpenTerminal { .. }
-                        | Command::OpenFiles { .. }
-                        | Command::OpenDatabase { .. }
-                        | Command::OpenMonitor { .. }
-                );
+                let owns = command.class().opens_session;
                 let response = match role {
                     Role::Gui | Role::Cli => self.core.execute(command).await,
                     Role::Mcp => self.execute_mcp(command).await,
@@ -324,12 +330,24 @@ enum Rule {
     GrantedAlerts,
 }
 
+impl Rule {
+    /// How the audit log names it.
+    fn name(&self) -> &'static str {
+        match self {
+            Rule::Run => "run",
+            Rule::ReadOnlyQuery => "read_only_query",
+            Rule::MonitorWithoutInstall => "monitor_without_install",
+            Rule::GrantedAlerts => "granted_alerts",
+        }
+    }
+}
+
 impl Conn {
     /// Runs a command for the MCP bridge if its grants allow it, and
     /// records it in the audit log either way.
     async fn execute_mcp(&self, command: Command) -> Result<Response> {
         let rule = self.mcp_rule(&command);
-        let mut entry = audit_entry(&command, rule.is_ok());
+        let mut entry = audit_entry(&command, rule.as_ref().ok(), self.id);
         let result = match rule {
             Err(e) => Err(e),
             Ok(Rule::Run) => self.core.execute(command).await,
@@ -366,76 +384,53 @@ impl Conn {
             }
         };
         entry["ok"] = json!(result.is_ok());
-        if let Err(e) = &result {
-            entry["error"] = json!(e.to_string());
+        match &result {
+            // Commands on the session name only its id, so this ties them
+            // to the node it was opened on.
+            Ok(Response::Session { session }) => entry["session"] = json!(session),
+            Ok(_) => {}
+            Err(e) => entry["error"] = json!(cut_error(&e.to_string())),
         }
+        cap_strings(&mut entry["command"]);
         self.core.audit(&entry);
         result
     }
 
-    /// The table of what the MCP bridge may run. Reading the sidebar is
-    /// free; acting needs a grant on the node, and a session it opened
-    /// itself. Anything not listed, such as changing nodes, secrets,
-    /// prompts, autostart, addons and grants, is refused. So are commands
-    /// that take a local path: the bridge reads and writes contents
-    /// instead, so it can't read or overwrite the user's own files.
+    /// What the MCP bridge may run. The command's class says what it
+    /// needs (see [`McpRule`]); this checks that against the grants and
+    /// the sessions the bridge opened itself.
     fn mcp_rule(&self, command: &Command) -> Result<Rule> {
-        use Capability::*;
-        let node = |node: NodeId, capability| self.require(node, capability);
-        let session = |session: SessionId, capability| {
-            let node = self.own_session(session)?;
-            self.require(node, capability)
-        };
-        match command {
-            Command::Version
-            | Command::ListNodes
-            | Command::GetNode { .. }
-            | Command::ListSessions
-            | Command::ListGrants => {}
-            Command::Exec { node: id, .. } => node(*id, Exec)?,
-            Command::OpenFiles { node: id } => node(*id, FilesRead)?,
-            Command::ListDir { session: s, .. } | Command::ReadFile { session: s, .. } => {
-                session(*s, FilesRead)?;
+        match command.class().mcp {
+            McpRule::Free => {}
+            McpRule::Node(node, capability) => self.require(node, capability)?,
+            McpRule::Session(session, capability) => {
+                let node = self.own_session(session)?;
+                self.require(node, capability)?;
             }
-            Command::WriteFile { session: s, .. }
-            | Command::MakeDir { session: s, .. }
-            | Command::RenamePath { session: s, .. }
-            | Command::RemovePath { session: s, .. } => session(*s, FilesWrite)?,
-            Command::OpenDatabase { node: id } => node(*id, SqlRead)?,
-            Command::ListSchema { session: s } | Command::CancelQuery { session: s } => {
-                session(*s, SqlRead)?;
-            }
-            Command::RunQuery { session: s, .. } => {
-                session(*s, SqlRead)?;
-                let id = self.own_session(*s)?;
-                if !self.core.granted(id, SqlWrite) {
+            McpRule::Query(session) => {
+                let node = self.own_session(session)?;
+                self.require(node, Capability::SqlRead)?;
+                if !self.core.granted(node, Capability::SqlWrite) {
                     return Ok(Rule::ReadOnlyQuery);
                 }
             }
-            Command::SetReadOnly { session: s, .. } => session(*s, SqlWrite)?,
-            Command::StartTunnel { node: id } => node(*id, Tunnel)?,
-            Command::OpenMonitor { node: id } => {
-                node(*id, MonitorRead)?;
+            McpRule::Monitor(node) => {
+                self.require(node, Capability::MonitorRead)?;
                 return Ok(Rule::MonitorWithoutInstall);
             }
-            Command::MonitorHistory { session: s } => session(*s, MonitorRead)?,
-            Command::MonitorTrend { node: id, .. } => node(*id, MonitorRead)?,
-            Command::ListAlerts => return Ok(Rule::GrantedAlerts),
-            Command::CloseSession { session: s } => {
-                if self.own_session(*s).is_err() {
-                    let tunnel = self
-                        .core
-                        .sessions()
-                        .list()
-                        .into_iter()
-                        .find(|i| i.session == *s && i.kind == crate::api::SessionKind::Tunnel);
+            McpRule::Alerts => return Ok(Rule::GrantedAlerts),
+            McpRule::Close(session) => {
+                if self.own_session(session).is_err() {
+                    let tunnel = self.core.sessions().list().into_iter().find(|i| {
+                        i.session == session && i.kind == crate::api::SessionKind::Tunnel
+                    });
                     match tunnel {
-                        Some(info) => self.require(info.node, Tunnel)?,
+                        Some(info) => self.require(info.node, Capability::Tunnel)?,
                         None => return Err(denied("close a session it did not open")),
                     }
                 }
             }
-            other => return Err(denied(&format!("run {}", command_type(other)))),
+            McpRule::Denied => return Err(denied(&format!("run {}", command_type(command)))),
         }
         Ok(Rule::Run)
     }
@@ -475,22 +470,79 @@ fn command_type(command: &Command) -> String {
         .unwrap_or_default()
 }
 
-/// What the audit log keeps of a command. A refused one is kept by type
-/// only, since it may carry a secret; file contents are kept by size.
-fn audit_entry(command: &Command, allowed: bool) -> Value {
+/// What the audit log keeps of a command, and the `rule` it runs under
+/// when it may run at all. A refused one is kept by type only, since it
+/// may carry a secret; file contents are kept by size and hash.
+fn audit_entry(command: &Command, rule: Option<&Rule>, connection: u64) -> Value {
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let mut logged = if allowed {
-        serde_json::to_value(command).unwrap_or_default()
-    } else {
-        json!({"type": command_type(command)})
+    let mut logged = match rule {
+        Some(_) => serde_json::to_value(command).unwrap_or_default(),
+        None => json!({"type": command_type(command)}),
     };
     if let Command::WriteFile { data, .. } = command {
-        logged["data"] = json!(format!("{} bytes", data.len()));
+        logged["data"] = json!({"bytes": data.len(), "sha256": sha256(data)});
     }
-    json!({"time": time, "command": logged})
+    let mut entry = json!({"time": time, "connection": connection, "command": logged});
+    if let Some(rule) = rule {
+        entry["rule"] = json!(rule.name());
+    }
+    entry
+}
+
+/// Replaces every string in a command that is longer than
+/// [`AUDIT_FIELD`] with what [`cut`] keeps of it.
+fn cap_strings(value: &mut Value) {
+    match value {
+        Value::String(text) if text.len() > AUDIT_FIELD => {
+            let kept = cut(text);
+            *value = kept;
+        }
+        Value::Array(items) => items.iter_mut().for_each(cap_strings),
+        Value::Object(fields) => fields.values_mut().for_each(cap_strings),
+        _ => {}
+    }
+}
+
+/// What the audit log keeps of a long string in a command: its start and
+/// its end, since a harmless start can hide what a command really does,
+/// and the whole value's length and SHA-256, so what was left out can be
+/// checked against a copy of the command.
+fn cut(text: &str) -> Value {
+    let half = AUDIT_FIELD / 2;
+    let mut head = half;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - half;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    json!({
+        "head": &text[..head],
+        "tail": &text[tail..],
+        "bytes": text.len(),
+        "sha256": sha256(text.as_bytes()),
+    })
+}
+
+/// An error's start, and how long it was. An error says why a command
+/// failed rather than what it did, so its start is enough.
+fn cut_error(text: &str) -> String {
+    if text.len() <= AUDIT_FIELD {
+        return text.to_string();
+    }
+    let mut end = AUDIT_FIELD;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes)", &text[..end], text.len())
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    HEXLOWER.encode(&Sha256::digest(bytes))
 }
 
 /// Passes events on as `event` notifications. A client that falls behind
@@ -562,4 +614,53 @@ fn parse<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, Failure> {
 
 fn failed(error: Error) -> Failure {
     (SERVER_ERROR, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_audit_line_keeps_the_ends_and_hash_of_long_strings() {
+        let sql = format!("select '{}'", "é".repeat(1 << 20));
+        let command = Command::RunQuery {
+            session: SessionId(1),
+            sql: sql.clone(),
+            limit: None,
+        };
+        let mut entry = audit_entry(&command, Some(&Rule::ReadOnlyQuery), 1);
+        cap_strings(&mut entry["command"]);
+        assert!(entry.to_string().len() < 2 * AUDIT_FIELD);
+        let kept = &entry["command"]["sql"];
+        assert!(kept["head"].as_str().unwrap().starts_with("select 'éé"));
+        assert!(kept["tail"].as_str().unwrap().ends_with("éé'"));
+        assert_eq!(kept["bytes"], sql.len());
+        assert_eq!(kept["sha256"], HEXLOWER.encode(&Sha256::digest(&sql)));
+
+        let error = cut_error(&"x".repeat(AUDIT_FIELD + 1));
+        assert!(error.ends_with("… (4097 bytes)"));
+        assert_eq!(cut_error("short"), "short");
+
+        // Contents are kept by size and hash alone.
+        let command = Command::WriteFile {
+            session: SessionId(1),
+            path: "notes".into(),
+            data: b"abc".to_vec(),
+            overwrite: false,
+        };
+        let entry = audit_entry(&command, Some(&Rule::Run), 1);
+        assert_eq!(
+            entry["command"]["data"],
+            json!({
+                "bytes": 3,
+                "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            })
+        );
+
+        // Short strings, and everything else, are left as they were.
+        let mut entry = audit_entry(&Command::ListNodes, Some(&Rule::Run), 2);
+        let before = entry.clone();
+        cap_strings(&mut entry["command"]);
+        assert_eq!(entry, before);
+    }
 }

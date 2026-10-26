@@ -10,23 +10,23 @@
 //! them.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use burrow_core::ipc::Client;
 use burrow_core::monitor::{Sample, Unit};
 use burrow_core::{
-    Alert, AlertKind, Command, MonitorHistory, NodeId, Response, SessionId, SessionState,
-    TrendRange,
+    Alert, AlertKind, Command, MonitorHistory, NodeId, Response, SessionState, TrendRange,
 };
 use relm4::gtk::prelude::*;
 use relm4::{ComponentSender, gtk};
 
 use crate::app::{App, AppMsg};
 use crate::files::{printable, size};
-use crate::remote::State;
 use crate::runtime::runtime;
+use crate::session::{self, SessionPage};
 
 /// Samples the charts show: ten minutes, at one every 2 seconds.
 const CHART_POINTS: usize = 300;
@@ -48,17 +48,14 @@ const TREND_REFRESH: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub enum Msg {
-    /// The core accepted `open_monitor`.
-    Started(SessionId),
-    /// `open_monitor` itself failed.
-    StartFailed(String),
+    /// `open_monitor` and what follows.
+    Session(session::Msg),
     /// What the monitor had seen before the tab joined it, which a
     /// background monitor has: whether systemd runs there, the latest
     /// services, and samples for the charts.
     History(MonitorHistory),
     /// The service filter or "failed only" changed.
     Filter,
-    Reconnect,
     /// The user turned "Monitor in the background" on or off. The window
     /// asks first, since it knows the host.
     SetBackground(bool),
@@ -72,10 +69,7 @@ pub enum Msg {
 pub struct Monitor {
     node: NodeId,
     pub page: gtk::Box,
-    pub state: State,
-    stack: gtk::Stack,
-    message: gtk::Label,
-    reconnect: gtk::Button,
+    pub session: SessionPage,
     summary: gtk::Label,
     cpu: Chart,
     cpu_label: gtk::Label,
@@ -91,6 +85,9 @@ pub struct Monitor {
     filter: gtk::SearchEntry,
     failed_only: gtk::CheckButton,
     units_list: gtk::ListBox,
+    /// The rows in `units_list`, in order, so a new list only changes the
+    /// rows that differ.
+    unit_rows: Vec<UnitRow>,
     systemd: bool,
     units: Option<Vec<Unit>>,
     background: gtk::CheckButton,
@@ -233,35 +230,13 @@ impl Monitor {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
 
-        let message = gtk::Label::new(Some("Connecting…"));
-        message.set_wrap(true);
-        message.set_max_width_chars(60);
-        message.set_selectable(true);
-        let reconnect = gtk::Button::with_label("Reconnect");
-        reconnect.connect_clicked({
-            let send = send(Msg::Reconnect);
-            move |_| send()
-        });
-        reconnect.set_halign(gtk::Align::Center);
-        reconnect.set_visible(false);
-        let message_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        message_page.set_valign(gtk::Align::Center);
-        message_page.append(&message);
-        message_page.append(&reconnect);
-
-        let stack = gtk::Stack::new();
-        stack.add_named(&scroller, Some("content"));
-        stack.add_named(&message_page, Some("message"));
-        stack.set_visible_child_name("message");
-        page.append(&stack);
+        let session = SessionPage::new(&scroller, send(Msg::Session(session::Msg::Reconnect)));
+        page.append(session.widget());
 
         Monitor {
             node,
             page,
-            state: State::Starting,
-            stack,
-            message,
-            reconnect,
+            session,
             summary,
             cpu,
             cpu_label,
@@ -275,6 +250,7 @@ impl Monitor {
             filter,
             failed_only,
             units_list,
+            unit_rows: Vec::new(),
             systemd: false,
             units: None,
             background,
@@ -315,32 +291,17 @@ impl Monitor {
         self.alerts.set_visible(!alerts.is_empty());
     }
 
-    fn show_message(&self, text: &str, can_reconnect: bool) {
-        self.message.set_label(text);
-        self.reconnect.set_visible(can_reconnect);
-        self.stack.set_visible_child_name("message");
-    }
-
     pub fn session_changed(
         &mut self,
         state: &SessionState,
         core: &Client,
         sender: &ComponentSender<App>,
     ) {
-        match state {
-            SessionState::Connecting { step } => self.show_message(&format!("{step}…"), false),
-            SessionState::Connected => {
-                self.show_message("Waiting for the first sample…", false);
-                self.fetch_history(core, sender);
-            }
-            SessionState::Closed { error } => {
-                self.state = State::Closed;
-                let text = match error {
-                    Some(error) => format!("The monitor stopped: {}", printable(error)),
-                    None => "The monitor stopped.".into(),
-                };
-                self.show_message(&text, true);
-            }
+        let ended = |error: Option<&str>| session::ended("The monitor stopped", error);
+        if self.session.session_changed(state, ended) {
+            self.session
+                .show_message("Waiting for the first sample…", false);
+            self.fetch_history(core, sender);
         }
     }
 
@@ -348,7 +309,7 @@ impl Monitor {
     /// in the history, and so are the services of a monitor that was
     /// running before the tab joined it.
     pub fn fetch_history(&self, core: &Client, sender: &ComponentSender<App>) {
-        let State::Running(session) = self.state else {
+        let Some(session) = self.session.running() else {
             return;
         };
         let (core, node, input) = (core.clone(), self.node, sender.input_sender().clone());
@@ -363,7 +324,7 @@ impl Monitor {
     }
 
     pub fn sample(&mut self, sample: &Sample, core: &Client, sender: &ComponentSender<App>) {
-        self.stack.set_visible_child_name("content");
+        self.session.show_content();
         if let Some(range) = self.range
             && self
                 .trend_read
@@ -490,65 +451,86 @@ impl Monitor {
         self.fill_units();
     }
 
-    fn fill_units(&self) {
-        while let Some(row) = self.units_list.row_at_index(0) {
-            self.units_list.remove(&row);
-        }
-        let Some(units) = &self.units else {
-            self.units_label.set_label("Services");
-            if !self.systemd {
-                self.units_list
-                    .append(&label("This server doesn't run systemd."));
-            }
-            return;
-        };
-        let failed = units.iter().filter(|u| u.active == "failed").count();
-        self.units_label.set_label(&match failed {
-            0 => format!("Services: {}", units.len()),
-            n => format!("Services: {}, {n} failed", units.len()),
-        });
+    /// Shows the services that pass the filter. Rows that were already
+    /// there are kept and updated, so the scroll position and the focus
+    /// survive a new list.
+    fn fill_units(&mut self) {
         let text = self.filter.text().to_lowercase();
         let failed_only = self.failed_only.is_active();
-        let mut shown: Vec<&Unit> = units
+        self.units_label.set_label(&match &self.units {
+            None => "Services".into(),
+            Some(units) => {
+                let failed = units.iter().filter(|u| u.active == "failed").count();
+                match failed {
+                    0 => format!("Services: {}", units.len()),
+                    n => format!("Services: {}, {n} failed", units.len()),
+                }
+            }
+        });
+        let entries = entries(self.units.as_deref(), self.systemd, &text, failed_only);
+
+        let old: Vec<&RowKey> = self.unit_rows.iter().map(|r| &r.key).collect();
+        let new: Vec<&RowKey> = entries.iter().map(|(key, _)| key).collect();
+        let keep = keep(&old, &new);
+        let focused = self
+            .unit_rows
             .iter()
-            .filter(|u| !failed_only || u.active == "failed")
-            .filter(|u| {
-                text.is_empty()
-                    || u.name.to_lowercase().contains(&text)
-                    || u.description.to_lowercase().contains(&text)
-            })
-            .collect();
-        // Failed first, then running, then the rest, each by name.
-        shown.sort_by_key(|u| (u.active != "failed", u.active != "active", &u.name));
-        if shown.is_empty() {
-            let none = label(if failed_only && text.is_empty() {
-                "No service has failed."
+            .position(|r| r.row.has_focus())
+            .map(|i| (i, self.unit_rows[i].key.clone()));
+
+        // Rows that move or go are taken out first. Those that stay are
+        // then in the new order, and the rest go in around them.
+        let mut kept: HashMap<RowKey, UnitRow> = HashMap::new();
+        let mut moving: HashMap<RowKey, UnitRow> = HashMap::new();
+        for (row, keep) in std::mem::take(&mut self.unit_rows).into_iter().zip(keep) {
+            if keep {
+                kept.insert(row.key.clone(), row);
             } else {
-                "No service matches."
-            });
-            none.add_css_class("dim");
-            self.units_list.append(&none);
+                self.units_list.remove(&row.row);
+                moving.insert(row.key.clone(), row);
+            }
         }
-        for unit in shown.iter().take(MAX_ROWS) {
-            self.units_list.append(&unit_row(unit));
+        for (index, (key, entry)) in entries.into_iter().enumerate() {
+            let row = match kept.remove(&key) {
+                Some(row) => row,
+                None => {
+                    let row = moving
+                        .remove(&key)
+                        .unwrap_or_else(|| UnitRow::new(key, &entry));
+                    self.units_list.insert(&row.row, index as i32);
+                    row
+                }
+            };
+            row.show(&entry);
+            self.unit_rows.push(row);
         }
-        if shown.len() > MAX_ROWS {
-            let more = label(&format!(
-                "{} more. Filter to see them.",
-                shown.len() - MAX_ROWS
-            ));
-            more.add_css_class("dim");
-            self.units_list.append(&more);
+
+        // A focused row that moved gets the focus back. One that went
+        // passes it to the row that took its place.
+        if let Some((index, key)) = focused {
+            let row = self
+                .unit_rows
+                .iter()
+                .find(|r| r.key == key)
+                .or_else(|| self.unit_rows.get(index))
+                .or(self.unit_rows.last());
+            if let Some(row) = row
+                && !row.row.has_focus()
+            {
+                row.row.grab_focus();
+            }
         }
     }
 
     pub fn update(&mut self, msg: Msg, core: &Client, sender: &ComponentSender<App>) {
         match msg {
             // Handled by the window, which knows the other sessions.
-            Msg::Started(_) => {}
-            Msg::StartFailed(error) => {
-                self.state = State::Closed;
-                self.show_message(&printable(&error), true);
+            Msg::Session(session::Msg::Started(_)) => {}
+            Msg::Session(session::Msg::StartFailed(error)) => self.session.start_failed(&error),
+            Msg::Session(session::Msg::Reconnect) => {
+                if self.session.reconnect() {
+                    start(core, self.node, sender);
+                }
             }
             Msg::History(history) => {
                 self.systemd = history.systemd;
@@ -585,54 +567,219 @@ impl Monitor {
                     self.show_trend(range, &points);
                 }
             }
-            Msg::Reconnect => {
-                if self.state == State::Closed {
-                    self.state = State::Starting;
-                    self.show_message("Connecting…", false);
-                    start(core, self.node, sender);
-                }
-            }
         }
     }
 }
 
-/// Asks the core for a monitor on `node`. The reply arrives as
-/// [`Msg::Started`] or [`Msg::StartFailed`].
+/// Asks the core for a monitor on `node`.
 pub fn start(core: &Client, node: NodeId, sender: &ComponentSender<App>) {
-    let (core, input) = (core.clone(), sender.input_sender().clone());
-    runtime().spawn(async move {
-        let msg = match core.execute(Command::OpenMonitor { node }).await {
-            Ok(Response::Session { session }) => Msg::Started(session),
-            Ok(other) => Msg::StartFailed(format!("unexpected reply {other:?}")),
-            Err(e) => Msg::StartFailed(e.to_string()),
-        };
-        let _ = input.send(AppMsg::Monitor { node, msg });
-    });
+    let wrap = move |msg| AppMsg::Monitor {
+        node,
+        msg: Msg::Session(msg),
+    };
+    session::start(core, Command::OpenMonitor { node }, sender, wrap);
 }
 
-fn unit_row(unit: &Unit) -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let name = label(&printable(&unit.name));
-    name.set_width_chars(32);
-    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    let state = label(&printable(&format!("{} ({})", unit.active, unit.sub)));
-    state.set_width_chars(20);
-    if unit.active == "failed" {
-        name.add_css_class("error-text");
-        state.add_css_class("error-text");
-    } else if unit.active == "active" {
-        state.add_css_class("running");
-    } else {
-        state.add_css_class("dim");
+/// What a row of the services list stands for, so a new list finds the
+/// row that showed it before.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RowKey {
+    /// A service, and which of the services with that name it is. Names
+    /// come from the server, so they may repeat.
+    Unit(String, usize),
+    NoSystemd,
+    NoneShown,
+    More,
+}
+
+/// What a row of the services list shows.
+#[derive(Debug, PartialEq)]
+enum Entry<'a> {
+    Unit(&'a Unit),
+    /// A note, and whether it is dimmed.
+    Text(String, bool),
+}
+
+/// The rows of the services list: the services that pass the filter,
+/// failed first, then running, then the rest, each by name, or a note
+/// saying why there are none.
+fn entries<'a>(
+    units: Option<&'a [Unit]>,
+    systemd: bool,
+    text: &str,
+    failed_only: bool,
+) -> Vec<(RowKey, Entry<'a>)> {
+    let Some(units) = units else {
+        if systemd {
+            return Vec::new();
+        }
+        let note = Entry::Text("This server doesn't run systemd.".into(), false);
+        return vec![(RowKey::NoSystemd, note)];
+    };
+    let mut shown: Vec<&Unit> = units
+        .iter()
+        .filter(|u| !failed_only || u.active == "failed")
+        .filter(|u| {
+            text.is_empty()
+                || u.name.to_lowercase().contains(text)
+                || u.description.to_lowercase().contains(text)
+        })
+        .collect();
+    shown.sort_by_key(|u| (u.active != "failed", u.active != "active", &u.name));
+    if shown.is_empty() {
+        let note = if failed_only && text.is_empty() {
+            "No service has failed."
+        } else {
+            "No service matches."
+        };
+        return vec![(RowKey::NoneShown, Entry::Text(note.into(), true))];
     }
-    let description = label(&printable(&unit.description));
-    description.add_css_class("dim");
-    description.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    description.set_hexpand(true);
-    row.append(&name);
-    row.append(&state);
-    row.append(&description);
-    row
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut rows: Vec<(RowKey, Entry)> = shown
+        .iter()
+        .take(MAX_ROWS)
+        .map(|unit| {
+            let nth = seen.entry(&unit.name).or_default();
+            *nth += 1;
+            (RowKey::Unit(unit.name.clone(), *nth - 1), Entry::Unit(unit))
+        })
+        .collect();
+    if shown.len() > MAX_ROWS {
+        let more = format!("{} more. Filter to see them.", shown.len() - MAX_ROWS);
+        rows.push((RowKey::More, Entry::Text(more, true)));
+    }
+    rows
+}
+
+/// Which rows of `old` can stay where they are when the list becomes
+/// `new`: as many as possible whose order doesn't change. The others are
+/// taken out and put back in their new place. Keys must not repeat.
+fn keep<K: Eq + Hash>(old: &[K], new: &[K]) -> Vec<bool> {
+    let at: HashMap<&K, usize> = old.iter().enumerate().map(|(i, k)| (k, i)).collect();
+    // The old places of the rows that are still there, in the new order.
+    // The longest increasing run through them is what can stay.
+    let places: Vec<usize> = new.iter().filter_map(|k| at.get(k).copied()).collect();
+    // `tails[n]` is the index into `places` that ends the best run of
+    // length n + 1 found so far, and `before` links each to the one
+    // ahead of it.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut before: Vec<Option<usize>> = vec![None; places.len()];
+    for (i, &place) in places.iter().enumerate() {
+        let n = tails.partition_point(|&t| places[t] < place);
+        before[i] = n.checked_sub(1).map(|n| tails[n]);
+        if n == tails.len() {
+            tails.push(i);
+        } else {
+            tails[n] = i;
+        }
+    }
+    let mut keep = vec![false; old.len()];
+    let mut next = tails.last().copied();
+    while let Some(i) = next {
+        keep[places[i]] = true;
+        next = before[i];
+    }
+    keep
+}
+
+/// A row of the services list, and the labels in it.
+struct UnitRow {
+    key: RowKey,
+    row: gtk::ListBoxRow,
+    view: RowView,
+}
+
+enum RowView {
+    Unit {
+        name: gtk::Label,
+        state: gtk::Label,
+        description: gtk::Label,
+        /// What the labels show, so they are only set when it changes.
+        shown: RefCell<Option<Unit>>,
+    },
+    Text(gtk::Label),
+}
+
+impl UnitRow {
+    fn new(key: RowKey, entry: &Entry) -> UnitRow {
+        let row = gtk::ListBoxRow::new();
+        let view = match entry {
+            Entry::Unit(_) => {
+                let line = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                let name = label("");
+                name.set_width_chars(32);
+                name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                let state = label("");
+                state.set_width_chars(20);
+                let description = label("");
+                description.add_css_class("dim");
+                description.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                description.set_hexpand(true);
+                line.append(&name);
+                line.append(&state);
+                line.append(&description);
+                row.set_child(Some(&line));
+                RowView::Unit {
+                    name,
+                    state,
+                    description,
+                    shown: RefCell::new(None),
+                }
+            }
+            Entry::Text(..) => {
+                let text = label("");
+                row.set_child(Some(&text));
+                RowView::Text(text)
+            }
+        };
+        UnitRow { key, row, view }
+    }
+
+    /// Shows `entry`, which has this row's key, so is of the same kind.
+    fn show(&self, entry: &Entry) {
+        match (&self.view, entry) {
+            (
+                RowView::Unit {
+                    name,
+                    state,
+                    description,
+                    shown,
+                },
+                Entry::Unit(unit),
+            ) => {
+                if shown.borrow().as_ref() == Some(*unit) {
+                    return;
+                }
+                name.set_label(&printable(&unit.name));
+                state.set_label(&printable(&format!("{} ({})", unit.active, unit.sub)));
+                description.set_label(&printable(&unit.description));
+                for class in ["error-text", "running", "dim"] {
+                    name.remove_css_class(class);
+                    state.remove_css_class(class);
+                }
+                if unit.active == "failed" {
+                    name.add_css_class("error-text");
+                    state.add_css_class("error-text");
+                } else if unit.active == "active" {
+                    state.add_css_class("running");
+                } else {
+                    state.add_css_class("dim");
+                }
+                shown.replace(Some((*unit).clone()));
+            }
+            (RowView::Text(label), Entry::Text(text, dim)) => {
+                if label.label() != *text {
+                    label.set_label(text);
+                }
+                if *dim {
+                    label.add_css_class("dim");
+                } else {
+                    label.remove_css_class("dim");
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn label(text: &str) -> gtk::Label {
@@ -868,6 +1015,128 @@ fn duration(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unit(name: &str, active: &str) -> Unit {
+        Unit {
+            name: name.into(),
+            active: active.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Checks `keep` against what the list ends up as: the rows kept are
+    /// in the new order, and `kept` of them stay.
+    fn check_keep(old: &[&str], new: &[&str], kept: usize) {
+        let keep = keep(old, new);
+        assert_eq!(keep.len(), old.len());
+        let stay: Vec<&str> = old
+            .iter()
+            .zip(&keep)
+            .filter(|(_, k)| **k)
+            .map(|(o, _)| *o)
+            .collect();
+        assert_eq!(stay.len(), kept, "{old:?} to {new:?} keeps {stay:?}");
+        let order: Vec<&str> = new.iter().copied().filter(|n| stay.contains(n)).collect();
+        assert_eq!(stay, order);
+    }
+
+    #[test]
+    fn rows_that_keep_their_order_stay() {
+        check_keep(&["a", "b", "c"], &["a", "b", "c"], 3);
+        check_keep(&["a", "b", "c"], &["a", "c"], 2);
+        check_keep(&["a", "c"], &["a", "b", "c"], 2);
+        check_keep(&[], &["a", "b"], 0);
+        check_keep(&["a", "b"], &[], 0);
+        // A service that fails moves to the top, and one that recovers
+        // moves down. Only that row moves, not those it passes.
+        check_keep(&["a", "b", "c", "d"], &["d", "a", "b", "c"], 3);
+        check_keep(&["d", "a", "b", "c"], &["a", "b", "c", "d"], 3);
+        check_keep(&["a", "b", "c", "d"], &["d", "c", "b", "a"], 1);
+        check_keep(&["a", "b", "c", "d", "e"], &["b", "x", "a", "d", "e"], 3);
+    }
+
+    #[test]
+    fn services_list_failed_then_running_then_the_rest() {
+        let units = [
+            unit("b.service", "inactive"),
+            unit("c.service", "active"),
+            unit("a.service", "active"),
+            unit("d.service", "failed"),
+        ];
+        let keys: Vec<RowKey> = entries(Some(&units), true, "", false)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let key = |name: &str| RowKey::Unit(name.into(), 0);
+        assert_eq!(
+            keys,
+            [
+                key("d.service"),
+                key("a.service"),
+                key("c.service"),
+                key("b.service")
+            ]
+        );
+    }
+
+    #[test]
+    fn services_with_the_same_name_get_their_own_rows() {
+        let units = [unit("a.service", "active"), unit("a.service", "active")];
+        let keys: Vec<RowKey> = entries(Some(&units), true, "", false)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                RowKey::Unit("a.service".into(), 0),
+                RowKey::Unit("a.service".into(), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn services_list_says_why_it_is_empty() {
+        assert_eq!(
+            entries(None, false, "", false),
+            [(
+                RowKey::NoSystemd,
+                Entry::Text("This server doesn't run systemd.".into(), false)
+            )]
+        );
+        assert!(entries(None, true, "", false).is_empty());
+        let units = [unit("a.service", "active")];
+        assert_eq!(
+            entries(Some(&units), true, "", true),
+            [(
+                RowKey::NoneShown,
+                Entry::Text("No service has failed.".into(), true)
+            )]
+        );
+        assert_eq!(
+            entries(Some(&units), true, "nginx", false),
+            [(
+                RowKey::NoneShown,
+                Entry::Text("No service matches.".into(), true)
+            )]
+        );
+    }
+
+    #[test]
+    fn services_past_the_limit_are_counted() {
+        let units: Vec<Unit> = (0..MAX_ROWS + 3)
+            .map(|i| unit(&format!("u{i:05}.service"), "active"))
+            .collect();
+        let rows = entries(Some(&units), true, "", false);
+        assert_eq!(rows.len(), MAX_ROWS + 1);
+        assert_eq!(
+            rows.last(),
+            Some(&(
+                RowKey::More,
+                Entry::Text("3 more. Filter to see them.".into(), true)
+            ))
+        );
+    }
 
     #[test]
     fn durations_read_well() {

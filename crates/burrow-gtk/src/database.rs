@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use burrow_core::ipc::Client;
 use burrow_core::{
     Command, DbSchema, DbTable, DbTableKind, HistoryEntry, Node, NodeId, QueryError, QueryResult,
-    Response, SessionId, SessionState, StatementResult,
+    Response, SessionState, StatementResult,
 };
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gio, glib};
@@ -23,8 +23,8 @@ use sourceview5::prelude::*;
 use crate::app::{App, AppMsg};
 use crate::dialogs;
 use crate::files::printable;
-use crate::remote::State;
 use crate::runtime::runtime;
+use crate::session::{self, SessionPage};
 
 /// The most characters of a value drawn in a grid cell. Labels get slow
 /// long before a value reaches the 64 KiB the core keeps.
@@ -36,10 +36,8 @@ const NOTE_TIME: Duration = Duration::from_secs(6);
 
 #[derive(Clone, Debug)]
 pub enum Msg {
-    /// The core accepted `open_database`.
-    Started(SessionId),
-    /// `open_database` itself failed.
-    StartFailed(String),
+    /// `open_database` and what follows.
+    Session(session::Msg),
     Run,
     Cancel,
     Ran {
@@ -77,7 +75,6 @@ pub enum Msg {
     UseQuery(String),
     ClearHistory,
     CopyRow,
-    Reconnect,
 }
 
 /// One row of the result grid.
@@ -94,7 +91,7 @@ enum Item {
 pub struct Database {
     node: NodeId,
     pub page: gtk::Box,
-    pub state: State,
+    pub session: SessionPage,
     /// As the core last confirmed it. Sessions start read-only.
     read_only: bool,
     running: bool,
@@ -116,9 +113,6 @@ pub struct Database {
     schemas: gio::ListStore,
     /// The SQL to export, while the user picks where to.
     export_sql: Option<String>,
-    stack: gtk::Stack,
-    message: gtk::Label,
-    reconnect: gtk::Button,
 }
 
 impl Database {
@@ -290,29 +284,14 @@ impl Database {
         main.append(&split);
         split.set_vexpand(true);
 
-        let message = gtk::Label::new(Some("Connecting…"));
-        message.set_wrap(true);
-        message.set_max_width_chars(60);
-        message.set_selectable(true);
-        let reconnect = button("Reconnect", Msg::Reconnect);
-        reconnect.set_halign(gtk::Align::Center);
-        reconnect.set_visible(false);
-        let message_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        message_page.set_valign(gtk::Align::Center);
-        message_page.append(&message);
-        message_page.append(&reconnect);
-
-        let stack = gtk::Stack::new();
-        stack.add_named(&main, Some("main"));
-        stack.add_named(&message_page, Some("message"));
-        stack.set_visible_child_name("message");
-        stack.set_vexpand(true);
-        page.append(&stack);
+        let session = SessionPage::new(&main, send(Msg::Session(session::Msg::Reconnect)));
+        session.widget().set_vexpand(true);
+        page.append(session.widget());
 
         Database {
             node,
             page,
-            state: State::Starting,
+            session,
             read_only: true,
             running: false,
             buffer,
@@ -331,19 +310,6 @@ impl Database {
             selection,
             schemas,
             export_sql: None,
-            stack,
-            message,
-            reconnect,
-        }
-    }
-
-    fn show_message(&self, text: &str, can_reconnect: bool) {
-        self.message.set_label(text);
-        self.reconnect.set_visible(can_reconnect);
-        self.stack.set_visible_child_name("message");
-        // Otherwise the selectable message takes focus, all selected.
-        if can_reconnect {
-            self.reconnect.grab_focus();
         }
     }
 
@@ -371,28 +337,23 @@ impl Database {
         core: &Client,
         sender: &ComponentSender<App>,
     ) {
-        match state {
-            SessionState::Connecting { step } => self.show_message(&format!("{step}…"), false),
-            SessionState::Connected => {
-                // A new session starts read-only, whatever the last one was.
-                self.set_read_only(true);
-                self.set_running(false);
-                self.stack.set_visible_child_name("main");
-                self.editor.grab_focus();
-                self.load_schema(core, sender);
-            }
-            SessionState::Closed { error } => {
-                self.state = State::Closed;
-                self.set_running(false);
-                // The editor only shows once connected.
-                let was_connected = self.stack.visible_child_name().as_deref() == Some("main");
-                let text = match (error, was_connected) {
-                    (Some(error), true) => format!("The connection ended: {}", printable(error)),
-                    (Some(error), false) => format!("Couldn't connect: {}", printable(error)),
-                    (None, _) => "The connection ended.".into(),
-                };
-                self.show_message(&text, true);
-            }
+        // The editor only shows once connected. Read before the session
+        // page swaps it for the message.
+        let was_connected = self.session.showing_content();
+        let ended = |error: Option<&str>| match (error, was_connected) {
+            (Some(_), false) => session::ended("Couldn't connect", error),
+            _ => session::ended("The connection ended", error),
+        };
+        if matches!(state, SessionState::Closed { .. }) {
+            self.set_running(false);
+        }
+        if self.session.session_changed(state, ended) {
+            // A new session starts read-only, whatever the last one was.
+            self.set_read_only(true);
+            self.set_running(false);
+            self.session.show_content();
+            self.editor.grab_focus();
+            self.load_schema(core, sender);
         }
     }
 
@@ -406,10 +367,13 @@ impl Database {
         let node = self.node;
         match msg {
             // Handled by the window, which knows the other sessions.
-            Msg::Started(_) => {}
-            Msg::StartFailed(error) => {
-                self.state = State::Closed;
-                self.show_message(&printable(&error), true);
+            Msg::Session(session::Msg::Started(_)) => {}
+            Msg::Session(session::Msg::StartFailed(error)) => self.session.start_failed(&error),
+            Msg::Session(session::Msg::Reconnect) => {
+                if self.session.reconnect() {
+                    self.show_error(None);
+                    start(core, node, sender);
+                }
             }
             Msg::Run => {
                 if self.running {
@@ -437,7 +401,7 @@ impl Database {
                 self.query(sql.clone(), 0, Some(sql), core, sender);
             }
             Msg::Cancel => {
-                let State::Running(session) = self.state else {
+                let Some(session) = self.session.running() else {
                     return;
                 };
                 self.request(Command::CancelQuery { session }, core, sender, |_| None);
@@ -466,7 +430,7 @@ impl Database {
                 if read_only == self.read_only {
                     return;
                 }
-                let State::Running(session) = self.state else {
+                let Some(session) = self.session.running() else {
                     return self.set_read_only(self.read_only);
                 };
                 let command = Command::SetReadOnly { session, read_only };
@@ -518,7 +482,7 @@ impl Database {
                 self.export_sql = Some(sql);
             }
             Msg::ExportTo(path) => {
-                let (State::Running(session), Some(sql)) = (self.state, self.export_sql.take())
+                let (Some(session), Some(sql)) = (self.session.running(), self.export_sql.take())
                 else {
                     return;
                 };
@@ -582,14 +546,6 @@ impl Database {
                 self.grid.clipboard().set_text(&text);
                 self.note("Copied the row", sender);
             }
-            Msg::Reconnect => {
-                if self.state == State::Closed {
-                    self.state = State::Starting;
-                    self.show_error(None);
-                    self.show_message("Connecting…", false);
-                    start(core, node, sender);
-                }
-            }
         }
     }
 
@@ -602,7 +558,7 @@ impl Database {
         core: &Client,
         sender: &ComponentSender<App>,
     ) {
-        let State::Running(session) = self.state else {
+        let Some(session) = self.session.running() else {
             return self.show_error(Some("Not connected."));
         };
         self.set_running(true);
@@ -659,7 +615,7 @@ impl Database {
     }
 
     fn load_schema(&self, core: &Client, sender: &ComponentSender<App>) {
-        let State::Running(session) = self.state else {
+        let Some(session) = self.session.running() else {
             return;
         };
         self.request(
@@ -816,8 +772,12 @@ impl Database {
                 line.append(&when);
                 list.append(&line);
             }
-            list.connect_row_activated({
-                let (sender, popover) = (sender.clone(), popover.clone());
+            // Weak: the list is inside the popover.
+            list.connect_row_activated(glib::clone!(
+                #[weak]
+                popover,
+                #[strong]
+                sender,
                 move |_, row| {
                     if let Some(entry) = newest_first.get(row.index() as usize) {
                         let msg = Msg::UseQuery(entry.sql.clone());
@@ -825,7 +785,7 @@ impl Database {
                     }
                     popover.popdown();
                 }
-            });
+            ));
             let scroller = gtk::ScrolledWindow::builder()
                 .child(&list)
                 .hscrollbar_policy(gtk::PolicyType::Never)
@@ -836,8 +796,11 @@ impl Database {
             content.append(&scroller);
             let clear = gtk::Button::with_label("Clear history");
             clear.set_halign(gtk::Align::End);
-            clear.connect_clicked({
-                let (sender, popover) = (sender.clone(), popover.clone());
+            clear.connect_clicked(glib::clone!(
+                #[weak]
+                popover,
+                #[strong]
+                sender,
                 move |_| {
                     sender.input(AppMsg::Database {
                         node,
@@ -845,7 +808,7 @@ impl Database {
                     });
                     popover.popdown();
                 }
-            });
+            ));
             content.append(&clear);
         }
         popover.set_child(Some(&content));
@@ -853,18 +816,13 @@ impl Database {
     }
 }
 
-/// Asks the core to connect to `node`. The reply arrives as
-/// [`Msg::Started`] or [`Msg::StartFailed`].
+/// Asks the core to connect to `node`.
 pub fn start(core: &Client, node: NodeId, sender: &ComponentSender<App>) {
-    let (core, input) = (core.clone(), sender.input_sender().clone());
-    runtime().spawn(async move {
-        let msg = match core.execute(Command::OpenDatabase { node }).await {
-            Ok(Response::Session { session }) => Msg::Started(session),
-            Ok(other) => Msg::StartFailed(format!("unexpected reply {other:?}")),
-            Err(e) => Msg::StartFailed(e.to_string()),
-        };
-        let _ = input.send(AppMsg::Database { node, msg });
-    });
+    let wrap = move |msg| AppMsg::Database {
+        node,
+        msg: Msg::Session(msg),
+    };
+    session::start(core, Command::OpenDatabase { node }, sender, wrap);
 }
 
 /// The schemas, their tables and their columns, as a tree. Activating a
@@ -1421,9 +1379,22 @@ pub fn edit(
     content.append(&buttons);
     window.set_child(Some(&content));
 
+    // The window is held weakly by everything inside it, or it would keep
+    // itself alive after closing.
     let submit = Rc::new({
-        let (window, name, error) = (window.clone(), name.clone(), error.clone());
+        let (window, name, error) = (window.downgrade(), name.clone(), error.clone());
+        let (host, socket, user, database, root, port) = (
+            host.clone(),
+            socket.clone(),
+            user.clone(),
+            database.clone(),
+            root.clone(),
+            port.clone(),
+        );
         move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
             let fail = |message: &str| {
                 error.set_label(message);
                 error.set_visible(true);
@@ -1485,11 +1456,12 @@ pub fn edit(
         let submit = submit.clone();
         move |_| submit()
     });
-    name.connect_activate(move |_| submit());
-    cancel.connect_clicked({
-        let window = window.clone();
-        move |_| window.close()
-    });
+    for entry in [&name, &host, &socket, &user, &database, &root] {
+        let submit = submit.clone();
+        entry.connect_activate(move |_| submit());
+    }
+    port.connect_activate(move |_| submit());
+    dialogs::close_on_cancel(&window, &cancel);
     dialogs::close_on_escape(&window);
 
     window.present();

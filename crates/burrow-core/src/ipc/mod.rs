@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub use client::{Client, Events};
 pub use server::serve;
-pub(crate) use start::{LOCK, SOCKET};
+pub(crate) use start::{LOCK, SOCKET, take_lock};
 pub use start::{connect, ensure_private_dir, runtime_dir, stop};
 
 /// The longest line either side accepts. Lines are long when a query
