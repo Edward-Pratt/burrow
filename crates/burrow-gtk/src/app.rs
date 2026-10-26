@@ -332,9 +332,40 @@ impl TabKey {
 }
 
 struct Tab {
-    /// A `gtk::Box` for node tabs, a [`terminal::page`] for terminals.
     page: gtk::Widget,
     title: gtk::Label,
+    panel: Panel,
+}
+
+/// What a tab shows, with the state it keeps.
+enum Panel {
+    /// An SSH host's shell.
+    Shell(Remote),
+    Files(Files),
+    Monitor(Monitor),
+    Database(Database),
+    /// The box a tunnel's page is drawn in.
+    Tunnel(gtk::Box),
+    /// The box an addon draws its view in.
+    View(gtk::Box),
+    /// A node Burrow can't open, described by [`fill_page`].
+    Placeholder(gtk::Box),
+    /// A local shell. VTE runs it, so there is nothing to keep.
+    Terminal,
+}
+
+impl Panel {
+    /// The state of the tab's own session, for panels that run one.
+    /// Tunnels run whether or not their tab is open, so theirs isn't.
+    fn session(&self) -> Option<session::State> {
+        match self {
+            Panel::Shell(remote) => Some(remote.state),
+            Panel::Files(panel) => Some(panel.session.state),
+            Panel::Monitor(panel) => Some(panel.session.state),
+            Panel::Database(panel) => Some(panel.session.state),
+            Panel::Tunnel(_) | Panel::View(_) | Panel::Placeholder(_) | Panel::Terminal => None,
+        }
+    }
 }
 
 pub struct App {
@@ -357,24 +388,12 @@ pub struct App {
     notice_id: u32,
     tabs: HashMap<TabKey, Tab>,
     next_terminal: u32,
-    /// SSH host tabs, by node.
-    remotes: HashMap<NodeId, Remote>,
-    /// File panels, by SSH host node.
-    files: HashMap<NodeId, Files>,
-    /// Monitors, by SSH host node.
-    monitors: HashMap<NodeId, Monitor>,
-    /// Database tabs, by node.
-    databases: HashMap<NodeId, Database>,
-    /// Tabs drawn by addons: the box their view goes in, by node.
-    views: HashMap<NodeId, gtk::Box>,
     unclaimed: Unclaimed,
     /// Whether a `list_sessions` to place an unknown session's prompt is
     /// on its way.
     looking_up: bool,
     /// Every tunnel that has run, by node, whether or not its tab is open.
     tunnels: HashMap<NodeId, tunnels::Status>,
-    /// Tunnel tabs: the box their page is drawn in, by node.
-    tunnel_pages: HashMap<NodeId, gtk::Box>,
     /// Tunnels to start again once their session has closed.
     restarting: HashSet<NodeId>,
     /// Tunnels that start with Burrow.
@@ -483,15 +502,9 @@ impl Component for App {
             notice_id: 0,
             tabs: HashMap::new(),
             next_terminal: 1,
-            remotes: HashMap::new(),
-            files: HashMap::new(),
-            monitors: HashMap::new(),
-            databases: HashMap::new(),
-            views: HashMap::new(),
             unclaimed: Unclaimed::default(),
             looking_up: false,
             tunnels: HashMap::new(),
-            tunnel_pages: HashMap::new(),
             restarting: HashSet::new(),
             autostart: HashSet::new(),
             monitoring: HashSet::new(),
@@ -616,8 +629,11 @@ impl Component for App {
             }
             AppMsg::TerminalExited(id) => self.close_tab(TabKey::Terminal(id), widgets),
             AppMsg::SessionStarted { node, session } => {
-                match self.remotes.get_mut(&node) {
-                    Some(remote) if remote.state == session::State::Starting => {
+                match self.tabs.get_mut(&TabKey::Node(node)) {
+                    Some(Tab {
+                        panel: Panel::Shell(remote),
+                        ..
+                    }) if remote.state == session::State::Starting => {
                         remote.state = session::State::Running(session);
                         // Sizes seen while starting had no session to go to.
                         let (cols, rows) = terminal::size(&remote.terminal);
@@ -639,28 +655,28 @@ impl Component for App {
                 }
             }
             AppMsg::SessionFailed { node, error } => {
-                if let Some(remote) = self.remotes.get_mut(&node) {
+                if let Some(remote) = self.shell(TabKey::Node(node)) {
                     remote.terminal.feed(remote::failure(&error).as_bytes());
                     remote.state = session::State::Closed;
                 }
             }
             AppMsg::SessionOutput { session, data } => {
-                if let Some(remote) = self.remote_for(session) {
+                if let Some(remote) = self.shell_running(session) {
                     remote.terminal.feed(&data);
                 }
             }
             AppMsg::SessionOutputEnded { session } => {
-                if let Some(remote) = self
-                    .remotes
-                    .values_mut()
-                    .find(|r| r.state == session::State::Running(session))
-                {
+                if let Some(remote) = self.shell_running(session) {
                     remote.ending.output_ended = true;
                     remote.finish_if_done();
                 }
             }
             AppMsg::RemoteInput { node, data } => {
-                let Some(remote) = self.remotes.get_mut(&node) else {
+                let Some(Tab {
+                    panel: Panel::Shell(remote),
+                    ..
+                }) = self.tabs.get_mut(&TabKey::Node(node))
+                else {
                     return;
                 };
                 match remote.state {
@@ -678,13 +694,14 @@ impl Component for App {
                 }
             }
             AppMsg::RemoteResize { node, cols, rows } => {
-                if let Some(&Remote {
+                let panel = self.tabs.get(&TabKey::Node(node)).map(|t| &t.panel);
+                if let Some(Panel::Shell(Remote {
                     state: session::State::Running(session),
                     ..
-                }) = self.remotes.get(&node)
+                })) = panel
                 {
                     let command = Command::ResizeTerminal {
-                        session,
+                        session: *session,
                         cols,
                         rows,
                     };
@@ -692,7 +709,7 @@ impl Component for App {
                 }
             }
             AppMsg::RemoteTitle { node, title } => {
-                if let Some(remote) = self.remotes.get_mut(&node) {
+                if let Some(remote) = self.shell(TabKey::Node(node)) {
                     // The server sets it.
                     remote.title = Some(files::printable(&title));
                     self.set_remote_tooltip(node);
@@ -702,8 +719,11 @@ impl Component for App {
             AppMsg::Files {
                 node,
                 msg: files::Msg::Session(session::Msg::Started(session)),
-            } => match self.files.get_mut(&node) {
-                Some(panel) if panel.session.state == session::State::Starting => {
+            } => match self.tabs.get_mut(&TabKey::Files(node)) {
+                Some(Tab {
+                    panel: Panel::Files(panel),
+                    ..
+                }) if panel.session.state == session::State::Starting => {
                     panel.session.state = session::State::Running(session);
                     for event in self.unclaimed.claim(session) {
                         self.session_event(event, window, &sender);
@@ -713,7 +733,11 @@ impl Component for App {
                 _ => execute(&self.core, &sender, Command::CloseSession { session }),
             },
             AppMsg::Files { node, msg } => {
-                if let Some(panel) = self.files.get_mut(&node) {
+                if let Some(Tab {
+                    panel: Panel::Files(panel),
+                    ..
+                }) = self.tabs.get_mut(&TabKey::Files(node))
+                {
                     panel.update(msg, &self.core, window, &sender);
                 }
             }
@@ -721,8 +745,11 @@ impl Component for App {
             AppMsg::Monitor {
                 node,
                 msg: monitor::Msg::Session(session::Msg::Started(session)),
-            } => match self.monitors.get_mut(&node) {
-                Some(panel) if panel.session.state == session::State::Starting => {
+            } => match self.tabs.get_mut(&TabKey::Monitor(node)) {
+                Some(Tab {
+                    panel: Panel::Monitor(panel),
+                    ..
+                }) if panel.session.state == session::State::Starting => {
                     panel.session.state = session::State::Running(session);
                     // A background monitor may have connected long ago,
                     // so no "connected" event is coming.
@@ -739,7 +766,11 @@ impl Component for App {
                 msg: monitor::Msg::SetBackground(on),
             } => self.set_monitoring(node, on, window, &sender),
             AppMsg::Monitor { node, msg } => {
-                if let Some(panel) = self.monitors.get_mut(&node) {
+                if let Some(Tab {
+                    panel: Panel::Monitor(panel),
+                    ..
+                }) = self.tabs.get_mut(&TabKey::Monitor(node))
+                {
                     panel.update(msg, &self.core, &sender);
                 }
             }
@@ -766,8 +797,11 @@ impl Component for App {
             AppMsg::Database {
                 node,
                 msg: database::Msg::Session(session::Msg::Started(session)),
-            } => match self.databases.get_mut(&node) {
-                Some(panel) if panel.session.state == session::State::Starting => {
+            } => match self.tabs.get_mut(&TabKey::Node(node)) {
+                Some(Tab {
+                    panel: Panel::Database(panel),
+                    ..
+                }) if panel.session.state == session::State::Starting => {
                     panel.session.state = session::State::Running(session);
                     for event in self.unclaimed.claim(session) {
                         self.session_event(event, window, &sender);
@@ -777,7 +811,11 @@ impl Component for App {
                 _ => execute(&self.core, &sender, Command::CloseSession { session }),
             },
             AppMsg::Database { node, msg } => {
-                if let Some(panel) = self.databases.get_mut(&node) {
+                if let Some(Tab {
+                    panel: Panel::Database(panel),
+                    ..
+                }) = self.tabs.get_mut(&TabKey::Node(node))
+                {
                     panel.update(msg, &self.core, window, &sender);
                 }
             }
@@ -1021,21 +1059,9 @@ impl App {
         }
         // Sessions ended with the daemon that ran them. Tunnels are settled
         // by the reload; the rest are only known here.
-        let ended: Vec<(NodeId, SessionId)> = (self.remotes.iter())
-            .map(|(node, r)| (*node, &r.state))
-            .chain(self.files.iter().map(|(node, p)| (*node, &p.session.state)))
-            .chain(
-                self.monitors
-                    .iter()
-                    .map(|(node, p)| (*node, &p.session.state)),
-            )
-            .chain(
-                self.databases
-                    .iter()
-                    .map(|(node, p)| (*node, &p.session.state)),
-            )
-            .filter_map(|(node, state)| match state {
-                session::State::Running(session) => Some((node, *session)),
+        let ended: Vec<(NodeId, SessionId)> = (self.tabs.iter())
+            .filter_map(|(key, tab)| match tab.panel.session() {
+                Some(session::State::Running(session)) => Some((key.node()?, session)),
                 _ => None,
             })
             .collect();
@@ -1091,18 +1117,14 @@ impl App {
             }
             Event::NodeUpdated { node } => {
                 let id = node.id;
-                if let Some(tab) = self.tabs.get(&TabKey::Files(id)) {
-                    set_tab_title(&tab.title, &files_title(&node.name));
-                }
-                if let Some(tab) = self.tabs.get(&TabKey::Monitor(id)) {
-                    set_tab_title(&tab.title, &monitor_title(&node.name));
-                }
-                if let Some(tab) = self.tabs.get(&TabKey::Node(id)) {
-                    set_tab_title(&tab.title, &node.name);
-                    if !self.tunnel_pages.contains_key(&id)
-                        && !self.databases.contains_key(&id)
-                        && let Some(page) = tab.page.downcast_ref::<gtk::Box>()
-                    {
+                for (key, tab) in self.tabs.iter().filter(|(key, _)| key.node() == Some(id)) {
+                    let title = match key {
+                        TabKey::Files(_) => files_title(&node.name),
+                        TabKey::Monitor(_) => monitor_title(&node.name),
+                        _ => node.name.clone(),
+                    };
+                    set_tab_title(&tab.title, &title);
+                    if let Panel::Placeholder(page) = &tab.panel {
                         fill_page(page, &node, &self.nodes);
                     }
                 }
@@ -1123,18 +1145,19 @@ impl App {
                 // Tunnel pages name the host they go through.
                 self.refresh_tunnels(sender);
                 // The addon draws from the node, so ask it again.
-                if self.views.contains_key(&id) {
-                    self.load_view(id, sender);
-                }
+                self.load_view(id, sender);
             }
             Event::NodeDeleted { id } => {
                 self.nodes.remove(&id);
-                self.views.remove(&id);
                 self.tunnels.remove(&id);
                 self.restarting.remove(&id);
-                self.close_tab(TabKey::Node(id), widgets);
-                self.close_tab(TabKey::Files(id), widgets);
-                self.close_tab(TabKey::Monitor(id), widgets);
+                let tabs: Vec<TabKey> = (self.tabs.keys())
+                    .filter(|key| key.node() == Some(id))
+                    .copied()
+                    .collect();
+                for key in tabs {
+                    self.close_tab(key, widgets);
+                }
                 widgets.sidebar.remove(id);
                 self.refresh_tunnels(sender);
             }
@@ -1166,21 +1189,21 @@ impl App {
             Event::MonitorSample {
                 session, sample, ..
             } => {
-                let running = session::State::Running(session);
-                if let Some(panel) = self
-                    .monitors
-                    .values_mut()
-                    .find(|p| p.session.state == running)
+                let tab = self.tab_of(session).and_then(|key| self.tabs.get_mut(&key));
+                if let Some(Tab {
+                    panel: Panel::Monitor(panel),
+                    ..
+                }) = tab
                 {
                     panel.sample(&sample, &self.core, sender);
                 }
             }
             Event::MonitorUnits { session, units, .. } => {
-                let running = session::State::Running(session);
-                if let Some(panel) = self
-                    .monitors
-                    .values_mut()
-                    .find(|p| p.session.state == running)
+                let tab = self.tab_of(session).and_then(|key| self.tabs.get_mut(&key));
+                if let Some(Tab {
+                    panel: Panel::Monitor(panel),
+                    ..
+                }) = tab
                 {
                     panel.set_units(units);
                 }
@@ -1197,10 +1220,14 @@ impl App {
                 // A transfer's last events can come after its session
                 // ended, so the panel showing it comes first.
                 let running = session::State::Running(session);
-                let panel = self
-                    .files
-                    .values_mut()
-                    .find(|p| p.has_transfer(transfer) || p.session.state == running);
+                let panel = (self.tabs.values_mut()).find_map(|tab| match &mut tab.panel {
+                    Panel::Files(panel)
+                        if panel.has_transfer(transfer) || panel.session.state == running =>
+                    {
+                        Some(panel)
+                    }
+                    _ => None,
+                });
                 if let Some(panel) = panel {
                     panel.transfer_changed(transfer, &state, &self.core, sender);
                 }
@@ -1219,15 +1246,14 @@ impl App {
         let usable = |list: &[AddonInfo], kind: &str| {
             addons::owner(list, kind).map(|a| (a.id.clone(), addons::usable(a)))
         };
-        let stale: Vec<NodeId> = self
-            .views
-            .keys()
+        let stale: Vec<NodeId> = (self.tabs.iter())
+            .filter(|(_, tab)| matches!(tab.panel, Panel::View(_)))
+            .filter_map(|(key, _)| key.node())
             .filter(|id| {
                 self.nodes.get(id).is_none_or(|node| {
                     usable(&self.addons, &node.kind) != usable(&addons, &node.kind)
                 })
             })
-            .copied()
             .collect();
         self.addons = addons;
         for id in stale {
@@ -1283,9 +1309,18 @@ impl App {
         label.map_or_else(|| kind.to_string(), sentence_case)
     }
 
-    /// Asks the node's addon for its view, or explains why it can't.
+    /// The box an addon draws `id`'s view in, if its tab is open.
+    fn view_page(&self, id: NodeId) -> Option<&gtk::Box> {
+        match &self.tabs.get(&TabKey::Node(id))?.panel {
+            Panel::View(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Asks the node's addon for its view, or explains why it can't, if
+    /// the node's tab shows a view.
     fn load_view(&self, id: NodeId, sender: &ComponentSender<Self>) {
-        let (Some(page), Some(node)) = (self.views.get(&id), self.nodes.get(&id)) else {
+        let (Some(page), Some(node)) = (self.view_page(id), self.nodes.get(&id)) else {
             return;
         };
         let Some(addon) = addons::owner(&self.addons, &node.kind) else {
@@ -1315,7 +1350,7 @@ impl App {
     }
 
     fn show_view(&self, id: NodeId, result: Result<View, String>, sender: &ComponentSender<Self>) {
-        let (Some(page), Some(node)) = (self.views.get(&id), self.nodes.get(&id)) else {
+        let (Some(page), Some(node)) = (self.view_page(id), self.nodes.get(&id)) else {
             return;
         };
         let Some(addon) = addons::owner(&self.addons, &node.kind) else {
@@ -1349,16 +1384,34 @@ impl App {
         else {
             return;
         };
-        if let Some(title) = self.remotes.get(&id).and_then(|r| r.title.as_ref()) {
+        if let Panel::Shell(Remote {
+            title: Some(title), ..
+        }) = &tab.panel
+        {
             let tooltip = format!("{}\n{title}", node.name);
             tab.title.set_tooltip_text(Some(&tooltip));
         }
     }
 
-    fn remote_for(&self, session: SessionId) -> Option<&Remote> {
-        self.remotes
-            .values()
-            .find(|r| r.state == session::State::Running(session))
+    /// The tab whose own session is `session`.
+    fn tab_of(&self, session: SessionId) -> Option<TabKey> {
+        let running = Some(session::State::Running(session));
+        (self.tabs.iter())
+            .find(|(_, tab)| tab.panel.session() == running)
+            .map(|(key, _)| *key)
+    }
+
+    fn shell(&mut self, key: TabKey) -> Option<&mut Remote> {
+        match &mut self.tabs.get_mut(&key)?.panel {
+            Panel::Shell(remote) => Some(remote),
+            _ => None,
+        }
+    }
+
+    /// The shell running `session`.
+    fn shell_running(&mut self, session: SessionId) -> Option<&mut Remote> {
+        let key = self.tab_of(session)?;
+        self.shell(key)
     }
 
     fn session_event(
@@ -1390,50 +1443,7 @@ impl App {
             self.ask(session, &prompt, window, sender);
             return;
         }
-        let running = session::State::Running(session);
-        if let Some(panel) = self
-            .databases
-            .values_mut()
-            .find(|p| p.session.state == running)
-        {
-            match event {
-                Event::SessionChanged { state, .. } => {
-                    panel.session_changed(&state, &self.core, sender)
-                }
-                Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
-                _ => {}
-            }
-            return;
-        }
-        if let Some(panel) = self
-            .monitors
-            .values_mut()
-            .find(|p| p.session.state == running)
-        {
-            match event {
-                Event::SessionChanged { state, .. } => {
-                    panel.session_changed(&state, &self.core, sender)
-                }
-                Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
-                _ => {}
-            }
-            return;
-        }
-        if let Some(panel) = self.files.values_mut().find(|p| p.session.state == running) {
-            match event {
-                Event::SessionChanged { state, .. } => {
-                    panel.session_changed(&state, &self.core, sender)
-                }
-                Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
-                _ => {}
-            }
-            return;
-        }
-        let Some(remote) = self
-            .remotes
-            .values_mut()
-            .find(|r| r.state == session::State::Running(session))
-        else {
+        let Some(key) = self.tab_of(session) else {
             // A prompt from a session nobody here started, such as a
             // tunnel that started with Burrow before its first event
             // arrived. Look up whose it is.
@@ -1444,8 +1454,18 @@ impl App {
             self.unclaimed.hold(session, event);
             return;
         };
-        match event {
-            Event::SessionChanged { state, .. } => {
+        let state = match event {
+            Event::SessionChanged { state, .. } => state,
+            Event::PromptRequested { prompt, .. } => {
+                return self.ask(session, &prompt, window, sender);
+            }
+            _ => return,
+        };
+        let Some(tab) = self.tabs.get_mut(&key) else {
+            return;
+        };
+        match &mut tab.panel {
+            Panel::Shell(remote) => {
                 let text = remote::status_text(&state);
                 if matches!(state, SessionState::Closed { .. }) {
                     remote.ending.status = Some(text.unwrap_or_default());
@@ -1454,8 +1474,10 @@ impl App {
                     remote.terminal.feed(text.as_bytes());
                 }
             }
-            Event::PromptRequested { prompt, .. } => self.ask(session, &prompt, window, sender),
-            _ => {}
+            Panel::Files(panel) => panel.session_changed(&state, &self.core, sender),
+            Panel::Monitor(panel) => panel.session_changed(&state, &self.core, sender),
+            Panel::Database(panel) => panel.session_changed(&state, &self.core, sender),
+            Panel::Tunnel(_) | Panel::View(_) | Panel::Placeholder(_) | Panel::Terminal => {}
         }
     }
 
@@ -1554,14 +1576,17 @@ impl App {
     }
 
     fn refresh_tunnels(&self, sender: &ComponentSender<Self>) {
-        for &id in self.tunnel_pages.keys() {
-            self.refresh_tunnel(id, sender);
+        for key in self.tabs.keys() {
+            if let TabKey::Node(id) = key {
+                self.refresh_tunnel(*id, sender);
+            }
         }
     }
 
     /// Draws a tunnel's tab again, if it is open.
     fn refresh_tunnel(&self, id: NodeId, sender: &ComponentSender<Self>) {
-        let (Some(page), Some(node)) = (self.tunnel_pages.get(&id), self.nodes.get(&id)) else {
+        let page = self.tabs.get(&TabKey::Node(id)).map(|tab| &tab.panel);
+        let (Some(Panel::Tunnel(page)), Some(node)) = (page, self.nodes.get(&id)) else {
             return;
         };
         let send = |message: AppMsg| -> Rc<dyn Fn()> {
@@ -1751,31 +1776,25 @@ impl App {
                 },
             );
             let page = terminal::page(&term);
-            self.add_tab(key, page.upcast(), icon, &name, widgets, sender);
-            term.grab_focus();
             remote::start(&self.core, id, &term, sender);
-            self.remotes.insert(id, Remote::new(term));
+            term.grab_focus();
+            let panel = Panel::Shell(Remote::new(term));
+            self.add_tab(key, page.upcast(), panel, icon, &name, widgets, sender);
             return;
         }
         if node.kind == POSTGRES_KIND {
             let panel = Database::new(id, sender);
-            self.add_tab(
-                key,
-                panel.page.clone().upcast(),
-                icon,
-                &name,
-                widgets,
-                sender,
-            );
+            let page = panel.page.clone().upcast();
             database::start(&self.core, id, sender);
-            self.databases.insert(id, panel);
+            let panel = Panel::Database(panel);
+            self.add_tab(key, page, panel, icon, &name, widgets, sender);
             return;
         }
         if node.kind == SSH_TUNNEL_KIND {
             let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
             page.add_css_class("tunnel-view");
-            self.add_tab(key, page.clone().upcast(), icon, &name, widgets, sender);
-            self.tunnel_pages.insert(id, page);
+            let panel = Panel::Tunnel(page.clone());
+            self.add_tab(key, page.upcast(), panel, icon, &name, widgets, sender);
             self.refresh_tunnel(id, sender);
             return;
         }
@@ -1786,14 +1805,15 @@ impl App {
                 .child(&page)
                 .hscrollbar_policy(gtk::PolicyType::Never)
                 .build();
-            self.add_tab(key, scroller.upcast(), icon, &name, widgets, sender);
-            self.views.insert(id, page);
+            let panel = Panel::View(page);
+            self.add_tab(key, scroller.upcast(), panel, icon, &name, widgets, sender);
             self.load_view(id, sender);
             return;
         }
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
         fill_page(&page, node, &self.nodes);
-        self.add_tab(key, page.upcast(), icon, &name, widgets, sender);
+        let panel = Panel::Placeholder(page.clone());
+        self.add_tab(key, page.upcast(), panel, icon, &name, widgets, sender);
     }
 
     fn open_files(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
@@ -1810,9 +1830,9 @@ impl App {
         let title = files_title(&node.name);
         let panel = Files::new(id, sender);
         let page = panel.page.clone().upcast();
-        self.add_tab(key, page, "folder-remote-symbolic", &title, widgets, sender);
         files::start(&self.core, id, sender);
-        self.files.insert(id, panel);
+        let (panel, icon) = (Panel::Files(panel), "folder-remote-symbolic");
+        self.add_tab(key, page, panel, icon, &title, widgets, sender);
     }
 
     fn open_monitor(&mut self, id: NodeId, widgets: &Widgets, sender: &ComponentSender<Self>) {
@@ -1830,19 +1850,28 @@ impl App {
         let panel = Monitor::new(id, sender);
         let page = panel.page.clone().upcast();
         let icon = "utilities-system-monitor-symbolic";
-        self.add_tab(key, page, icon, &title, widgets, sender);
         monitor::start(&self.core, id, sender);
-        self.monitors.insert(id, panel);
+        self.add_tab(
+            key,
+            page,
+            Panel::Monitor(panel),
+            icon,
+            &title,
+            widgets,
+            sender,
+        );
         self.refresh_monitors();
     }
 
     /// Shows each monitor tab whether its host is monitored in the
     /// background, and its alerts.
     fn refresh_monitors(&mut self) {
-        for (node, panel) in &mut self.monitors {
-            panel.set_background(self.monitoring.contains(node));
-            let alerts: Vec<&Alert> = self.alerts.iter().filter(|a| a.node == *node).collect();
-            panel.set_alerts(&alerts);
+        for (key, tab) in &mut self.tabs {
+            if let (TabKey::Monitor(node), Panel::Monitor(panel)) = (key, &mut tab.panel) {
+                panel.set_background(self.monitoring.contains(node));
+                let alerts: Vec<&Alert> = self.alerts.iter().filter(|a| a.node == *node).collect();
+                panel.set_alerts(&alerts);
+            }
         }
     }
 
@@ -1926,10 +1955,12 @@ impl App {
         let page = terminal::page(&term);
         let key = TabKey::Terminal(id);
         let name = terminal::shell_name(&shell);
+        let icon = "utilities-terminal-symbolic";
         self.add_tab(
             key,
             page.upcast(),
-            "utilities-terminal-symbolic",
+            Panel::Terminal,
+            icon,
             name,
             widgets,
             sender,
@@ -1937,10 +1968,12 @@ impl App {
         term.grab_focus();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_tab(
         &mut self,
         key: TabKey,
         page: gtk::Widget,
+        panel: Panel,
         icon: &str,
         name: &str,
         widgets: &Widgets,
@@ -1973,30 +2006,17 @@ impl App {
         notebook.set_current_page(Some(index));
 
         send_on_click(&close, sender, AppMsg::CloseTab(key));
-        self.tabs.insert(key, Tab { page, title });
+        self.tabs.insert(key, Tab { page, title, panel });
     }
 
     fn close_tab(&mut self, key: TabKey, widgets: &Widgets) {
-        if let Some(tab) = self.tabs.remove(&key) {
-            close_page(&widgets.notebook, &tab.page);
-        }
-        if let TabKey::Node(id) = key {
-            self.views.remove(&id);
-            self.tunnel_pages.remove(&id);
-        }
+        let Some(tab) = self.tabs.remove(&key) else {
+            return;
+        };
+        close_page(&widgets.notebook, &tab.page);
         // A session still starting is closed when its id arrives. Closing
         // a file panel's session stops its transfers too.
-        let state = match key {
-            TabKey::Node(id) => self
-                .remotes
-                .remove(&id)
-                .map(|r| r.state)
-                .or_else(|| self.databases.remove(&id).map(|d| d.session.state)),
-            TabKey::Files(id) => self.files.remove(&id).map(|f| f.session.state),
-            TabKey::Monitor(id) => self.monitors.remove(&id).map(|m| m.session.state),
-            TabKey::Terminal(_) => None,
-        };
-        if let Some(session::State::Running(session)) = state {
+        if let Some(session::State::Running(session)) = tab.panel.session() {
             let core = self.core.clone();
             runtime().spawn(async move {
                 let _ = core.execute(Command::CloseSession { session }).await;
@@ -2380,13 +2400,13 @@ impl App {
     /// shells end with the window, and burrowd closes this client's SSH
     /// sessions when it goes.
     fn close_window(&self, window: &gtk::ApplicationWindow) {
-        let remote = (self.remotes.values())
-            .filter(|r| matches!(r.state, session::State::Running(_)))
+        let open = (self.tabs.values())
+            .filter(|tab| match &tab.panel {
+                Panel::Shell(remote) => matches!(remote.state, session::State::Running(_)),
+                Panel::Terminal => true,
+                _ => false,
+            })
             .count();
-        let local = (self.tabs.keys())
-            .filter(|key| matches!(key, TabKey::Terminal(_)))
-            .count();
-        let open = remote + local;
         if open == 0 {
             window.destroy();
             return;
