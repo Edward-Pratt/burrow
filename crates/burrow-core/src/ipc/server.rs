@@ -647,6 +647,7 @@ mod tests {
             path: "notes".into(),
             data: b"abc".to_vec(),
             overwrite: false,
+            expect: None,
         };
         let entry = audit_entry(&command, Some(&Rule::Run), 1);
         assert_eq!(

@@ -208,7 +208,7 @@ impl Bridge {
                     limit: number("max_bytes"),
                 };
                 match self.execute(command).await? {
-                    Response::File { data, size } => return Ok(file_text(&data, size)),
+                    Response::File { data, size, .. } => return Ok(file_text(&data, size)),
                     other => other,
                 }
             }
@@ -219,6 +219,7 @@ impl Bridge {
                     path: text("path")?,
                     data: text("content")?.into_bytes(),
                     overwrite: args["overwrite"].as_bool().unwrap_or(false),
+                    expect: None,
                 };
                 self.execute(command).await?
             }

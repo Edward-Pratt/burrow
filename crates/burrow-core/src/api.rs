@@ -870,6 +870,10 @@ pub enum Command {
     /// Writes `data` (base64 in JSON, at most 16 MiB) to a remote file,
     /// replacing one already there only with `overwrite`. Like an upload, it
     /// goes through a temporary file and never writes through a symlink.
+    ///
+    /// With `expect`, the SHA-256 a [`Response::File`] gave for the whole
+    /// file, it replaces the file only if it still has that hash, and fails
+    /// if it changed or is gone. Then `overwrite` isn't needed.
     WriteFile {
         session: SessionId,
         path: String,
@@ -877,6 +881,8 @@ pub enum Command {
         data: Vec<u8>,
         #[serde(default)]
         overwrite: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<String>,
     },
     /// Copies a remote file or folder to `local`, an absolute path that
     /// names the copy itself. Fails if `local` exists, unless `overwrite`
@@ -1103,11 +1109,15 @@ pub enum Response {
     Monitor {
         history: MonitorHistory,
     },
-    /// The start of a file, and its whole size.
+    /// The start of a file, its whole size, and the SHA-256 of `data` in
+    /// lower-case hex. When `data` is the whole file, that hash can go in
+    /// [`Command::WriteFile`]'s `expect`.
     File {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
         size: u64,
+        #[serde(default)]
+        sha256: String,
     },
     Grants {
         grants: Vec<Grant>,

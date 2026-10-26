@@ -1196,6 +1196,7 @@ async fn files_are_read_and_written_by_content() {
         path: path.clone(),
         data: data.as_bytes().to_vec(),
         overwrite,
+        expect: None,
     };
 
     core.execute(write("first", false)).await.unwrap();
@@ -1215,12 +1216,45 @@ async fn files_are_read_and_written_by_content() {
         limit: Some(3),
     };
     match core.execute(read).await.unwrap() {
-        Response::File { data, size } => {
+        Response::File { data, size, .. } => {
             assert_eq!(data, b"sec");
             assert_eq!(size, 6);
         }
         other => panic!("expected a file, got {other:?}"),
     }
+
+    // A save from an editor replaces the file only if nobody changed it
+    // since it was read.
+    let read_all = || Command::ReadFile {
+        session,
+        path: path.clone(),
+        limit: None,
+    };
+    let sha = match core.execute(read_all()).await.unwrap() {
+        Response::File { sha256, .. } => sha256,
+        other => panic!("expected a file, got {other:?}"),
+    };
+    let save = |data: &str, expect: &str| Command::WriteFile {
+        session,
+        path: path.clone(),
+        data: data.as_bytes().to_vec(),
+        overwrite: false,
+        expect: Some(expect.to_string()),
+    };
+    core.execute(save("third", &sha)).await.unwrap();
+    assert_eq!(fs::read_to_string(root.join("note.txt")).unwrap(), "third");
+    // The hash is of "second", which the file no longer holds.
+    let error = core.execute(save("fourth", &sha)).await.unwrap_err();
+    assert!(
+        error.to_string().contains("changed on the server"),
+        "{error}"
+    );
+    assert_eq!(fs::read_to_string(root.join("note.txt")).unwrap(), "third");
+    fs::remove_file(root.join("note.txt")).unwrap();
+    let error = core.execute(save("fifth", &sha)).await.unwrap_err();
+    assert!(error.to_string().contains("removed"), "{error}");
+    assert!(!root.join("note.txt").exists());
+    core.execute(write("second", false)).await.unwrap();
 
     // Never through a symlink, and nothing left behind.
     let target = server.path("outside.txt");
@@ -1231,6 +1265,7 @@ async fn files_are_read_and_written_by_content() {
         path: remote(&root.join("link")),
         data: b"owned".to_vec(),
         overwrite: true,
+        expect: None,
     };
     assert!(core.execute(through).await.is_err());
     assert_eq!(fs::read_to_string(&target).unwrap(), "keep");

@@ -759,7 +759,7 @@ impl Files {
         runtime().spawn(async move {
             let msg = match core.execute(command).await {
                 // Decoded here, away from the GTK thread.
-                Ok(Response::File { data, size }) => Msg::Opened {
+                Ok(Response::File { data, size, .. }) => Msg::Opened {
                     name,
                     contents: viewer::Contents::new(&data, size),
                 },

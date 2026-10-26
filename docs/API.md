@@ -51,8 +51,8 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `exec` | `node`, `command`, `timeout?` (seconds) | `exec { result }` |
 | `open_files` | `node` | `session { session }` |
 | `list_dir` | `session`, `path?` (empty = home) | `dir { path, entries }` |
-| `read_file` | `session`, `path`, `limit?` | `file { data, size }` |
-| `write_file` | `session`, `path`, `data`, `overwrite?` | `ok` |
+| `read_file` | `session`, `path`, `limit?` | `file { data, size, sha256 }` |
+| `write_file` | `session`, `path`, `data`, `overwrite?`, `expect?` | `ok` |
 | `make_dir` | `session`, `path` | `ok` |
 | `rename_path` | `session`, `from`, `to` | `ok` |
 | `remove_path` | `session`, `path` | `ok` |
@@ -197,6 +197,7 @@ target_port = 5432           # "local" only
 
 - **`list_dir`** returns the folder's absolute `path` and its entries, sorted by name. Each entry has a `name`, `kind` (`file`, `dir`, `symlink` or `other`), `size`, and optional `modified` (Unix seconds) and `permissions` (mode bits). Names are sent as the server sent them and can hold control characters, so clients must clean them before showing them. Entries named `.`, `..` or with a `/` are left out.
 - **Other server text:** `list_dir`'s `path` is the server's own form of the folder, sent as it came, so it can hold control characters too. So can anything a server can word: a session state's `step` and `error` (in `session_changed` and `list_sessions`), a transfer's `failed { error }`, a query's `error` fields, and the message of an error a command fails with because the SSH, SFTP or database server refused or failed it. Clients clean all of these before showing them, as they do names.
+- **`read_file` and `write_file`** work with contents. `read_file` returns at most `limit` bytes (1 MiB by default, 16 MiB at most), the file's whole `size` as the server reports it, and `sha256`, the SHA-256 of `data` in lower-case hex. `write_file` fails if the file exists, unless `overwrite` is set. With `expect`, a `sha256` from reading the whole file, it replaces the file only if it still has that hash, and fails without writing if the file changed, was removed or is no longer a plain file. This is how an editor saves without losing a change made on the server meanwhile. A change in the moment between the check and the write is still lost.
 - **`rename_path`** fails if `to` exists. **`remove_path`** deletes a folder with everything in it, and removes symlinks rather than following them.
 - **`download` and `upload`** copy a file or a whole folder in the background and reply with a transfer id at once. `local` is an absolute path naming the copy itself. If the target exists they fail, unless `overwrite` is set: then files are replaced and folders merged.
 - **Transfers don't trust names.** A name inside a folder that holds `/`, or is `.` or `..`, fails the transfer rather than writing outside the folder that was picked. Symlinks inside a folder are skipped on both sides, and Burrow won't write through a symlink at the target.

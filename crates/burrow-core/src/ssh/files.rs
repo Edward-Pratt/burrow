@@ -17,8 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use data_encoding::HEXLOWER;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
@@ -733,13 +735,20 @@ pub(crate) async fn read_file(
     Ok((data, size))
 }
 
+/// The SHA-256 of `data`, in lower-case hex, as [`Response::File`] gives it.
+pub(crate) fn sha256(data: &[u8]) -> String {
+    HEXLOWER.encode(&Sha256::digest(data))
+}
+
 /// Writes `data` to a remote file, as an upload would. An existing file is
-/// only replaced with `overwrite`.
+/// only replaced with `overwrite`, or when it still has the SHA-256 in
+/// `expect`.
 pub(crate) async fn write_file(
     sftp: &SftpSession,
     path: &str,
     data: &[u8],
     overwrite: bool,
+    expect: Option<&str>,
 ) -> Result<()> {
     if data.len() as u64 > MAX_INLINE {
         return Err(format!(
@@ -747,7 +756,21 @@ pub(crate) async fn write_file(
             data.len()
         ));
     }
-    if !overwrite && sftp.symlink_metadata(path).await.is_ok() {
+    if let Some(expect) = expect {
+        // Checked just before writing, so a change in the moment between
+        // the two is still lost. An editor's save is not that quick.
+        let now = match sftp.symlink_metadata(path).await {
+            Ok(meta) if meta.file_type() == FileType::File => {
+                let (now, _) = read_file(sftp, path, MAX_INLINE).await?;
+                now
+            }
+            Ok(_) => return Err(format!("{path} is no longer a file")),
+            Err(_) => return Err(format!("{path} was removed on the server")),
+        };
+        if !sha256(&now).eq_ignore_ascii_case(expect) {
+            return Err(format!("{path} changed on the server since it was read"));
+        }
+    } else if !overwrite && sftp.symlink_metadata(path).await.is_ok() {
         return Err(format!("{path} already exists"));
     }
     let tag = format!("w{}", uuid::Uuid::new_v4().simple());
