@@ -2392,8 +2392,12 @@ impl App {
                 move |title| sender.input(AppMsg::TerminalTitle { id, title })
             },
             {
-                let sender = sender.clone();
-                move || sender.input(AppMsg::TerminalExited(id))
+                // Closing the window ends the shell after the app has
+                // stopped taking messages, which `input` panics on.
+                let input = sender.input_sender().clone();
+                move || {
+                    let _ = input.send(AppMsg::TerminalExited(id));
+                }
             },
         );
         terminal::set_font(&term, self.settings.terminal_font.as_deref());
