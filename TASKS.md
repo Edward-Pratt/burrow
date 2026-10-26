@@ -24,6 +24,7 @@ Next milestones from `docs/DESIGN.md`, in rough order; pick by what the tester u
 
 ## Done
 
+- [x] ~~Update button and prebuilt releases~~ (2026-10-26, branch m18-updates)
 - [x] ~~M17: VNC desktops~~ (2026-10-26, branch m17-vnc)
 - [x] ~~M16: service actions and logs~~ (2026-10-26, PR #23 merged)
 - [x] ~~M15: containers and PM2~~ (2026-10-26, PR #22 merged)
