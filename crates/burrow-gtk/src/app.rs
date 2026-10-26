@@ -1110,7 +1110,7 @@ impl App {
                 SavedTab::Terminal { shell, folder } => {
                     // A shell no longer installed gives way to the login one.
                     let shell = Some(shell).filter(|shell| shells.contains(shell));
-                    let folder = folder.filter(|folder| layout::safe_folder(folder));
+                    let folder = folder.and_then(|folder| layout::safe_folder(&folder));
                     self.open_terminal(shell, folder.as_deref(), widgets, sender);
                 }
                 SavedTab::Node { node } => self.open_tab_now(node, widgets, sender),

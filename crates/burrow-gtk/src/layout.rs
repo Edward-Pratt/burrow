@@ -43,16 +43,31 @@ pub struct Layout {
     pub tabs: Vec<SavedTab>,
 }
 
-/// Whether a local shell may start in `folder` again. Output can name any
-/// folder as the shell's (OSC 7), and prompts that run `git` in a folder
-/// run hooks from its repository, so the folder must be the user's own and
-/// writable by nobody else. The home folder is used otherwise.
-pub fn safe_folder(folder: &Path) -> bool {
+/// Where a local shell may start again for `folder`, with its links
+/// resolved, or `None` to use the home folder. Output can name any folder
+/// as the shell's (OSC 7), and prompts that run `git` in a folder run hooks
+/// from its repository, so the folder must be the user's own and writable
+/// by nobody else. So must each folder above it, or someone could swap the
+/// folder for their own between this check and the shell starting, except
+/// that in a sticky folder such as /tmp others can't rename the user's.
+pub fn safe_folder(folder: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
-    let (Ok(home), Ok(meta)) = (fs::metadata(glib::home_dir()), fs::metadata(folder)) else {
-        return false;
-    };
-    meta.is_dir() && meta.uid() == home.uid() && meta.mode() & 0o022 == 0
+    const STICKY: u32 = 0o1000;
+    let user = fs::metadata(glib::home_dir()).ok()?.uid();
+    let folder = fs::canonicalize(folder).ok()?;
+    let meta = fs::metadata(&folder).ok()?;
+    if !meta.is_dir() || meta.uid() != user || meta.mode() & 0o022 != 0 {
+        return None;
+    }
+    for parent in folder.ancestors().skip(1) {
+        let meta = fs::metadata(parent).ok()?;
+        let owner_ok = meta.uid() == user || meta.uid() == 0;
+        let others_ok = meta.mode() & 0o022 == 0 || meta.mode() & STICKY != 0;
+        if !owner_ok || !others_ok {
+            return None;
+        }
+    }
+    Some(folder)
 }
 
 fn layout_path(state_dir: &Path) -> PathBuf {
@@ -116,15 +131,36 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("burrow-folder-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(safe_folder(&dir));
+        let dir = fs::canonicalize(&dir).unwrap();
+        assert_eq!(safe_folder(&dir), Some(dir.clone()));
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(!safe_folder(&dir));
+        assert_eq!(safe_folder(&dir), None);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o757)).unwrap();
-        assert!(!safe_folder(&dir));
+        assert_eq!(safe_folder(&dir), None);
+
+        // A folder of the user's own, in a folder others can write.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let inner = dir.join("inner");
+        fs::create_dir(&inner).unwrap();
+        fs::set_permissions(&inner, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(safe_folder(&inner), None);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(safe_folder(&inner), Some(inner.clone()));
+
+        // A link is followed, and the folder it leads to is checked.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&inner, &link).unwrap();
+        assert_eq!(safe_folder(&link), Some(inner.clone()));
+        let shared = dir.join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(&shared, dir.join("to-shared")).unwrap();
+        assert_eq!(safe_folder(&dir.join("to-shared")), None);
+
         // Shared folders such as /tmp. (CI runs as root, so `/` would be
         // the user's own there.)
-        assert!(!safe_folder(Path::new("/tmp")));
-        assert!(!safe_folder(&dir.join("missing")));
+        assert_eq!(safe_folder(Path::new("/tmp")), None);
+        assert_eq!(safe_folder(&dir.join("missing")), None);
         fs::remove_dir_all(&dir).unwrap();
     }
 
