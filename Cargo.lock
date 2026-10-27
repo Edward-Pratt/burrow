@@ -429,7 +429,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "burrow-addon-notes"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "burrow-core",
  "serde_json",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "burrow-agent"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "burrow-core",
  "libc",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "burrow-cli"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "burrow-core",
  "clap",
@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "burrow-core"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "burrow-agent",
  "data-encoding",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "burrow-gtk"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "burrow-core",
  "gtk4",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "burrowd"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "burrow-core",
  "tempfile",
