@@ -2,8 +2,10 @@ name: Release
 
 # A vX.Y.Z tag on main, made by update-server's scripts/release.sh, becomes
 # a stable release: the build `burrow-update --stable` installs. A
-# vX.Y.Z-rc.N tag becomes a pre-release, which --stable skips. The tagged
-# commit already passed CI on main.
+# vX.Y.Z-rc.N tag becomes a pre-release, which --stable skips. release.sh
+# pushes its version commit with the tag, so that commit's CI runs beside
+# this build; --locked still refuses a version that Cargo.lock disagrees
+# with.
 on:
   push:
     tags: ['v*']

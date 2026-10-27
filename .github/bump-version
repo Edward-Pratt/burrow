@@ -5,6 +5,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version=${1:?usage: bump-version X.Y.Z}
+current=$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml)
+# Only X.Y.Z counts here: a release candidate of the current version isn't older than it.
+if [ "${version%%-*}" != "${current%%-*}" ] &&
+  [ "$(printf '%s\n%s\n' "${version%%-*}" "${current%%-*}" | sort -V | head -1)" = "${version%%-*}" ]; then
+  echo "bump-version: $version is older than the current version, $current" >&2
+  exit 1
+fi
 sed -i "/^\[workspace.package\]/,/^\[/ s/^version = \".*\"/version = \"$version\"/" Cargo.toml
 grep -qx "version = \"$version\"" Cargo.toml || { echo "bump-version: no [workspace.package] version in Cargo.toml" >&2; exit 1; }
 # The crates name each other's version too. A release candidate's version only matches a requirement naming it.
