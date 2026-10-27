@@ -80,6 +80,9 @@ jobs:
   # downloads, so nobody compiles Burrow to install or update it. It
   # replaces the files of one release, build-main, whose tag follows main.
   # Built on the newest Arch, so it runs on an Arch kept up to date.
+  # build-main is a pre-release, so GitHub's latest release, which
+  # `burrow-update --stable` follows, is always a tagged one
+  # (release.yml).
   release:
     needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -127,9 +130,10 @@ jobs:
               -f sha="$GITHUB_SHA" -F force=true >/dev/null
           else
             gh release create build-main --target "$GITHUB_SHA" \
-              --title "Latest build of main" --notes "" --latest
+              --title "Latest build of main" --notes "" --prerelease
           fi
           for file in burrow-x86_64.tar.gz SHA256SUMS commit; do
             gh release upload build-main "$file" --clobber
           done
-          gh release edit build-main --notes "Built from $GITHUB_SHA. Install it with dist/install.sh, which also keeps it up to date."
+          gh release edit build-main --prerelease \
+            --notes "Built from $GITHUB_SHA. Install it with dist/install.sh, which also keeps it up to date."

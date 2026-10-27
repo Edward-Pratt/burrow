@@ -51,6 +51,8 @@ struct Check {
     follow: String,
     installed: String,
     available: String,
+    /// The release's tag, when following tagged releases.
+    tag: Option<String>,
 }
 
 fn parse_check(output: &str) -> Option<Check> {
@@ -64,6 +66,7 @@ fn parse_check(output: &str) -> Option<Check> {
         follow: field("follow")?,
         installed: field("installed")?,
         available: field("available")?,
+        tag: field("tag"),
     })
 }
 
@@ -228,7 +231,12 @@ async fn check(dialog: Rc<Dialog>, script: PathBuf, restart: Restart) {
         );
         return;
     }
-    let detail = if check.follow == "release" {
+    let detail = if let Some(tag) = &check.tag {
+        format!(
+            "Installed: {}\nNewest release: {tag}",
+            short(&check.installed)
+        )
+    } else if check.follow == "release" {
         format!(
             "Installed: {}\nNewest: {}",
             short(&check.installed),
@@ -308,7 +316,13 @@ mod tests {
                 follow: "release".into(),
                 installed: "abc1234def".into(),
                 available: "0123456789".into(),
+                tag: None,
             })
+        );
+        let stable = "follow stable\ninstalled abc1234def\navailable 0123456789\ntag v0.2.0\n";
+        assert_eq!(
+            parse_check(stable).and_then(|c| c.tag),
+            Some("v0.2.0".into())
         );
         assert_eq!(parse_check("Another Burrow update is running.\n"), None);
     }

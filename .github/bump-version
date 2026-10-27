@@ -1,0 +1,20 @@
+#!/bin/bash
+# Writes a release's version into the workspace, for update-server's release.sh: `.github/bump-version 0.2.0`.
+# Every crate takes [workspace.package]'s version. The crates' requirements on each other and Cargo.lock repeat it,
+# and --locked builds need them all to agree.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+version=${1:?usage: bump-version X.Y.Z}
+current=$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml)
+# Only X.Y.Z counts here: a release candidate of the current version isn't older than it.
+if [ "${version%%-*}" != "${current%%-*}" ] &&
+  [ "$(printf '%s\n%s\n' "${version%%-*}" "${current%%-*}" | sort -V | head -1)" = "${version%%-*}" ]; then
+  echo "bump-version: $version is older than the current version, $current" >&2
+  exit 1
+fi
+sed -i "/^\[workspace.package\]/,/^\[/ s/^version = \".*\"/version = \"$version\"/" Cargo.toml
+grep -qx "version = \"$version\"" Cargo.toml || { echo "bump-version: no [workspace.package] version in Cargo.toml" >&2; exit 1; }
+# The crates name each other's version too. A release candidate's version only matches a requirement naming it.
+sed -i -E "s/^(burrow[a-z-]* = \{ version = )\"[^\"]*\"(, path = \"\.\.\/)/\1\"$version\"\2/" crates/*/Cargo.toml
+# Resolving rewrites the workspace's own entries in Cargo.lock and leaves every other locked version as it is.
+cargo metadata --quiet --format-version 1 >/dev/null

@@ -1,0 +1,53 @@
+name: Release
+
+# A vX.Y.Z tag on main, made by update-server's scripts/release.sh, becomes
+# a stable release: the build `burrow-update --stable` installs. A
+# vX.Y.Z-rc.N tag becomes a pre-release, which --stable skips. release.sh
+# pushes its version commit with the tag, so that commit's CI runs beside
+# this build; --locked still refuses a version that Cargo.lock disagrees
+# with.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  # The same build as ci.yml's build-main, from this tag alone.
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install system packages
+        run: pacman -Syu --noconfirm --needed base-devel git rustup gtk4 vte4 gtksourceview5
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # No build cache: what users install should come only from this tag.
+      - name: Set up Rust
+        run: |
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      # SHA256SUMS comes from the shared workflow, over every file here.
+      - name: Build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          dist/install.sh --stage out/burrow
+          mkdir release
+          tar -czf release/burrow-x86_64.tar.gz -C out burrow
+          cp out/burrow/commit release/commit
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-files
+          path: release/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    uses: Edward-Pratt/update-server/.github/workflows/release.yml@v1
+    with:
+      artifact: release-files
+    permissions:
+      contents: write
