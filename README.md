@@ -37,9 +37,13 @@ To update, choose **Check for updates…** in the window's menu, then **Update**
 
 Elsewhere, or to try a branch, build from source instead: `burrow-update --branch NAME` (or `dist/install.sh --branch main` from a clone) keeps a clone in `~/.local/share/burrow/src` and builds that branch on each update, which takes a few minutes. It needs Rust 1.93 or newer (best with [rustup](https://rustup.rs)) and the libraries above. `burrow-update --release` goes back to the builds of main.
 
-Either way it installs whatever lands on main, or on the branch it follows, so anyone who can push there can run code on your computer. Run `journalctl --user -u burrow-update` to see the last check. To remove it, run `systemctl --user disable --now burrow-update.timer`, then delete `~/.local/bin/{burrow,burrowd,burrow-gtk,burrow-update}`, `~/.local/lib/burrow`, `~/.local/share/burrow`, `~/.local/share/applications/dev.burrow.Burrow.desktop`, `~/.local/share/icons/hicolor/scalable/apps/dev.burrow.Burrow.svg` and the `burrow*` units in `~/.local/share/systemd/user`.
+For fewer changes, `burrow-update --stable` follows tagged releases instead of every build of main: it installs the newest `vX.Y.Z` release and updates only when there's a newer one. `burrow-update --release` goes back.
+
+Whichever it follows, it installs whatever lands on main, on the branch, or in a tagged release, so anyone who can push there can run code on your computer. Run `journalctl --user -u burrow-update` to see the last check. To remove it, run `systemctl --user disable --now burrow-update.timer`, then delete `~/.local/bin/{burrow,burrowd,burrow-gtk,burrow-update}`, `~/.local/lib/burrow`, `~/.local/share/burrow`, `~/.local/share/applications/dev.burrow.Burrow.desktop`, `~/.local/share/icons/hicolor/scalable/apps/dev.burrow.Burrow.svg` and the `burrow*` units in `~/.local/share/systemd/user`.
 
 To install it system-wide with pacman instead, without the update button, use the package in `dist/`: `cd burrow/dist && makepkg -si`. It packages the server agent for each musl target you have (`rust-musl` and `rust-aarch64-musl`, or `rustup target add`).
+
+To make a stable release, tag main with update-server's `scripts/release.sh minor` (or `patch`, `major`, with `--rc` for a pre-release). It runs `.github/bump-version` to set the version, and `.github/workflows/release.yml` builds and publishes the tag.
 
 For development, build it from the checkout. If a library is missing, `cargo build` names it.
 

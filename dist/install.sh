@@ -10,6 +10,7 @@
 #   install.sh                       install the newest build of main
 #   burrow-update                    update now
 #   burrow-update --check            say whether an update is ready
+#   burrow-update --stable           follow tagged releases from now on
 #   burrow-update --branch NAME      build NAME from source from now on
 #   burrow-update --release          go back to the builds of main
 #   install.sh --stage DIR           build this checkout into DIR (CI)
@@ -22,10 +23,15 @@ url=https://github.com/Edward-Pratt/burrow.git
 # Where CI publishes the builds of main. Only the environment can change
 # it, for testing, never a config file.
 releases=${BURROW_RELEASES:-https://github.com/Edward-Pratt/burrow/releases/download/build-main}
+# GitHub redirects this to the newest tagged release that isn't a
+# pre-release. BURROW_STABLE_RELEASES names a release's files directly,
+# for testing.
+latest=https://github.com/Edward-Pratt/burrow/releases/latest
 tarball=burrow-x86_64.tar.gz
 data=${XDG_DATA_HOME:-$HOME/.local/share}
 src=$data/burrow/src
-# Says what is followed: `release`, or the branch built from source.
+# Says what is followed: `release` (the builds of main), `stable` (tagged
+# releases), or the branch built from source.
 follow_file=$data/burrow/follow
 bin=$HOME/.local/bin
 # The core finds agents in lib/burrow beside the folder it runs from.
@@ -64,13 +70,38 @@ fetch() { # url destination
     --proto '=https,file' --proto-redir '=https' --retry 2 -o "$2" "$1"
 }
 
+# True when updates download a build CI made, rather than building one.
+downloads() { # follow
+  [ "$1" = release ] || [ "$1" = stable ]
+}
+
+# Sets `releases` to the files of the newest tagged release, and `tag` to
+# its tag.
+find_stable() {
+  if [ -n "${BURROW_STABLE_RELEASES:-}" ]; then
+    releases=$BURROW_STABLE_RELEASES
+    tag=${releases##*/}
+    return
+  fi
+  local page
+  page=$(curl --fail --silent --show-error --proto '=https' --retry 2 \
+    --output /dev/null --write-out '%{redirect_url}' "$latest")
+  # With no tagged release yet, GitHub sends this to the list of releases.
+  if ! [[ $page =~ ^https://github\.com/Edward-Pratt/burrow/releases/tag/(v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    echo "Burrow has no stable release yet. burrow-update --release follows the builds of main." >&2
+    exit 1
+  fi
+  tag=${BASH_REMATCH[1]}
+  releases=https://github.com/Edward-Pratt/burrow/releases/download/$tag
+}
+
 # Only with someone at the terminal to answer sudo. Under the timer a
 # missing piece fails the update, and the notification says so.
 prepare() { # follow
   local tools=(curl tar sha256sum)
   if command -v pacman >/dev/null; then
     local want=(gtk4 vte4 gtksourceview5 openssh curl) missing
-    if [ "$1" != release ]; then
+    if ! downloads "$1"; then
       want+=(git gcc pkgconf)
       # pacman's rust-musl and rust-aarch64-musl need its rust, which
       # rustup conflicts with, so they are only for a machine without
@@ -90,7 +121,7 @@ prepare() { # follow
       sudo pacman -S --needed --noconfirm "${missing[@]}"
     fi
   fi
-  if [ "$1" != release ]; then
+  if ! downloads "$1"; then
     tools=(git cargo)
     if command -v rustup >/dev/null; then
       rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
@@ -204,6 +235,10 @@ while [ $# -gt 0 ]; do
       follow=release
       shift
       ;;
+    --stable)
+      follow=stable
+      shift
+      ;;
     --check)
       check=yes
       shift
@@ -213,7 +248,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     *)
-      echo "usage: ${0##*/} [--check] [--branch NAME | --release]" >&2
+      echo "usage: ${0##*/} [--check] [--branch NAME | --release | --stable]" >&2
       exit 2
       ;;
   esac
@@ -233,7 +268,7 @@ follow=${follow:-$(cat "$follow_file" 2>/dev/null || echo release)}
 if [ ! -f "$follow_file" ] && [ -n "${BURROW_INSTALL_FROM:-}" ] && [ "$follow" = main ]; then
   follow=release
 fi
-if [ "$follow" != release ]; then
+if ! downloads "$follow"; then
   git check-ref-format --branch "$follow" >/dev/null
 fi
 if [ -t 0 ] && [ "$check" = no ]; then
@@ -250,7 +285,9 @@ if ! flock -n 9; then
 fi
 
 # The newest commit of what is followed.
-if [ "$follow" = release ]; then
+tag=
+if downloads "$follow"; then
+  [ "$follow" = release ] || find_stable
   available=$(fetch "$releases/commit" -)
   if ! [[ $available =~ ^[0-9a-f]{40}$ ]]; then
     echo "The release doesn't name a commit." >&2
@@ -275,7 +312,7 @@ installed=$(cat "$lib/commit" 2>/dev/null || echo none)
 # again next time. Built from source, a musl target added since then needs
 # a build too, for its agent.
 current=$([ "$installed" = "$available" ] && echo yes || echo no)
-if [ "$follow" != release ]; then
+if ! downloads "$follow"; then
   for arch in $(arches); do
     [ -f "$lib/burrow-agent-$arch" ] || current=no
   done
@@ -286,6 +323,7 @@ if [ "$check" = yes ]; then
   echo "follow $follow"
   echo "installed $installed"
   echo "available $available"
+  [ -z "$tag" ] || echo "tag $tag"
   # Once per commit, or the timer would say it every day.
   if [ "$current" = no ] && [ "$(cat "$data/burrow/notified" 2>/dev/null)" != "$available" ]; then
     notify "A Burrow update is ready" "Choose Check for updates… in Burrow's menu to install it."
@@ -294,16 +332,16 @@ if [ "$check" = yes ]; then
   exit 0
 fi
 if [ "$current" = yes ]; then
-  echo "Burrow is up to date: ${available:0:7}."
+  echo "Burrow is up to date: ${tag:-${available:0:7}}."
   exit 0
 fi
 printf '%s\n' "$follow" >"$follow_file"
 
-if [ "$follow" = release ]; then
+if downloads "$follow"; then
   stage=$data/burrow/stage
   # Kept after a failed install, so trying again doesn't download again.
   if [ "$(cat "$stage/commit" 2>/dev/null)" != "$available" ]; then
-    echo "Downloading Burrow ${available:0:7}…"
+    echo "Downloading Burrow ${tag:-${available:0:7}}…"
     download=$(mktemp -d "$data/burrow/download.XXXXXX")
     fetch "$releases/SHA256SUMS" "$download/SHA256SUMS"
     fetch "$releases/$tarball" "$download/$tarball"
@@ -338,12 +376,15 @@ fi
 # copy running now, so a new step takes effect in the update that adds it.
 # It inherits the lock, and takes it again when it reopens the lock file.
 if [ "${BURROW_INSTALL_FROM:-}" != "$available" ]; then
-  args=(--release)
-  [ "$follow" = release ] || args=(--branch "$follow")
+  case $follow in
+    release) args=(--release) ;;
+    stable) args=(--stable) ;;
+    *) args=(--branch "$follow") ;;
+  esac
   BURROW_INSTALL_FROM=$available exec "$from_script" "${args[@]}"
 fi
 
-if [ "$follow" != release ]; then
+if ! downloads "$follow"; then
   echo "Building Burrow ${available:0:7} from $follow…"
   (cd "$src" && build "$src/target/stage")
   stage=$src/target/stage
@@ -351,13 +392,13 @@ fi
 install_stage "$stage"
 # Only needed until an install succeeds. Bash still reads this script from
 # the deleted file.
-if [ "$follow" = release ]; then
+if downloads "$follow"; then
   rm -rf "$stage"
 fi
 
-echo "Installed Burrow ${available:0:7} into ~/.local. Restart Burrow to use it."
+echo "Installed Burrow ${tag:-${available:0:7}} into ~/.local. Restart Burrow to use it."
 # Says what is still missing at run time, such as a Secret Service.
 if [ -t 1 ]; then
   "$bin/burrow" doctor || true
 fi
-notify "Burrow updated to ${available:0:7}" "Restart Burrow to use it."
+notify "Burrow updated to ${tag:-${available:0:7}}" "Restart Burrow to use it."
