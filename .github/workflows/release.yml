@@ -1,11 +1,9 @@
 name: Release
 
-# A vX.Y.Z tag on main, made by update-server's scripts/release.sh, becomes
-# a stable release: the build `burrow-update --stable` installs. A
-# vX.Y.Z-rc.N tag becomes a pre-release, which --stable skips. release.sh
-# pushes its version commit with the tag, so that commit's CI runs beside
-# this build; --locked still refuses a version that Cargo.lock disagrees
-# with.
+# A vX.Y.Z tag on main, made by `herald release`, becomes a stable
+# release: the build `burrow-update --stable` installs. A vX.Y.Z-rc.N tag
+# becomes a pre-release, which --stable skips. herald merges the version
+# change through a pull request first, so the tagged commit passed CI.
 on:
   push:
     tags: ['v*']
@@ -38,7 +36,7 @@ jobs:
           tar -czf release/burrow-x86_64.tar.gz -C out burrow
           cp out/burrow/commit release/commit
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-files
           path: release/
@@ -46,7 +44,7 @@ jobs:
 
   release:
     needs: build
-    uses: Edward-Pratt/update-server/.github/workflows/release.yml@v1
+    uses: Edward-Pratt/herald/.github/workflows/release.yml@v1
     with:
       artifact: release-files
     permissions:

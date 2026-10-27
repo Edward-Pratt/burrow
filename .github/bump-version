@@ -1,5 +1,5 @@
 #!/bin/bash
-# Writes a release's version into the workspace, for update-server's release.sh: `.github/bump-version 0.2.0`.
+# Writes a release's version into the workspace, for `herald release`: `.github/bump-version 0.2.0`.
 # Every crate takes [workspace.package]'s version. The crates' requirements on each other and Cargo.lock repeat it,
 # and --locked builds need them all to agree.
 set -euo pipefail

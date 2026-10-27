@@ -43,7 +43,7 @@ Whichever it follows, it installs whatever lands on main, on the branch, or in a
 
 To install it system-wide with pacman instead, without the update button, use the package in `dist/`: `cd burrow/dist && makepkg -si`. It packages the server agent for each musl target you have (`rust-musl` and `rust-aarch64-musl`, or `rustup target add`).
 
-To make a stable release, tag main with update-server's `scripts/release.sh minor` (or `patch`, `major`, with `--rc` for a pre-release). It runs `.github/bump-version` to set the version, and `.github/workflows/release.yml` builds and publishes the tag.
+To make a stable release, run [herald](https://github.com/Edward-Pratt/herald)'s `herald release minor` on main (or `patch`, `major`, with `--rc` for a pre-release). It runs `.github/bump-version` to set the version and opens a pull request for it; once that's merged, the same command tags it, and `.github/workflows/release.yml` builds and publishes the tag.
 
 For development, build it from the checkout. If a library is missing, `cargo build` names it.
 
