@@ -1,3 +1,7 @@
 /target/
 .env
 *.log
+
+# Nimbalyst workspace state and the local wiki
+/nimbalyst-local/
+/.nimbalyst/
