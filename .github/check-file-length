@@ -1,0 +1,23 @@
+#!/bin/bash
+# Fails when a source file changed since BASE is over the line cap and doesn't say why: `.github/check-file-length [BASE]`.
+# BASE defaults to HEAD, so with no argument it checks what isn't committed yet; CI passes the pull request's base.
+# Files are split before they grow past the cap. One that is a single cohesive unit (a parser, an exhaustive router),
+# generated, or a table of data says so with `modular-exempt: <reason>` in its first 10 lines.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+base=${1:-HEAD}
+cap=300
+failed=0
+while IFS= read -r file; do
+  case "$file" in
+    *.rs | *.sh | *.py | *.ts | *.js | *.luau | *.lua | *.java | *.c | *.h | *.html | *.css) ;;
+    *) continue ;;
+  esac
+  [ -f "$file" ] || continue
+  lines=$(wc -l <"$file")
+  [ "$lines" -gt "$cap" ] || continue
+  head -n 10 "$file" | grep -q 'modular-exempt:' && continue
+  echo "$file: $lines lines, over the cap of $cap. Split it, or say why not with \"modular-exempt: <reason>\" in its first 10 lines." >&2
+  failed=1
+done < <(git diff --name-only --diff-filter=AMR "$base" -- . && git ls-files --others --exclude-standard)
+exit $failed

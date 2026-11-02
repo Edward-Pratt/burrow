@@ -42,6 +42,17 @@ jobs:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # Before the toolchain: a file over the line cap needs splitting, not
+      # building. The base is fetched on its own, since the checkout is
+      # shallow.
+      - name: File length
+        if: matrix.check == 'lint'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          git fetch --depth=1 origin "$BASE"
+          .github/check-file-length "$BASE"
+
       - name: Set up Rust
         run: |
           chown -R builder "$GITHUB_WORKSPACE" /home/builder

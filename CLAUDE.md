@@ -15,14 +15,16 @@ A Linux-first desktop app for servers and databases, in Rust + GTK4 (gtk4-rs + r
 
 ## Checks
 
-CI runs exactly these. Run all three before every commit:
+CI runs exactly these. Run all four before every commit:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+.github/check-file-length
 ```
 
+- Source files stay under 300 lines. `check-file-length` fails on a changed file over that unless its first 10 lines say `modular-exempt: <reason>` (one cohesive unit, generated, or a table). Touching a long file: move the part you change into its own module first, then change it.
 - `crates/burrow-core/tests/ssh.rs` starts a throwaway `sshd` per test. It skips silently if `/usr/bin/sshd` is missing, so check those tests actually ran.
 - Put unit tests in the module they test, in a `#[cfg(test)] mod tests`.
 - To see a UI change working, use the `burrow-gui-test` skill (`.claude/skills/burrow-gui-test/`). It runs the app on a headless Xvfb display, never on the user's desktop.
