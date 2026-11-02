@@ -44,12 +44,14 @@ jobs:
 
       # Before the toolchain: a file over the line cap needs splitting, not
       # building. The base is fetched on its own, since the checkout is
-      # shallow.
+      # shallow. The checkout belongs to the runner's user, not the
+      # container's root, so git is told it is safe first.
       - name: File length
         if: matrix.check == 'lint'
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git fetch --depth=1 origin "$BASE"
           .github/check-file-length "$BASE"
 
