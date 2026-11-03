@@ -4,7 +4,7 @@ A Linux-first desktop app for servers and databases, in Rust + GTK4 (gtk4-rs + r
 
 ## Layout
 
-- `crates/burrow-core`: everything that isn't drawing. It owns config, secrets, SSH, tunnels, SFTP and the addon host. Clients drive it only through `Core::execute(Command)` and `Core::subscribe()` (`src/api.rs` is the contract).
+- `crates/burrow-core`: everything that isn't drawing. It owns config, secrets, SSH, tunnels, SFTP and the addon host. Clients drive it only through `Core::execute(Command)` and `Core::subscribe()` (`src/api/` is the contract).
   - `src/ssh/`: `connection.rs` shares one connection per host; `session.rs` holds terminals, `tunnel.rs` tunnels, `files.rs` SFTP.
   - `src/addon/`: manifests, approval, JSON-RPC over stdio.
 - `crates/burrow-gtk`: a thin client of the core in `burrowd`. State flows one way: user action → `Command` → core `Event` → redraw. Each tab kind has a module: `terminal.rs`/`remote.rs` (terminals), `tunnels.rs`, `files/`, `monitor/`, `database/`, `addons.rs`; the folders keep their struct and messages in `mod.rs`, the page builder in `page.rs` and the message handler in `update.rs`. `session.rs` is the session page the file panel, monitor and database share, and `sidebar/` the tree. `app/` is the window: `mod.rs` holds `App` and its relm4 `Component`, `dispatch.rs` routes each `AppMsg` to the module that owns the work (`tabs`, `panels`, `shells`, `sessions`, `tunnels`, `monitors`, `nodes`, `editors`, `menus`, `grants`, `views`, `status`, `window`), and `daemon.rs` talks to the core.
