@@ -7,6 +7,7 @@
 //! user's files anyway. Each client says which [`Role`] it plays when it
 //! connects, and the server limits what it may do by that role.
 
+mod audit;
 mod client;
 mod events;
 mod server;

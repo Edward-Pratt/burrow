@@ -61,6 +61,8 @@ pub(crate) fn start(
                 // A client closed it before it finished.
                 Ok(None) => Ok(()),
                 Err(error) => {
+                    // Explained here, as the caller hears it first.
+                    let error = prompter.explain(error);
                     let _ = tx.send(Err(error.clone()));
                     Err(error)
                 }

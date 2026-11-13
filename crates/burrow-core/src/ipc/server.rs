@@ -11,10 +11,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use data_encoding::{BASE64, HEXLOWER};
+use data_encoding::BASE64;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
@@ -22,6 +21,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use zeroize::Zeroize;
 
+use super::audit::{cap_strings, cut_error, sha256};
 use super::events::forward_events;
 use super::{
     BUILD, INVALID_PARAMS, Initialize, MAX_LINE, METHOD_NOT_FOUND, Role, SERVER_ERROR, ServerInfo,
@@ -43,10 +43,6 @@ const IDLE_CHECK: Duration = Duration::from_secs(5);
 
 /// Connections so far, which numbers each one.
 static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
-
-/// The longest string the audit log keeps whole, so a few lines can't
-/// fill the log and push out what came before. See [`cut`].
-const AUDIT_FIELD: usize = 4 << 10;
 
 /// Serves clients on `listener`. With `idle`, it returns once no client
 /// has been connected and no session running for that long; otherwise it
@@ -109,7 +105,7 @@ struct Conn {
     forwarders: Mutex<HashMap<SessionId, AbortHandle>>,
     /// Sessions this client opened, closed when it goes. Tunnels are left
     /// out: they belong to the daemon and outlive the window.
-    owned: Mutex<Vec<SessionId>>,
+    owned: Arc<Mutex<Vec<SessionId>>>,
     /// Never sent on; tasks watch for it being dropped.
     alive: watch::Receiver<()>,
 }
@@ -138,7 +134,7 @@ async fn connection(core: Core, stream: UnixStream, _connected: Connected) {
         control,
         output,
         forwarders: Mutex::default(),
-        owned: Mutex::default(),
+        owned: Arc::default(),
         alive,
     });
 
@@ -226,7 +222,8 @@ impl Conn {
                 let owns = command.class().opens_session;
                 let response = match role {
                     Role::Gui | Role::Cli => self.core.execute(command).await,
-                    Role::Mcp => self.execute_mcp(command).await,
+                    // Nobody at the bridge can answer a session's questions.
+                    Role::Mcp => crate::ssh::unattended(self.execute_mcp(command)).await,
                 }
                 .map_err(failed)?;
                 if owns && let Response::Session { session } = response {
@@ -270,6 +267,7 @@ impl Conn {
             self.core.subscribe(),
             self.control.clone(),
             hello.role,
+            self.owned.clone(),
             self.alive.clone(),
         ));
         let info = ServerInfo {
@@ -492,59 +490,6 @@ fn audit_entry(command: &Command, rule: Option<&Rule>, connection: u64) -> Value
     entry
 }
 
-/// Replaces every string in a command that is longer than
-/// [`AUDIT_FIELD`] with what [`cut`] keeps of it.
-fn cap_strings(value: &mut Value) {
-    match value {
-        Value::String(text) if text.len() > AUDIT_FIELD => {
-            let kept = cut(text);
-            *value = kept;
-        }
-        Value::Array(items) => items.iter_mut().for_each(cap_strings),
-        Value::Object(fields) => fields.values_mut().for_each(cap_strings),
-        _ => {}
-    }
-}
-
-/// What the audit log keeps of a long string in a command: its start and
-/// its end, since a harmless start can hide what a command really does,
-/// and the whole value's length and SHA-256, so what was left out can be
-/// checked against a copy of the command.
-fn cut(text: &str) -> Value {
-    let half = AUDIT_FIELD / 2;
-    let mut head = half;
-    while !text.is_char_boundary(head) {
-        head -= 1;
-    }
-    let mut tail = text.len() - half;
-    while !text.is_char_boundary(tail) {
-        tail += 1;
-    }
-    json!({
-        "head": &text[..head],
-        "tail": &text[tail..],
-        "bytes": text.len(),
-        "sha256": sha256(text.as_bytes()),
-    })
-}
-
-/// An error's start, and how long it was. An error says why a command
-/// failed rather than what it did, so its start is enough.
-fn cut_error(text: &str) -> String {
-    if text.len() <= AUDIT_FIELD {
-        return text.to_string();
-    }
-    let mut end = AUDIT_FIELD;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… ({} bytes)", &text[..end], text.len())
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    HEXLOWER.encode(&Sha256::digest(bytes))
-}
-
 /// Writes replies and events first, and terminal output when there are
 /// none waiting.
 async fn write_all(
@@ -576,7 +521,11 @@ fn failed(error: Error) -> Failure {
 
 #[cfg(test)]
 mod tests {
+    use data_encoding::HEXLOWER;
+    use sha2::{Digest, Sha256};
+
     use super::*;
+    use crate::ipc::audit::AUDIT_FIELD;
 
     #[test]
     fn an_audit_line_keeps_the_ends_and_hash_of_long_strings() {

@@ -12,12 +12,13 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use burrow_core::ipc::Client;
-use burrow_core::{Command, Node, NodeId, Response, SessionId, SessionState};
+use burrow_core::{Command, Node, NodeId, Response, SessionId};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::{Result, find};
 
+mod sessions;
 mod tools;
 
 use tools::tools;
@@ -30,9 +31,6 @@ const VERSIONS: [&str; 3] = ["2026-07-28", "2025-11-25", "2025-06-18"];
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const UNSUPPORTED_VERSION: i64 = -32022;
-
-/// How long a database or file session may take to connect.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the monitor tool waits for a new monitor's first sample.
 const FIRST_SAMPLE: Duration = Duration::from_secs(5);
@@ -245,11 +243,12 @@ impl Bridge {
             }
             "start_tunnel" => {
                 let node = self.node(&text("node")?).await?;
+                let mut events = self.client.subscribe();
                 let session = match self.execute(Command::StartTunnel { node: node.id }).await? {
                     Response::Session { session } => session,
                     other => return Ok(pretty(&other)),
                 };
-                self.wait(session).await?;
+                self.wait(session, &mut events).await?;
                 return Ok(format!("{} is up", node.name));
             }
             "stop_tunnel" => {
@@ -363,76 +362,6 @@ impl Bridge {
             .execute(command)
             .await
             .map_err(|e| Called::Failed(e.to_string()))
-    }
-
-    async fn sessions_list(&self) -> Result<Vec<burrow_core::SessionInfo>, Called> {
-        match self.execute(Command::ListSessions).await? {
-            Response::Sessions { sessions } => Ok(sessions),
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    /// A connected session of `kind` on the node, opened on first use.
-    async fn session(&mut self, arg: &str, kind: Kind) -> Result<SessionId, Called> {
-        let node = self.node(arg).await?;
-        if let Some(&session) = self.sessions.get(&(node.id, kind)) {
-            let running = self.sessions_list().await?;
-            if running
-                .iter()
-                .any(|s| s.session == session && s.state == SessionState::Connected)
-            {
-                return Ok(session);
-            }
-            self.sessions.remove(&(node.id, kind));
-        }
-        let command = match kind {
-            Kind::Database => Command::OpenDatabase { node: node.id },
-            Kind::Files => Command::OpenFiles { node: node.id },
-            Kind::Monitor => Command::OpenMonitor { node: node.id },
-        };
-        let session = match self.execute(command).await? {
-            Response::Session { session } => session,
-            other => return Err(Called::Failed(pretty(&other))),
-        };
-        self.wait(session).await?;
-        self.sessions.insert((node.id, kind), session);
-        Ok(session)
-    }
-
-    /// Waits for a session to connect. The bridge hears no session events,
-    /// so it asks.
-    async fn wait(&self, session: SessionId) -> Result<(), Called> {
-        let waited = tokio::time::timeout(CONNECT_TIMEOUT, async {
-            loop {
-                let running = self.sessions_list().await?;
-                match running
-                    .iter()
-                    .find(|s| s.session == session)
-                    .map(|s| &s.state)
-                {
-                    Some(SessionState::Connected) => return Ok(()),
-                    Some(SessionState::Connecting { .. }) => {}
-                    _ => {
-                        return Err(Called::Failed(
-                            "it closed while connecting; open it in Burrow to see why".into(),
-                        ));
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        });
-        match waited.await {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = self.execute(Command::CloseSession { session }).await;
-                Err(Called::Failed(
-                    "it did not connect in time. It may be waiting for a password, a \
-                     passphrase or a host key that only the user can give: ask them to \
-                     connect to it once in Burrow."
-                        .into(),
-                ))
-            }
-        }
     }
 }
 

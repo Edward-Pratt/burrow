@@ -30,7 +30,7 @@ pub(crate) use agent::Agents;
 pub(crate) use connection::{Connection, Connections, alias};
 pub(crate) use files::Transfers;
 pub(crate) use monitor::Waits;
-pub(crate) use prompter::Prompter;
+pub(crate) use prompter::{Prompter, unattended};
 pub(crate) use tunnel::Autostart;
 
 use std::collections::HashMap;
@@ -422,12 +422,8 @@ where
         },
     );
     drop(map);
-    let prompter = Prompter {
-        core: core.clone(),
-        session: id,
-        pending: prompts,
-        next: Arc::default(),
-    };
+    let prompter = Prompter::new(core.clone(), id, prompts);
+    let explainer = prompter.clone();
     let core = core.clone();
     tokio::spawn(async move {
         let node_id = node.id;
@@ -438,7 +434,7 @@ where
             session: id,
             node: node_id,
             state: SessionState::Closed {
-                error: result.err(),
+                error: result.err().map(|e| explainer.explain(e)),
             },
         });
     });
