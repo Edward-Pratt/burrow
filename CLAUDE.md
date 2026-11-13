@@ -58,4 +58,4 @@ For dev runs, point Burrow away from the user's real setup:
 - `BURROW_RUNTIME_DIR` sets the daemon's socket folder. If it isn't set but any of the three above is, the run gets a private daemon under `$XDG_RUNTIME_DIR/burrow/dev-<hash>/`, so it never joins the real one. Socket paths max out at 107 bytes, so don't put it in the scratchpad.
 - While the daemon runs, its pid is in `burrowd.lock` in the socket folder. After changing core code, stop the old dev daemon, because a running daemon keeps its old code.
 
-The user's agent socket is `/run/user/1000/ssh-agent.socket`. A shell started earlier may not have `SSH_AUTH_SOCK` set.
+The user's agent is gcr-ssh-agent, at `/run/user/1000/gcr/ssh` (their Hyprland config sets `SSH_AUTH_SOCK` to it). It asks for a key's passphrase in a desktop dialog on first use, unless it was unlocked at login. A shell started earlier may not have `SSH_AUTH_SOCK` set.

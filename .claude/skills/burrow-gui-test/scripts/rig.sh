@@ -83,7 +83,7 @@ app)
     stop_daemon
     cargo build -q -p burrow-gtk --manifest-path "$REPO/Cargo.toml"
     if [ "${2:-}" = --real-ssh ]; then
-        ssh_env="SSH_AUTH_SOCK=/run/user/$(id -u)/ssh-agent.socket"
+        ssh_env="SSH_AUTH_SOCK=/run/user/$(id -u)/gcr/ssh"
     else
         ssh_env="BURROW_SSH_CONFIG=$DIR/sshd/ssh_config"
     fi
