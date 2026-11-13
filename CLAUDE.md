@@ -11,7 +11,7 @@ A Linux-first desktop app for servers and databases, in Rust + GTK4 (gtk4-rs + r
 - `crates/burrow-addon-notes`: the example addon, plus the addon integration tests.
 - `crates/burrowd`: the daemon binary. The daemon itself is `burrow-core/src/daemon.rs`, and the socket protocol (server, client, finding and starting the daemon, and what each role may run) is `src/ipc/`.
 - `crates/burrow-agent`: the program monitors run on servers, and its wire format. The core's side is `ssh/agent.rs` (install) and `ssh/monitor.rs` (session). Its sshd tests live here so they can upload its real binary. Build it for servers with `cargo build -p burrow-agent --profile agent --target x86_64-unknown-linux-musl`.
-- `crates/burrow-cli`: the `burrow` command, and `burrow mcp serve` in `src/mcp.rs`. What the MCP bridge may do is decided in the daemon, never in the bridge: `class.rs` says what each command needs, and `ipc/server.rs` and `grants.rs` enforce it.
+- `crates/burrow-cli`: the `burrow` command, and `burrow mcp serve` in `src/mcp/`. What the MCP bridge may do is decided in the daemon, never in the bridge: `class.rs` says what each command needs, and `ipc/server.rs` and `grants.rs` enforce it.
 
 ## Checks
 

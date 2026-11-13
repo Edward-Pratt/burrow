@@ -12,11 +12,16 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use burrow_core::ipc::Client;
-use burrow_core::{Command, Node, NodeId, Response, SessionId, SessionState};
+use burrow_core::{Command, Node, NodeId, Response, SessionId};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::{Result, find};
+
+mod sessions;
+mod tools;
+
+use tools::tools;
 
 /// Protocol versions this server speaks, newest first. The first is
 /// stateless; the others start with `initialize`.
@@ -26,9 +31,6 @@ const VERSIONS: [&str; 3] = ["2026-07-28", "2025-11-25", "2025-06-18"];
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const UNSUPPORTED_VERSION: i64 = -32022;
-
-/// How long a database or file session may take to connect.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the monitor tool waits for a new monitor's first sample.
 const FIRST_SAMPLE: Duration = Duration::from_secs(5);
@@ -241,11 +243,12 @@ impl Bridge {
             }
             "start_tunnel" => {
                 let node = self.node(&text("node")?).await?;
+                let mut events = self.client.subscribe();
                 let session = match self.execute(Command::StartTunnel { node: node.id }).await? {
                     Response::Session { session } => session,
                     other => return Ok(pretty(&other)),
                 };
-                self.wait(session).await?;
+                self.wait(session, &mut events).await?;
                 return Ok(format!("{} is up", node.name));
             }
             "stop_tunnel" => {
@@ -360,76 +363,6 @@ impl Bridge {
             .await
             .map_err(|e| Called::Failed(e.to_string()))
     }
-
-    async fn sessions_list(&self) -> Result<Vec<burrow_core::SessionInfo>, Called> {
-        match self.execute(Command::ListSessions).await? {
-            Response::Sessions { sessions } => Ok(sessions),
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    /// A connected session of `kind` on the node, opened on first use.
-    async fn session(&mut self, arg: &str, kind: Kind) -> Result<SessionId, Called> {
-        let node = self.node(arg).await?;
-        if let Some(&session) = self.sessions.get(&(node.id, kind)) {
-            let running = self.sessions_list().await?;
-            if running
-                .iter()
-                .any(|s| s.session == session && s.state == SessionState::Connected)
-            {
-                return Ok(session);
-            }
-            self.sessions.remove(&(node.id, kind));
-        }
-        let command = match kind {
-            Kind::Database => Command::OpenDatabase { node: node.id },
-            Kind::Files => Command::OpenFiles { node: node.id },
-            Kind::Monitor => Command::OpenMonitor { node: node.id },
-        };
-        let session = match self.execute(command).await? {
-            Response::Session { session } => session,
-            other => return Err(Called::Failed(pretty(&other))),
-        };
-        self.wait(session).await?;
-        self.sessions.insert((node.id, kind), session);
-        Ok(session)
-    }
-
-    /// Waits for a session to connect. The bridge hears no session events,
-    /// so it asks.
-    async fn wait(&self, session: SessionId) -> Result<(), Called> {
-        let waited = tokio::time::timeout(CONNECT_TIMEOUT, async {
-            loop {
-                let running = self.sessions_list().await?;
-                match running
-                    .iter()
-                    .find(|s| s.session == session)
-                    .map(|s| &s.state)
-                {
-                    Some(SessionState::Connected) => return Ok(()),
-                    Some(SessionState::Connecting { .. }) => {}
-                    _ => {
-                        return Err(Called::Failed(
-                            "it closed while connecting; open it in Burrow to see why".into(),
-                        ));
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        });
-        match waited.await {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = self.execute(Command::CloseSession { session }).await;
-                Err(Called::Failed(
-                    "it did not connect in time. It may be waiting for a password, a \
-                     passphrase or a host key that only the user can give: ask them to \
-                     connect to it once in Burrow."
-                        .into(),
-                ))
-            }
-        }
-    }
 }
 
 enum Called {
@@ -503,115 +436,4 @@ fn file_text(data: &[u8], size: u64) -> String {
             data_encoding::BASE64.encode(data)
         ),
     }
-}
-
-fn tools() -> Value {
-    let node = json!({"type": "string", "description": "The node's name or id, from list_nodes"});
-    let tool = |name: &str, description: &str, properties: Value, required: &[&str]| {
-        json!({
-            "name": name,
-            "description": description,
-            "inputSchema": {"type": "object", "properties": properties, "required": required},
-        })
-    };
-    json!([
-        tool(
-            "list_nodes",
-            "List the user's SSH hosts, tunnels and databases, with their settings and what you may do on each (`allowed`).",
-            json!({}),
-            &[],
-        ),
-        tool(
-            "run_command",
-            "Run a shell command on an SSH host, as `ssh host command` does, and return its exit status, stdout and stderr. Needs exec.",
-            json!({
-                "node": node,
-                "command": {"type": "string"},
-                "timeout_seconds": {"type": "integer", "description": "Default 60, at most 3600"},
-            }),
-            &["node", "command"],
-        ),
-        tool(
-            "query",
-            "Run SQL on a Postgres node. Needs sql-read, which runs one statement read-only; sql-write allows writing.",
-            json!({
-                "node": node,
-                "sql": {"type": "string"},
-                "max_rows": {"type": "integer", "description": "Rows kept per statement, default 200"},
-            }),
-            &["node", "sql"],
-        ),
-        tool(
-            "list_schema",
-            "List a Postgres database's schemas, tables and columns. Needs sql-read.",
-            json!({"node": node}),
-            &["node"],
-        ),
-        tool(
-            "list_files",
-            "List a folder on an SSH host. Needs files-read.",
-            json!({"node": node, "path": {"type": "string", "description": "Empty for the home folder"}}),
-            &["node"],
-        ),
-        tool(
-            "read_file",
-            "Read a file on an SSH host. Needs files-read.",
-            json!({
-                "node": node,
-                "path": {"type": "string"},
-                "max_bytes": {"type": "integer", "description": "Default 1 MiB"},
-            }),
-            &["node", "path"],
-        ),
-        tool(
-            "write_file",
-            "Write a text file on an SSH host. Needs files-write.",
-            json!({
-                "node": node,
-                "path": {"type": "string"},
-                "content": {"type": "string"},
-                "overwrite": {"type": "boolean", "description": "Replace an existing file"},
-            }),
-            &["node", "path", "content"],
-        ),
-        tool(
-            "make_dir",
-            "Create a folder on an SSH host. Needs files-write.",
-            json!({"node": node, "path": {"type": "string"}}),
-            &["node", "path"],
-        ),
-        tool(
-            "rename_path",
-            "Rename or move a file or folder on an SSH host. Needs files-write.",
-            json!({"node": node, "from": {"type": "string"}, "to": {"type": "string"}}),
-            &["node", "from", "to"],
-        ),
-        tool(
-            "remove_path",
-            "Delete a file on an SSH host, or a folder with everything in it. Needs files-write.",
-            json!({"node": node, "path": {"type": "string"}}),
-            &["node", "path"],
-        ),
-        tool(
-            "start_tunnel",
-            "Start a tunnel and wait until it is up. Needs tunnel.",
-            json!({"node": node}),
-            &["node"],
-        ),
-        tool(
-            "monitor",
-            "Show an SSH host's CPU, memory, disks, network, load and systemd services, with a summary of the last hour while the monitor has been open. For a host Burrow monitors in the background, also the alerts that hold now (failed services, full disks, low memory, not answering). Needs monitor-read, and burrow-agent installed on the host from Burrow.",
-            json!({
-                "node": node,
-                "units": {"type": "string", "enum": ["failed", "all"], "description": "Which services to list, default failed"},
-            }),
-            &["node"],
-        ),
-        tool(
-            "stop_tunnel",
-            "Stop a running tunnel. Needs tunnel.",
-            json!({"node": node}),
-            &["node"],
-        ),
-    ])
 }
