@@ -2,13 +2,13 @@
 //! passphrases. They go to the session's clients as events, unless the
 //! session was started for a client with nobody to answer them.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 
-use super::Pending;
 use crate::api::{Event, Prompt, PromptAnswer, PromptKind, SessionId};
 use crate::engine::Core;
 
@@ -23,6 +23,44 @@ tokio::task_local! {
 /// Sessions are started on the caller's task, so the mark reaches them.
 pub(crate) async fn unattended<F: Future>(work: F) -> F::Output {
     UNATTENDED.scope((), work).await
+}
+
+/// A session's questions that still wait for an answer, by prompt id. Each
+/// is kept whole, so a client that joins the session after it was asked
+/// can be asked too.
+#[derive(Clone, Default)]
+pub(super) struct Pending(Arc<Mutex<BTreeMap<u32, Waiting>>>);
+
+struct Waiting {
+    prompt: Prompt,
+    answer: oneshot::Sender<PromptAnswer>,
+}
+
+impl Pending {
+    /// Hands `answer` to whoever asked `prompt`. `false` if it isn't
+    /// waiting.
+    pub(super) fn answer(&self, prompt: u32, answer: PromptAnswer) -> bool {
+        let Some(waiting) = self.0.lock().unwrap().remove(&prompt) else {
+            return false;
+        };
+        // A send error means the asker has gone, and says so itself.
+        let _ = waiting.answer.send(answer);
+        true
+    }
+
+    /// Drops every question, which its asker sees as "cancelled".
+    pub(super) fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
+
+    /// Calls `each` with the questions that wait, oldest first. They stay
+    /// locked meanwhile, so none of them can be closed before `each` has
+    /// seen it: a [`Event::PromptClosed`] always follows.
+    pub(super) fn each(&self, mut each: impl FnMut(&Prompt)) {
+        for waiting in self.0.lock().unwrap().values() {
+            each(&waiting.prompt);
+        }
+    }
 }
 
 /// Asks the session's clients a question and waits for the answer.
@@ -91,39 +129,46 @@ impl Prompter {
             return PromptAnswer::Cancel;
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        let prompt = Prompt {
+            id,
+            kind,
+            title: title.to_string(),
+            message: message.to_string(),
+            action,
+        };
+        let (answer, answered) = oneshot::channel();
+        let waiting = Waiting {
+            prompt: prompt.clone(),
+            answer,
+        };
+        self.pending.0.lock().unwrap().insert(id, waiting);
         self.core.emit(Event::PromptRequested {
             session: self.session,
-            prompt: Prompt {
-                id,
-                kind,
-                title: title.to_string(),
-                message: message.to_string(),
-                action,
-            },
+            prompt,
         });
         // Announced however the wait ends, even if this future is dropped.
         let _closed = Closed {
-            core: &self.core,
-            session: self.session,
+            prompter: self,
             prompt: id,
         };
-        rx.await.unwrap_or(PromptAnswer::Cancel)
+        answered.await.unwrap_or(PromptAnswer::Cancel)
     }
 }
 
-/// Emits [`Event::PromptClosed`] when dropped.
+/// Stops the prompt waiting, and emits [`Event::PromptClosed`], when
+/// dropped. In that order, so a prompt that has closed is never repeated
+/// to a client that joins.
 struct Closed<'a> {
-    core: &'a Core,
-    session: SessionId,
+    prompter: &'a Prompter,
     prompt: u32,
 }
 
 impl Drop for Closed<'_> {
     fn drop(&mut self) {
-        self.core.emit(Event::PromptClosed {
-            session: self.session,
+        let prompter = self.prompter;
+        prompter.pending.0.lock().unwrap().remove(&self.prompt);
+        prompter.core.emit(Event::PromptClosed {
+            session: prompter.session,
             prompt: self.prompt,
         });
     }

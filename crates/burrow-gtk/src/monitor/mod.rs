@@ -137,7 +137,9 @@ impl Monitor {
         sender: &ComponentSender<App>,
     ) {
         let ended = |error: Option<&str>| session::ended("The monitor stopped", error);
-        if self.session.session_changed(state, ended) {
+        // A shared monitor says "connected" again whenever a client joins
+        // it, which is no news to a tab that shows it.
+        if self.session.session_changed(state, ended) && !self.session.showing_content() {
             self.session
                 .show_message("Waiting for the first sample…", false);
             self.fetch_history(core, sender);
@@ -181,6 +183,12 @@ impl Monitor {
                     self.units = history.units;
                 }
                 self.fill_units();
+                // The history is asked for on joining a monitor and each
+                // time it connects, and holds what the charts had before.
+                if !history.samples.is_empty() {
+                    self.cpu.clear();
+                    self.net.clear();
+                }
                 let recent = history.samples.len().saturating_sub(CHART_POINTS);
                 for sample in &history.samples[recent..] {
                     self.cpu.push(&[sample.cpu.percent]);

@@ -91,6 +91,10 @@ impl App {
     ) {
         let (core, sender) = (self.core.clone(), sender.clone());
         let id = prompt.id;
+        // A shared monitor asks again whenever a client joins it.
+        if self.prompts.borrow().contains_key(&(session, id)) {
+            return;
+        }
         let dialog = dialogs::answer(window, prompt, move |answer| {
             let command = Command::AnswerPrompt {
                 session,

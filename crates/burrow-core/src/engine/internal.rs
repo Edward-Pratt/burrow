@@ -25,9 +25,15 @@ impl Core {
     /// Starts a monitor on an SSH host node. Without `install` it runs only
     /// an agent the user already let Burrow put there, which is how the MCP
     /// bridge opens one.
+    ///
+    /// A host monitored in the background has its monitor already, and the
+    /// caller may not have been there for what it said. So it says where
+    /// it stands again: without that, a window opened while the monitor
+    /// waits for an answer would wait with it, showing nothing.
     pub(crate) fn open_monitor(&self, node: NodeId, install: bool) -> Result<SessionId> {
         let node = self.node_of_kind(node, SSH_HOST_KIND)?;
         if let Some(session) = self.inner.sessions.background(node.id) {
+            self.inner.repeat(session);
             return Ok(session);
         }
         Ok(ssh::open_monitor(self, node, install))

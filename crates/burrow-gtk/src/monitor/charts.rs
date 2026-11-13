@@ -130,6 +130,13 @@ impl Chart {
         }
     }
 
+    /// Forgets the live values.
+    pub(super) fn clear(&self) {
+        for series in &mut self.data.borrow_mut().series {
+            series.clear();
+        }
+    }
+
     /// Draws `fixed` instead of the live values, as the newest of `points`
     /// across the width, or the live values again.
     pub(super) fn show(&self, fixed: Option<(Vec<Vec<f64>>, usize)>) {
