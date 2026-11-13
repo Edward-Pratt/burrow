@@ -5,10 +5,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use russh::client::{AuthResult, Handle, KeyboardInteractiveAuthResponse};
-use russh::keys::agent::AgentIdentity;
-use russh::keys::agent::client::AgentClient;
 use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::{MethodKind, MethodSet};
+
+mod agent;
 
 use super::{Client, Result, text};
 use crate::api::{Node, PromptAnswer, PromptKind, SecretValue};
@@ -66,44 +66,28 @@ pub(super) async fn authenticate(
 
     // 1. Keys in the agent. Agents can hold many keys, and each one offered
     // counts against the server's MaxAuthTries, so configured keys go first.
-    if let Some(socket) = &config.identity_agent {
-        match AgentClient::connect_uds(socket).await {
-            Ok(mut agent) => {
-                let mut keys: Vec<PublicKey> = agent
-                    .request_identities()
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|identity| match identity {
-                        AgentIdentity::PublicKey { key, .. } => Some(key),
-                        AgentIdentity::Certificate { .. } => None,
-                    })
-                    .collect();
-                if config.identities_only {
-                    keys.retain(is_configured);
-                }
-                keys.sort_by_key(|key| !is_configured(key));
-                for key in keys {
-                    if !allowed(&methods, MethodKind::PublicKey) {
-                        break;
-                    }
-                    let hash = hash_for(&key);
-                    match handle
-                        .authenticate_publickey_with(user, key.clone(), hash, &mut agent)
-                        .await
-                    {
-                        Ok(AuthResult::Success) => return Ok(()),
-                        Ok(AuthResult::Failure {
-                            remaining_methods, ..
-                        }) => methods = Some(remaining_methods),
-                        // The agent declined to sign, for example when its
-                        // approval dialog was dismissed.
-                        Err(e) => tracing::debug!("agent key not used: {e}"),
-                    }
-                    tried.push(key);
-                }
+    if let Some(socket) = &config.identity_agent
+        && let Some((mut agent, mut keys)) = agent::keys(socket).await
+    {
+        if config.identities_only {
+            keys.retain(is_configured);
+        }
+        keys.sort_by_key(|key| !is_configured(key));
+        for key in keys {
+            if !allowed(&methods, MethodKind::PublicKey) {
+                break;
             }
-            Err(e) => tracing::debug!("no SSH agent at {}: {e}", socket.display()),
+            let hash = hash_for(&key);
+            match agent::sign(handle, user, &key, hash, &mut agent, prompter).await? {
+                Ok(AuthResult::Success) => return Ok(()),
+                Ok(AuthResult::Failure {
+                    remaining_methods, ..
+                }) => methods = Some(remaining_methods),
+                // The agent declined to sign, for example when its
+                // approval dialog was dismissed.
+                Err(e) => tracing::debug!("agent key not used: {e}"),
+            }
+            tried.push(key);
         }
     }
 

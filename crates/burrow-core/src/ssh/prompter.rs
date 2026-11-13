@@ -98,6 +98,12 @@ impl Prompter {
         }
     }
 
+    /// Whether someone at Burrow may answer: `false` for a session started
+    /// [`unattended`].
+    pub fn attended(&self) -> bool {
+        self.unasked.is_none()
+    }
+
     /// The session questions go to.
     pub fn session(&self) -> SessionId {
         self.session
