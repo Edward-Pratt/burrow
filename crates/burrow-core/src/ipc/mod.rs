@@ -8,6 +8,7 @@
 //! connects, and the server limits what it may do by that role.
 
 mod client;
+mod events;
 mod server;
 mod start;
 
