@@ -81,8 +81,11 @@ async fn a_command_fails_at_once_on_a_key_passphrase() {
         "took {:?}",
         started.elapsed()
     );
-    assert!(error.contains("\"Key passphrase\""), "{error}");
+    assert!(error.contains("passphrase"), "{error}");
     assert!(error.contains("ssh-add"), "{error}");
+    // Only the first question: the password asked after the key went
+    // unused is beside the point.
+    assert!(!error.contains("password"), "{error}");
     // The window wasn't asked on the bridge's behalf either.
     assert_nothing_asked(&mut gui_events).await;
 
@@ -151,7 +154,7 @@ async fn a_new_host_key_closes_the_session_and_trusts_nothing() {
         started.elapsed()
     );
     assert!(error.contains("not trusted"), "{error}");
-    assert!(error.contains("\"Trust this host?\""), "{error}");
+    assert!(error.contains("trust a new host key"), "{error}");
     assert!(error.contains("once in Burrow"), "{error}");
     assert_eq!(server.known_hosts(), "");
     assert_nothing_asked(&mut gui_events).await;
@@ -184,4 +187,52 @@ async fn the_bridge_hears_only_its_own_sessions() {
         .collect();
     assert!(heard.contains(&ours), "{heard:?}");
     assert!(!heard.contains(&theirs), "{heard:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tunnel_the_bridge_starts_still_asks_in_the_window() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    let core = server.core();
+    let via = host(&core, "test").await;
+    let props = format!(
+        "type = \"local\"\nport = {}\ntarget_host = \"127.0.0.1\"\ntarget_port = 9",
+        free_port()
+    );
+    let mut props: toml::Table = toml::from_str(&props).unwrap();
+    props.insert("via".into(), via.id.to_string().into());
+    let command = Command::CreateNode {
+        parent: None,
+        kind: "ssh-tunnel".into(),
+        name: "tunnel".into(),
+        color: None,
+        props,
+    };
+    let Response::Node { node } = core.execute(command).await.unwrap() else {
+        panic!("expected a node");
+    };
+    let socket = serve(core, server.dir.path());
+    let gui = Client::connect(&socket, Role::Gui).await.unwrap();
+    let mcp = Client::connect(&socket, Role::Mcp).await.unwrap();
+    grant(&gui, &node, &[Capability::Tunnel]).await;
+    let mut gui_events = gui.subscribe();
+
+    let command = Command::StartTunnel { node: node.id };
+    let Response::Session { session } = mcp.execute(command).await.unwrap() else {
+        panic!("expected a session");
+    };
+    // Tunnels belong to the daemon, and the window answers their questions.
+    let prompt = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(Event::PromptRequested { session: s, prompt }) = gui_events.recv().await
+                && s == session
+            {
+                return prompt;
+            }
+        }
+    })
+    .await
+    .expect("the window was not asked");
+    assert_eq!(prompt.title, "Trust this host?");
 }

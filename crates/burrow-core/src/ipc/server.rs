@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use zeroize::Zeroize;
 
-use super::audit::{cap_strings, cut_error, sha256};
+use super::audit::{Rule, audit_entry, cap_strings, command_type, cut_error};
 use super::events::forward_events;
 use super::{
     BUILD, INVALID_PARAMS, Initialize, MAX_LINE, METHOD_NOT_FOUND, Role, SERVER_ERROR, ServerInfo,
@@ -222,7 +222,11 @@ impl Conn {
                 let owns = command.class().opens_session;
                 let response = match role {
                     Role::Gui | Role::Cli => self.core.execute(command).await,
-                    // Nobody at the bridge can answer a session's questions.
+                    // Nobody at the bridge can answer a session's questions. The
+                    // window shows a tunnel's, whoever started it.
+                    Role::Mcp if matches!(command, Command::StartTunnel { .. }) => {
+                        self.execute_mcp(command).await
+                    }
                     Role::Mcp => crate::ssh::unattended(self.execute_mcp(command)).await,
                 }
                 .map_err(failed)?;
@@ -314,29 +318,6 @@ impl Conn {
             .unwrap()
             .insert(session, task.abort_handle());
         Ok(())
-    }
-}
-
-/// What the MCP bridge may do with a command.
-enum Rule {
-    Run,
-    /// A query that must not write, whatever the session allows.
-    ReadOnlyQuery,
-    /// A monitor that runs only the agent the user put on the server.
-    MonitorWithoutInstall,
-    /// Only the alerts of hosts it may monitor.
-    GrantedAlerts,
-}
-
-impl Rule {
-    /// How the audit log names it.
-    fn name(&self) -> &'static str {
-        match self {
-            Rule::Run => "run",
-            Rule::ReadOnlyQuery => "read_only_query",
-            Rule::MonitorWithoutInstall => "monitor_without_install",
-            Rule::GrantedAlerts => "granted_alerts",
-        }
     }
 }
 
@@ -459,35 +440,6 @@ impl Conn {
 
 fn denied(what: &str) -> Error {
     Error::PermissionDenied(format!("the MCP bridge may not {what}"))
-}
-
-fn command_type(command: &Command) -> String {
-    serde_json::to_value(command)
-        .ok()
-        .and_then(|v| v["type"].as_str().map(str::to_string))
-        .unwrap_or_default()
-}
-
-/// What the audit log keeps of a command, and the `rule` it runs under
-/// when it may run at all. A refused one is kept by type only, since it
-/// may carry a secret; file contents are kept by size and hash.
-fn audit_entry(command: &Command, rule: Option<&Rule>, connection: u64) -> Value {
-    let time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
-    let mut logged = match rule {
-        Some(_) => serde_json::to_value(command).unwrap_or_default(),
-        None => json!({"type": command_type(command)}),
-    };
-    if let Command::WriteFile { data, .. } = command {
-        logged["data"] = json!({"bytes": data.len(), "sha256": sha256(data)});
-    }
-    let mut entry = json!({"time": time, "connection": connection, "command": logged});
-    if let Some(rule) = rule {
-        entry["rule"] = json!(rule.name());
-    }
-    entry
 }
 
 /// Writes replies and events first, and terminal output when there are
