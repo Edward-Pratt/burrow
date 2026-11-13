@@ -68,7 +68,7 @@ All non-secret state lives as TOML files in `$XDG_CONFIG_HOME/burrow/` (default 
 
 ### OpenSSH config as source of truth
 
-- **Host settings:** hosts come from `~/.ssh/config`, including `Include`, `Host` patterns, `Match`, `ProxyJump`, `IdentityFile`, `User` and `Port`. Burrow does not keep its own copy of them.
+- **Host settings:** hosts come from `~/.ssh/config`, including `Include`, `Host` patterns, `Match`, `ProxyJump`, `IdentityFile`, `User` and `Port`. Burrow does not keep its own copy of them. Jump hosts aren't built yet: a host that connects through `ProxyJump` or a `ProxyCommand` is refused with a message, rather than reached directly.
 - **Host keys:** host keys are checked against and added to `~/.ssh/known_hosts`.
 - **Burrow-only extras:** colour, folder, start directory and monitoring settings go in Burrow's config, keyed by the `Host` alias.
 - **Hosts added in Burrow:** these are written to `~/.ssh/config.d/burrow.conf`, which is pulled in by an `Include` line. Burrow asks once before adding that line, so `ssh myhost` in a shell matches Burrow.
