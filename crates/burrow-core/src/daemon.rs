@@ -163,14 +163,23 @@ fn take_activated_socket() -> Option<std::os::unix::net::UnixListener> {
 }
 
 /// Started by systemd, the daemon may not have `SSH_AUTH_SOCK`, which
-/// desktop sessions set only for programs they start. The socket of
-/// OpenSSH's own `ssh-agent.socket` user unit is used then, when it exists.
+/// desktop sessions set only for programs they start. Started from an old
+/// shell, it may name an agent that has gone. The socket of OpenSSH's own
+/// `ssh-agent.socket` user unit is used then, when it exists.
 fn find_agent() {
-    if std::env::var_os("SSH_AUTH_SOCK").is_some() {
+    let set = std::env::var_os("SSH_AUTH_SOCK");
+    let Some(agent) = doctor::ssh_agent_socket(|name| std::env::var_os(name)) else {
         return;
-    }
-    if let Some(agent) = doctor::ssh_agent_socket(|name| std::env::var_os(name)) {
-        tracing::info!("SSH_AUTH_SOCK is not set; using {}", agent.display());
+    };
+    if set.as_deref() != Some(agent.as_os_str()) {
+        match &set {
+            Some(set) => tracing::info!(
+                "nothing answers on SSH_AUTH_SOCK ({}); using {}",
+                std::path::Path::new(set).display(),
+                agent.display()
+            ),
+            None => tracing::info!("SSH_AUTH_SOCK is not set; using {}", agent.display()),
+        }
         // SAFETY: no other threads exist yet (see `run`).
         unsafe { std::env::set_var("SSH_AUTH_SOCK", agent) };
     }
