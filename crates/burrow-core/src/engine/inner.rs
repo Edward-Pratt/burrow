@@ -5,7 +5,7 @@
 
 use std::sync::MutexGuard;
 
-use crate::api::{Command, Event, Node, NodeId, Response, SecretValue};
+use crate::api::{Command, Event, Node, NodeId, Response, SecretValue, SessionId};
 use crate::error::Result;
 use crate::secrets::SecretKey;
 use crate::tree::{Entry, Tree};
@@ -28,6 +28,15 @@ impl Inner {
         }
         // Fails only when nobody is subscribed, which is fine.
         let _ = self.events.send(event);
+    }
+
+    /// Has `session` say where it stands again, for a client that joins
+    /// it. Sent straight to the subscribers: nothing changed, so there is
+    /// nothing to record.
+    pub(super) fn repeat(&self, session: SessionId) {
+        self.sessions.repeat(session, |event| {
+            let _ = self.events.send(event);
+        });
     }
 
     pub(super) fn lookup(&self) -> impl Fn(NodeId) -> Option<Node> + '_ {

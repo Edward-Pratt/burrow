@@ -63,8 +63,9 @@ impl App {
                 ..
             }) if panel.session.state == session::State::Starting => {
                 panel.session.state = session::State::Running(session);
-                // A background monitor may have connected long ago,
-                // so no "connected" event is coming.
+                // A background monitor may have connected long ago. It
+                // says so again to a client that joins it, but a daemon
+                // from before an update doesn't.
                 panel.fetch_history(&self.core, sender);
                 for event in self.unclaimed.claim(session) {
                     self.session_event(event, window, sender);

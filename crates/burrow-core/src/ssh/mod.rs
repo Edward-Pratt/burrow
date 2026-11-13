@@ -17,6 +17,7 @@ mod connection;
 pub(crate) mod exec;
 pub(crate) mod files;
 pub(crate) mod hosts;
+mod join;
 mod known_hosts;
 mod monitor;
 mod prompter;
@@ -37,8 +38,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use prompter::Pending;
 use russh_sftp::client::SftpSession;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::api::{
     Event, Node, NodeId, PromptAnswer, SessionId, SessionInfo, SessionKind, SessionState,
@@ -89,9 +91,6 @@ pub(crate) enum Attached {
     Monitor(Arc<monitor::Monitor>),
 }
 
-/// Prompts waiting for an answer, by prompt id.
-type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<PromptAnswer>>>>;
-
 impl Sessions {
     pub fn send(&self, id: SessionId, input: Input) -> Result<()> {
         let map = self.map.lock().unwrap();
@@ -122,10 +121,9 @@ impl Sessions {
             .get(&id)
             .filter(|e| e.input.is_some())
             .ok_or(Error::SessionNotFound(id))?;
-        let waiting = entry.prompts.lock().unwrap().remove(&prompt);
-        let sender =
-            waiting.ok_or_else(|| Error::invalid("prompt", format!("{prompt} is not waiting")))?;
-        let _ = sender.send(answer);
+        if !entry.prompts.answer(prompt, answer) {
+            return Err(Error::invalid("prompt", format!("{prompt} is not waiting")));
+        }
         Ok(())
     }
 
@@ -275,7 +273,7 @@ impl Sessions {
             Some(entry) if entry.output.is_some() => {
                 entry.input = None;
                 entry.attached = None;
-                entry.prompts.lock().unwrap().clear();
+                entry.prompts.clear();
             }
             _ => {
                 map.remove(&id);

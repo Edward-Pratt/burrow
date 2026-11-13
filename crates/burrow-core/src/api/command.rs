@@ -255,7 +255,9 @@ pub enum Command {
     /// Starts burrow-agent on an SSH host node, putting it there first if
     /// needed, and reports what it sees as [`Event::MonitorSample`](crate::api::Event::MonitorSample),
     /// [`Event::MonitorUnits`](crate::api::Event::MonitorUnits) and [`Event::MonitorApps`](crate::api::Event::MonitorApps). Returns [`Response::Session`](crate::api::Response::Session): the host's
-    /// background monitor if it has one, otherwise a new session.
+    /// background monitor if it has one, otherwise a new session. A
+    /// background monitor then repeats its state and the prompts it waits
+    /// on, as events, since the caller may have missed them.
     OpenMonitor {
         node: NodeId,
     },
