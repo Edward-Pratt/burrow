@@ -18,6 +18,9 @@ pub(super) struct Shared {
     pub(super) size: Cell<(u16, u16)>,
     /// The mouse buttons held, as RFB's mask.
     buttons: Cell<u8>,
+    /// The clipboard text the two sides last shared, so neither sends it
+    /// back to the other.
+    pub(super) copied: RefCell<Option<String>>,
 }
 
 impl Shared {

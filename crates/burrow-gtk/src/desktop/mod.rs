@@ -3,6 +3,7 @@
 //! window speaks RFB itself with vnc-rs ([`rfb`]) and draws the screen
 //! ([`frame`]).
 
+mod clipboard;
 mod dialog;
 mod frame;
 mod input;
@@ -67,6 +68,7 @@ impl Desktop {
         picture.add_css_class("desktop");
         let shared = Rc::new(Shared::default());
         add_input(&picture, &shared);
+        clipboard::add(&picture, &shared);
 
         let reconnect = {
             let sender = sender.clone();
@@ -98,6 +100,10 @@ impl Desktop {
         };
         if self.session.session_changed(state, ended) {
             self.session.show_content();
+            if self.picture.has_focus() {
+                // Taking the focus again would not say so.
+                clipboard::send_local(&self.picture, &self.shared);
+            }
             self.picture.grab_focus();
         }
         if matches!(state, SessionState::Closed { .. }) {
@@ -109,6 +115,7 @@ impl Desktop {
     pub fn attach(&mut self, core: &Client, session: SessionId) {
         let (input, events) = mpsc::unbounded_channel();
         self.shared.input.replace(Some(input));
+        self.shared.copied.replace(None);
         let (core, sender, node) = (core.clone(), self.sender.input_sender().clone(), self.node);
         runtime().spawn(async move {
             let error = drive(&core, session, events, &sender, node).await.err();
@@ -160,6 +167,9 @@ impl Desktop {
             VncEvent::RawImage(rect, data) => self.frame.put(rect, &data),
             VncEvent::Copy(to, from) => self.frame.copy(to, from),
             VncEvent::Bell => self.picture.error_bell(),
+            VncEvent::Text(text) => {
+                return clipboard::from_server(&self.picture, &self.shared, &text);
+            }
             _ => return,
         }
         if !self.dirty {
