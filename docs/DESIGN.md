@@ -83,6 +83,19 @@ All non-secret state lives as TOML files in `$XDG_CONFIG_HOME/burrow/` (default 
 - **Fallback (later):** servers without the agent will fall back to plain shell commands with parsed output.
 - **No exposed ports:** the agent never listens on the network. It only talks over SSH.
 
+### Mobile client
+
+Burrow mobile is an Android app that is a client of `burrowd`, like the window and the CLI, rather than a port of the core to the phone.
+
+- **Why a client:** the core's dependencies are the Linux desktop: Secret Service over D-Bus for secrets, `ssh -G` for host settings, `~/.ssh` for keys and known hosts, XDG folders and a Unix socket. None of that is on a phone. The daemon already runs background monitors, keeps a week of history and raises alerts with no window open, so the phone only has to show them. Secrets never leave the computer running the daemon.
+- **Over SSH:** the phone connects to the daemon's computer with SSH as the user and runs `burrow proxy --role mobile`, which finds or starts the daemon and passes the JSON-RPC lines between the SSH channel and the socket. The process touching the socket runs as the user, so the socket's trust boundary (`SO_PEERCRED`) is unchanged, and the daemon needs no network listener, TLS or pairing protocol of its own. An exec channel rather than forwarding the socket itself, because the phone then needn't know the socket path, which depends on `$XDG_RUNTIME_DIR`, and because the key's `authorized_keys` line can be limited to that one command.
+- **The key is the pairing:** the app makes its own ed25519 key on first run and shows the `authorized_keys` line to add on the daemon's computer, with `command="/home/<user>/.local/bin/burrow proxy --role mobile",no-port-forwarding,no-pty,no-agent-forwarding,no-X11-forwarding`, so that key can only ever be a Burrow mobile client, never a shell. The path is absolute because sshd runs a forced command through the user's shell non-interactively, where `~/.local/bin` is usually not on `PATH`. The proxy refuses a first line that isn't `initialize` with the role it was given. The phone pins the computer's host key on first connect, showing its fingerprint, and keeps its own known hosts. A lost phone still gives the daemon's API, which is everything the user granted themselves: the computer's own clients aren't walled off from each other either. The `mobile` role runs what `gui` runs today; it is where the daemon would restrict a phone, with no protocol change, if that is ever wanted.
+- **Tauri 2:** the app's Rust side shares `burrow-api` (the API types and the JSON-RPC client, over any stream) and uses russh for the hop, so the protocol code is the daemon's own. The UI is TypeScript in the system webview: on a phone the webview is the platform's, so the reason to avoid one on the desktop (WebKitGTK) doesn't apply. Alternatives: Flutter with a Rust bridge would mean a Dart UI for the same Rust; Kotlin would mean the Android SDK and a new language for the same result.
+- **Sessions:** monitors the phone opens close when its connection drops, as every client's do; the background monitors and their history don't. The phone reads history with `monitor_trend`, which is bounded, rather than `monitor_history`, and lists nodes, sessions and alerts again on every reconnect and on `resync`. Terminals from the phone are later: they would die whenever the screen locks, until the daemon can keep a session detached from its client.
+- **Alerts only while open:** the daemon notifies over D-Bus on its own computer, and nothing reaches a phone that isn't connected. Pushing alerts to a closed app, through an Android foreground service holding the connection or a relay such as ntfy, is a later choice.
+- **Where the daemon runs:** any computer with `burrowd` and `sshd` the phone can reach. For the user that is `warren` over Tailscale, with `burrowd.socket` enabled, which needs Burrow to run there without a desktop session.
+- **Its own repository:** `burrow-mobile` builds for Android, which can't join this workspace's `cargo test --workspace`. It depends on `burrow-api` by git.
+
 ## Platform
 
 | Concern | Choice |
@@ -95,6 +108,7 @@ All non-secret state lives as TOML files in `$XDG_CONFIG_HOME/burrow/` (default 
 | Packaging | A PKGBUILD for pacman, or `dist/install.sh` for one user in `~/.local`. CI publishes a build of each green push to main (pre-release `build-main`), and of each `vX.Y.Z` tag (a GitHub release, which `--stable` follows). The script downloads one and checks it against its SHA-256, so users don't compile. "Check for updates…" in the window runs the installed script and restarts into the new build; a daily timer only checks and notifies. Updates stay out of the core, so nothing that talks to the daemon, such as the MCP bridge, can start one. Builds come from the newest Arch, and an update whose libraries are missing isn't installed. `--branch` builds from source instead. Not Flatpak: its sandbox blocks host shells, the SSH agent and `~/.ssh`. |
 | VNC | The core signs in over a channel on the SSH host's connection, then passes the RFB stream to the window, which draws it with vnc-rs into a GTK texture. Not gtk-vnc, which is GTK 3 only. |
 | RDP | IronRDP or FreeRDP, later |
+| Mobile | Tauri 2 on Android, a client of `burrowd` over SSH; see [Mobile client](#mobile-client) |
 
 ## Addons
 
@@ -155,3 +169,6 @@ Built-in features use the same addon API as third-party ones.
 15. Containers and PM2 in `burrow-agent`, shown in the monitor tab, with alerts when one stops
 16. Service actions from the monitor tab: systemd units through sudo (a terminal asks for the password when sudo needs one), containers and PM2 apps, and each one's log in a tab
 17. VNC desktops in a tab, through an SSH host, with the core signing in so the password stays in the core
+18. `burrow-api` crate: the API types and the JSON-RPC client over any stream, `burrow proxy --role <role>` for SSH forced commands, and the `mobile` role
+19. Burrow on `warren` without a desktop: install, `burrowd.socket`, and a keyring and SSH keys for its monitors
+20. Burrow mobile v1, in its own repository: Tauri 2 on Android, pairing by SSH key, hosts with alert badges, the monitor page with live samples and trends, alerts, and the agent-install prompt
