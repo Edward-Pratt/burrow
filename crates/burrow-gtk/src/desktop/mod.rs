@@ -6,6 +6,7 @@
 mod dialog;
 mod frame;
 mod input;
+mod pointer;
 mod rfb;
 
 use std::rc::Rc;

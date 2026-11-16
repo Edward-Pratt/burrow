@@ -6,9 +6,11 @@ use burrow_core::ipc::Client;
 use burrow_core::{Command, NodeId, SessionId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use vnc::{PixelFormat, VncConnector, VncEncoding, X11Event};
 
 use super::Msg;
+use super::pointer::{Batch, FRAME};
 use crate::app::AppMsg;
 
 /// How often the server is asked for what changed.
@@ -37,6 +39,8 @@ pub(super) async fn drive(
     });
     let writer = core.clone();
     tokio::spawn(async move {
+        // A read takes all vnc-rs wrote while the last command was out,
+        // so messages written close together go as one command.
         let mut buffer = vec![0; 64 << 10];
         while let Ok(n @ 1..) = from_client.read(&mut buffer).await {
             let data = buffer[..n].to_vec();
@@ -69,6 +73,9 @@ pub(super) async fn drive(
         .map_err(text)?;
     vnc.input(X11Event::FullRefresh).await.map_err(text)?;
     let mut refresh = tokio::time::interval(REFRESH);
+    let mut batch = Batch::default();
+    let due = tokio::time::sleep(FRAME);
+    tokio::pin!(due);
     loop {
         tokio::select! {
             event = vnc.recv_event() => {
@@ -77,7 +84,20 @@ pub(super) async fn drive(
                     return Ok(());
                 }
             }
-            Some(event) = events.recv() => vnc.input(event).await.map_err(text)?,
+            Some(event) = events.recv() => {
+                let waiting = batch.is_pending();
+                for event in batch.push(event) {
+                    vnc.input(event).await.map_err(text)?;
+                }
+                if !waiting && batch.is_pending() {
+                    due.as_mut().reset(Instant::now() + FRAME);
+                }
+            }
+            () = &mut due, if batch.is_pending() => {
+                if let Some(event) = batch.flush() {
+                    vnc.input(event).await.map_err(text)?;
+                }
+            }
             _ = refresh.tick() => vnc.input(X11Event::Refresh).await.map_err(text)?,
         }
     }
