@@ -200,7 +200,7 @@ impl Files {
                 let msg = Msg::TransferButton(transfer);
                 sender.input(AppMsg::Files { node, msg });
             });
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             row.add_css_class("transfer");
             row.append(&label);
             row.append(&progress);

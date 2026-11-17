@@ -95,7 +95,7 @@ pub(super) struct AppRow {
 
 impl AppsSection {
     pub(super) fn new() -> AppsSection {
-        let section = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let section = gtk::Box::new(gtk::Orientation::Vertical, 4);
         section.set_visible(false);
         let heading = heading("");
         let grid = gtk::Grid::new();

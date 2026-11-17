@@ -24,10 +24,10 @@ pub(super) fn show_settings(
     let grid = gtk::Grid::builder()
         .row_spacing(12)
         .column_spacing(16)
-        .margin_top(18)
-        .margin_bottom(18)
-        .margin_start(18)
-        .margin_end(18)
+        .margin_top(16)
+        .margin_bottom(16)
+        .margin_start(16)
+        .margin_end(16)
         .build();
     let row_label = |text: &str| {
         let label = gtk::Label::new(Some(text));

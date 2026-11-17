@@ -103,10 +103,10 @@ pub fn new_host(parent_window: &impl IsA<gtk::Window>, core: Client, parent: Opt
         .default_width(440)
         .build();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
 
     let write = gtk::CheckButton::with_label("Enter its settings here");
     let existing = gtk::CheckButton::with_label("Use a host already in ~/.ssh/config");
@@ -177,7 +177,7 @@ pub fn new_host(parent_window: &impl IsA<gtk::Window>, core: Client, parent: Opt
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(4);
     let cancel = gtk::Button::with_label("Cancel");
     let ok = gtk::Button::with_label("Create");
     ok.add_css_class("suggested-action");

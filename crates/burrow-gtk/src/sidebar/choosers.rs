@@ -24,11 +24,11 @@ pub fn move_dialog(
         .resizable(false)
         .default_width(380)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
 
     let label = gtk::Label::new(Some(&format!("Move “{}” to", node.name)));
     label.set_xalign(0.0);
@@ -42,7 +42,7 @@ pub fn move_dialog(
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(4);
     let cancel = gtk::Button::with_label("Cancel");
     let ok = gtk::Button::with_label("Move");
     ok.add_css_class("suggested-action");
@@ -111,11 +111,11 @@ pub fn colour_dialog(
         .transient_for(parent)
         .resizable(false)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
     let label = gtk::Label::new(Some(&format!("Colour for “{}”", node.name)));
     label.set_xalign(0.0);
     label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
@@ -124,8 +124,8 @@ pub fn colour_dialog(
     let current = node.color.as_deref().map(str::to_lowercase);
     let done = Rc::new(done);
     let swatches = gtk::Grid::new();
-    swatches.set_column_spacing(6);
-    swatches.set_row_spacing(6);
+    swatches.set_column_spacing(8);
+    swatches.set_row_spacing(8);
     for (index, (name, hex)) in (0..).zip(COLOURS) {
         let dot = gtk::Label::new(None);
         dot.set_markup(&format!(
@@ -154,7 +154,7 @@ pub fn colour_dialog(
     content.append(&swatches);
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(4);
     let none = gtk::Button::with_label("None");
     none.set_has_frame(current.is_none());
     none.set_hexpand(true);

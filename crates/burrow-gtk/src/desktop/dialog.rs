@@ -26,10 +26,10 @@ pub fn edit(
         .default_width(440)
         .build();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
     let props = node.map(|n| n.props.clone()).unwrap_or_default();
     let text = |key: &str| props.get(key).and_then(|v| v.as_str()).map(str::to_string);
 
@@ -92,7 +92,7 @@ pub fn edit(
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(4);
     let cancel = gtk::Button::with_label("Cancel");
     let ok = gtk::Button::with_label(if node.is_some() { "Save" } else { "Create" });
     ok.add_css_class("suggested-action");

@@ -133,13 +133,13 @@ pub fn show(parent: &gtk::ApplicationWindow, restart: impl Fn(PathBuf) + 'static
         .resizable(false)
         .default_width(420)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
 
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let spinner = gtk::Spinner::new();
     let message = gtk::Label::new(None);
     message.set_xalign(0.0);
@@ -167,7 +167,7 @@ pub fn show(parent: &gtk::ApplicationWindow, restart: impl Fn(PathBuf) + 'static
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(4);
     let close = gtk::Button::with_label("Close");
     let action = gtk::Button::new();
     action.add_css_class("suggested-action");
