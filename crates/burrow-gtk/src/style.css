@@ -11,7 +11,7 @@
 
 .sidebar row {
   padding: 4px 8px;
-  margin: 1px 6px;
+  margin: 1px 4px;
   border-radius: 6px;
 }
 
@@ -36,14 +36,14 @@
 /* A row being dragged. Opaque and square, since without a compositor the
    transparent parts of a drag icon show black. */
 .sidebar-drag {
-  padding: 6px 10px;
+  padding: 4px 8px;
   background-color: @theme_base_color;
   color: @theme_fg_color;
   border: 1px solid alpha(currentColor, 0.25);
 }
 
 .statusbar {
-  padding: 2px 10px;
+  padding: 2px 8px;
   font-size: smaller;
   border-top: 1px solid alpha(currentColor, 0.12);
 }
@@ -70,7 +70,7 @@
 .props {
   font-family: monospace;
   margin-top: 8px;
-  padding: 8px 10px;
+  padding: 8px;
   border-radius: 6px;
   background: alpha(currentColor, 0.05);
 }
@@ -114,7 +114,7 @@
 }
 
 .shell-bar {
-  padding: 2px 6px;
+  padding: 2px 4px;
 }
 
 .welcome-title {
@@ -156,7 +156,7 @@ popover.menu button {
 }
 
 .file-list row {
-  padding: 2px 6px;
+  padding: 2px 4px;
 }
 
 .transfer progressbar trough,
@@ -176,7 +176,7 @@ levelbar block.warning {
 }
 
 .unit-list row {
-  padding: 2px 6px;
+  padding: 2px 4px;
 }
 
 /* What a desktop doesn't cover, around a screen scaled to fit. */
