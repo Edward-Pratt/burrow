@@ -27,12 +27,14 @@ impl Meter {
         let bar = gtk::LevelBar::new();
         bar.set_hexpand(true);
         bar.set_valign(gtk::Align::Center);
-        // Full is the warning, so the theme's "high" colour isn't used for
-        // a disk that is merely busy.
+        // Over 90% is the warning, as the monitor's alerts say. The theme
+        // paints a "full" bar in its success colour, so that band takes
+        // the stylesheet's "warning" instead, and the rest stays "high".
+        bar.remove_offset_value(Some(gtk::LEVEL_BAR_OFFSET_LOW));
         bar.remove_offset_value(Some(gtk::LEVEL_BAR_OFFSET_HIGH));
-        bar.add_offset_value(gtk::LEVEL_BAR_OFFSET_LOW, 0.9);
+        bar.remove_offset_value(Some(gtk::LEVEL_BAR_OFFSET_FULL));
         bar.add_offset_value(gtk::LEVEL_BAR_OFFSET_HIGH, 0.9);
-        bar.add_offset_value(gtk::LEVEL_BAR_OFFSET_FULL, 1.0);
+        bar.add_offset_value("warning", 1.0);
         let text = label("");
         text.set_width_chars(24);
         Meter {

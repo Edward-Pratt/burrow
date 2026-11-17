@@ -164,6 +164,13 @@ popover.menu button {
   min-height: 6px;
 }
 
+/* A monitor's meter over 90%, in the warning colour rather than the
+   theme's success colour for a full bar. */
+levelbar block.warning {
+  background-color: #c88800;
+  border-color: #c88800;
+}
+
 .monitor-view {
   margin: 24px;
 }
