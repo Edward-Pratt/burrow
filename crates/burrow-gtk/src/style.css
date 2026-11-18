@@ -11,13 +11,13 @@
 
 .sidebar row {
   padding: 4px 8px;
-  margin: 4px;
+  margin: 1px 8px;
   border-radius: 6px;
 }
 
-/* 12 px per folder level, with the expander's 4 px spacing. */
+/* 16 px per folder level, with the expander's 4 px spacing. */
 .sidebar treeexpander indent {
-  -gtk-icon-size: 8px;
+  -gtk-icon-size: 12px;
 }
 
 /* The space a leaf gets in place of a folder's arrow, so names line up.
@@ -36,14 +36,14 @@
 /* A row being dragged. Opaque and square, since without a compositor the
    transparent parts of a drag icon show black. */
 .sidebar-drag {
-  padding: 4px 8px;
+  padding: 8px 12px;
   background-color: @theme_base_color;
   color: @theme_fg_color;
   border: 1px solid alpha(currentColor, 0.25);
 }
 
 .statusbar {
-  padding: 4px 8px;
+  padding: 2px 12px;
   font-size: smaller;
   border-top: 1px solid alpha(currentColor, 0.12);
 }
@@ -58,7 +58,7 @@
 
 .statusbar button.warning,
 .statusbar button.error {
-  padding: 0 4px;
+  padding: 0 8px;
   min-height: 0;
 }
 
@@ -70,7 +70,7 @@
 .props {
   font-family: monospace;
   margin-top: 8px;
-  padding: 8px;
+  padding: 8px 12px;
   border-radius: 6px;
   background: alpha(currentColor, 0.05);
 }
@@ -122,7 +122,7 @@ label.error {
 }
 
 .shell-bar {
-  padding: 4px;
+  padding: 2px 8px;
 }
 
 .welcome-title {
@@ -134,7 +134,7 @@ label.error {
 .kbd {
   font-family: monospace;
   font-size: smaller;
-  padding: 4px;
+  padding: 1px 8px;
   border: 1px solid alpha(currentColor, 0.25);
   border-radius: 4px;
 }
@@ -164,7 +164,7 @@ popover.menu button {
 }
 
 .file-list row {
-  padding: 4px;
+  padding: 2px 8px;
 }
 
 .transfer progressbar trough,
@@ -186,7 +186,7 @@ levelbar block.warning {
 }
 
 .unit-list row {
-  padding: 4px;
+  padding: 2px 8px;
 }
 
 /* What a desktop doesn't cover, around a screen scaled to fit. */
