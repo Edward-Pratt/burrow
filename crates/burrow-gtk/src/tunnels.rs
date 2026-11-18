@@ -142,9 +142,9 @@ pub fn status_text(status: &Status) -> (String, Option<&'static str>) {
     match &status.session {
         None | Some((_, SessionState::Closed { error: None })) => ("Stopped".into(), None),
         Some((_, SessionState::Connecting { step })) => (format!("{step}…"), None),
-        Some((_, SessionState::Connected)) => ("Running".into(), Some("running")),
+        Some((_, SessionState::Connected)) => ("Running".into(), Some("success")),
         Some((_, SessionState::Closed { error: Some(error) })) => {
-            (format!("Stopped: {error}"), Some("error-text"))
+            (format!("Stopped: {error}"), Some("error"))
         }
     }
 }
@@ -210,7 +210,7 @@ impl TunnelPage {
         ));
         stale.set_xalign(0.0);
         stale.set_wrap(true);
-        stale.add_css_class("warning-text");
+        stale.add_css_class("warning");
         stale.set_visible(false);
         page.append(&stale);
 
@@ -311,7 +311,7 @@ impl TunnelPage {
             set_text(value, text);
         }
         let state = &self.values[3];
-        for old in ["running", "error-text"] {
+        for old in ["success", "error"] {
             if Some(old) != class {
                 state.remove_css_class(old);
             }
@@ -498,7 +498,7 @@ pub fn edit(
     let error = gtk::Label::new(None);
     error.set_xalign(0.0);
     error.set_wrap(true);
-    error.add_css_class("error-text");
+    error.add_css_class("error");
     error.set_visible(false);
     content.append(&error);
 

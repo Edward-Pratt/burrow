@@ -80,6 +80,7 @@ impl Row {
         let dot = gtk::Label::new(None);
         content.append(&dot);
         let running = gtk::Label::new(Some("running"));
+        running.add_css_class("success");
         running.add_css_class("running-badge");
         content.append(&running);
         // The expander draws the indent and, for folders, the disclosure

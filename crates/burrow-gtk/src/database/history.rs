@@ -48,7 +48,7 @@ impl Database {
                 line.append(&sql);
                 if !entry.ok {
                     let failed = gtk::Label::new(Some("failed"));
-                    failed.add_css_class("error-text");
+                    failed.add_css_class("error");
                     line.append(&failed);
                 }
                 line.append(&when);

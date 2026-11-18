@@ -81,7 +81,7 @@ impl Files {
         error.set_xalign(0.0);
         error.set_wrap(true);
         error.set_selectable(true);
-        error.add_css_class("error-text");
+        error.add_css_class("error");
         error.set_visible(false);
         page.append(&error);
 

@@ -191,7 +191,7 @@ pub fn edit(
     let error = gtk::Label::new(None);
     error.set_xalign(0.0);
     error.set_wrap(true);
-    error.add_css_class("error-text");
+    error.add_css_class("error");
     error.set_visible(false);
     content.append(&error);
 

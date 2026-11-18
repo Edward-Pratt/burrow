@@ -257,8 +257,8 @@ fn alert_class(kind: &AlertKind) -> &'static str {
         AlertKind::UnitFailed { .. }
         | AlertKind::Unreachable { .. }
         | AlertKind::ContainerFailed { .. }
-        | AlertKind::AppFailed { .. } => "error-text",
-        AlertKind::DiskFull { .. } | AlertKind::MemoryLow { .. } => "warning-text",
+        | AlertKind::AppFailed { .. } => "error",
+        AlertKind::DiskFull { .. } | AlertKind::MemoryLow { .. } => "warning",
     }
 }
 
@@ -269,11 +269,8 @@ mod tests {
     #[test]
     fn down_is_an_error_and_short_is_a_warning() {
         let (unit, error, percent) = (String::new(), String::new(), 93.0);
-        assert_eq!(alert_class(&AlertKind::UnitFailed { unit }), "error-text");
-        assert_eq!(alert_class(&AlertKind::Unreachable { error }), "error-text");
-        assert_eq!(
-            alert_class(&AlertKind::MemoryLow { percent }),
-            "warning-text"
-        );
+        assert_eq!(alert_class(&AlertKind::UnitFailed { unit }), "error");
+        assert_eq!(alert_class(&AlertKind::Unreachable { error }), "error");
+        assert_eq!(alert_class(&AlertKind::MemoryLow { percent }), "warning");
     }
 }

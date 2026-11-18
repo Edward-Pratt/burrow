@@ -171,7 +171,7 @@ pub fn new_host(parent_window: &impl IsA<gtk::Window>, core: Client, parent: Opt
     error.set_xalign(0.0);
     error.set_wrap(true);
     error.set_max_width_chars(56);
-    error.add_css_class("error-text");
+    error.add_css_class("error");
     error.set_visible(false);
     content.append(&error);
 

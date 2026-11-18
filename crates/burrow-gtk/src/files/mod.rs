@@ -130,7 +130,7 @@ impl Transfer {
     fn stop(&mut self, status: &str) {
         self.ended = true;
         self.status = status.to_string();
-        self.label.add_css_class("error-text");
+        self.label.add_css_class("error");
         self.button.set_label("Dismiss");
         self.button.set_visible(true);
     }

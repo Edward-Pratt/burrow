@@ -92,21 +92,29 @@
   opacity: 0.5;
 }
 
-.running,
-.running-badge {
+/* A state's colour, under GNOME's class for what it means. Plain GTK
+   colours only label.error itself, so all three are set here. */
+label.success {
   color: #26a269;
+}
+
+label.warning {
+  color: #c88800;
+}
+
+label.error {
+  color: #e01b24;
+}
+
+/* Breeze draws .warning and .error as an info bar, with the window's
+   background behind the text, which shows as a patch in a list row. */
+label.warning,
+label.error {
+  background: none;
 }
 
 .running-badge {
   font-size: smaller;
-}
-
-.error-text {
-  color: #e01b24;
-}
-
-.warning-text {
-  color: #c88800;
 }
 
 .dim {

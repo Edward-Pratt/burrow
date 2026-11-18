@@ -298,7 +298,7 @@ pub fn review(parent: &impl IsA<gtk::Window>, addon: &AddonInfo, approve: impl F
         ));
         changed.set_xalign(0.0);
         changed.set_wrap(true);
-        changed.add_css_class("warning-text");
+        changed.add_css_class("warning");
         content.append(&changed);
     }
 

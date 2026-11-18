@@ -54,7 +54,7 @@ impl Database {
             }
         });
         let writable_note = gtk::Label::new(Some("Changes allowed"));
-        writable_note.add_css_class("warning-text");
+        writable_note.add_css_class("warning");
         writable_note.set_visible(false);
         bar.append(&run);
         bar.append(&cancel);
@@ -107,7 +107,7 @@ impl Database {
         error.set_xalign(0.0);
         error.set_wrap(true);
         error.set_selectable(true);
-        error.add_css_class("error-text");
+        error.add_css_class("error");
         error.set_visible(false);
 
         let rows = gio::ListStore::new::<glib::BoxedAnyObject>();

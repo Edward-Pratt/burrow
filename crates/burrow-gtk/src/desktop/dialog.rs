@@ -85,7 +85,7 @@ pub fn edit(
     let error = gtk::Label::new(None);
     error.set_xalign(0.0);
     error.set_wrap(true);
-    error.add_css_class("error-text");
+    error.add_css_class("error");
     error.set_visible(hosts.is_empty());
     error.set_label("Add an SSH host first: a desktop is reached through one.");
     content.append(&error);
