@@ -51,7 +51,7 @@ pub fn show<M: Clone + 'static>(
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(8);
     content.set_margin_bottom(8);
     content.set_margin_start(8);
@@ -139,11 +139,11 @@ pub fn show<M: Clone + 'static>(
 }
 
 fn row<M>(item: &Item<M>) -> gtk::ListBoxRow {
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
     content.set_margin_top(4);
     content.set_margin_bottom(4);
-    content.set_margin_start(4);
-    content.set_margin_end(4);
+    content.set_margin_start(8);
+    content.set_margin_end(8);
     let title = gtk::Label::new(Some(&item.title));
     title.set_xalign(0.0);
     content.append(&title);

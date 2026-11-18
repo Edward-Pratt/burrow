@@ -229,7 +229,7 @@ impl TunnelPage {
         page.append(&buttons);
 
         let autostart = gtk::CheckButton::with_label("Start with Burrow on this computer");
-        autostart.set_margin_top(4);
+        autostart.set_margin_top(8);
         page.append(&autostart);
 
         let tab = Rc::new(TunnelPage {
@@ -374,10 +374,10 @@ pub fn edit(
         .default_width(420)
         .build();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin_top(16);
-    content.set_margin_bottom(16);
-    content.set_margin_start(16);
-    content.set_margin_end(16);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
 
     let base = node.map(|n| n.props.clone()).unwrap_or_default();
     let (via, port, target) = Settings::from_props(&base);
@@ -504,7 +504,7 @@ pub fn edit(
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(4);
+    buttons.set_margin_top(8);
     let cancel = gtk::Button::with_label("Cancel");
     let ok = gtk::Button::with_label(if node.is_some() { "Save" } else { "Create" });
     ok.add_css_class("suggested-action");
