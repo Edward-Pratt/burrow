@@ -35,7 +35,7 @@ impl Database {
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
         page.add_css_class("database-view");
 
-        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let run = button("Run", Msg::Run);
         run.add_css_class("suggested-action");
         run.set_tooltip_text(Some("Run the selection, or everything (Ctrl+Enter)"));
@@ -149,7 +149,7 @@ impl Database {
         work.set_position(180);
 
         let (tree, schemas) = schema_tree(node, sender);
-        let tree_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let tree_header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let tree_title = gtk::Label::new(Some("Tables"));
         tree_title.set_xalign(0.0);
         tree_title.set_hexpand(true);

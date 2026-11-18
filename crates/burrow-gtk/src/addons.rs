@@ -119,7 +119,7 @@ fn text(text: &str) -> gtk::Label {
 
 fn table(columns: &[String], rows: &[Vec<String>]) -> gtk::Widget {
     let grid = gtk::Grid::builder()
-        .row_spacing(2)
+        .row_spacing(4)
         .column_spacing(16)
         .build();
     grid.add_css_class("view-table");
@@ -282,7 +282,7 @@ pub fn review(parent: &impl IsA<gtk::Window>, addon: &AddonInfo, approve: impl F
         .transient_for(parent)
         .default_width(460)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(16);
     content.set_margin_bottom(16);
     content.set_margin_start(16);
@@ -392,7 +392,7 @@ pub fn manage(
         .transient_for(parent)
         .default_width(480)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(16);
     content.set_margin_bottom(16);
     content.set_margin_start(16);
@@ -407,7 +407,7 @@ pub fn manage(
     }
     for addon in addons {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        let labels = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let labels = gtk::Box::new(gtk::Orientation::Vertical, 4);
         labels.set_hexpand(true);
         let name = gtk::Label::new(Some(&format!("{} {}", addon.name, addon.version)));
         name.set_xalign(0.0);

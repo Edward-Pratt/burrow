@@ -133,7 +133,7 @@ pub fn show(parent: &gtk::ApplicationWindow, restart: impl Fn(PathBuf) + 'static
         .resizable(false)
         .default_width(420)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(16);
     content.set_margin_bottom(16);
     content.set_margin_start(16);

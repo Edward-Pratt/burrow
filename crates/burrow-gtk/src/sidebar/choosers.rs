@@ -24,7 +24,7 @@ pub fn move_dialog(
         .resizable(false)
         .default_width(380)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(16);
     content.set_margin_bottom(16);
     content.set_margin_start(16);
@@ -111,7 +111,7 @@ pub fn colour_dialog(
         .transient_for(parent)
         .resizable(false)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(16);
     content.set_margin_bottom(16);
     content.set_margin_start(16);
@@ -124,8 +124,8 @@ pub fn colour_dialog(
     let current = node.color.as_deref().map(str::to_lowercase);
     let done = Rc::new(done);
     let swatches = gtk::Grid::new();
-    swatches.set_column_spacing(8);
-    swatches.set_row_spacing(8);
+    swatches.set_column_spacing(4);
+    swatches.set_row_spacing(4);
     for (index, (name, hex)) in (0..).zip(COLOURS) {
         let dot = gtk::Label::new(None);
         dot.set_markup(&format!(

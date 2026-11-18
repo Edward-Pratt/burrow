@@ -28,7 +28,7 @@ pub fn prompt(
         .build();
     window.add_css_class("prompt");
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(16);
     content.set_margin_bottom(16);
     content.set_margin_start(16);
@@ -206,7 +206,7 @@ pub fn answer(
         .resizable(false)
         .default_width(380)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(16);
     content.set_margin_bottom(16);
     content.set_margin_start(16);
@@ -310,7 +310,7 @@ pub fn choose(
         .resizable(false)
         .default_width(420)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(16);
     content.set_margin_bottom(16);
     content.set_margin_start(16);

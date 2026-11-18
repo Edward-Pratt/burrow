@@ -70,7 +70,7 @@ pub(super) fn schema_tree(
 
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
-        let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         line.append(&gtk::Image::new());
         let name = gtk::Label::new(None);
         name.set_xalign(0.0);

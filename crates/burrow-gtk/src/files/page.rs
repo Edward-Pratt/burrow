@@ -41,7 +41,7 @@ impl Files {
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
         page.add_css_class("files-view");
 
-        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         bar.append(&icon_button("go-up-symbolic", "Up (Backspace)", Msg::Up));
         bar.append(&icon_button("go-home-symbolic", "Home folder", Msg::Home));
         bar.append(&icon_button(
@@ -59,7 +59,7 @@ impl Files {
         bar.append(&path_entry);
         page.append(&bar);
 
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         actions.append(&button("New folder…", Msg::NewFolder));
         actions.append(&button("Upload files…", Msg::Upload { folder: false }));
         actions.append(&button("Upload folder…", Msg::Upload { folder: true }));
