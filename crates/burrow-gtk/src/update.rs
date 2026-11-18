@@ -14,6 +14,7 @@ use relm4::gtk::{gio, glib};
 
 use crate::dialogs;
 use crate::files;
+use crate::motion;
 
 /// The binary to start in place of this one when the window has closed.
 static RESTART: OnceLock<PathBuf> = OnceLock::new();
@@ -95,8 +96,7 @@ struct Dialog {
 
 impl Dialog {
     fn busy(&self, message: &str) {
-        self.spinner.set_visible(true);
-        self.spinner.start();
+        motion::spin(&self.spinner);
         self.message.set_text(message);
         self.detail.set_text("");
         self.action.set_visible(false);
@@ -133,13 +133,13 @@ pub fn show(parent: &gtk::ApplicationWindow, restart: impl Fn(PathBuf) + 'static
         .resizable(false)
         .default_width(420)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
 
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let spinner = gtk::Spinner::new();
     let message = gtk::Label::new(None);
     message.set_xalign(0.0);
@@ -167,7 +167,7 @@ pub fn show(parent: &gtk::ApplicationWindow, restart: impl Fn(PathBuf) + 'static
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(8);
     let close = gtk::Button::with_label("Close");
     let action = gtk::Button::new();
     action.add_css_class("suggested-action");

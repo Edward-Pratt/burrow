@@ -35,7 +35,7 @@ impl Database {
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
         page.add_css_class("database-view");
 
-        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let run = button("Run", Msg::Run);
         run.add_css_class("suggested-action");
         run.set_tooltip_text(Some("Run the selection, or everything (Ctrl+Enter)"));
@@ -54,7 +54,7 @@ impl Database {
             }
         });
         let writable_note = gtk::Label::new(Some("Changes allowed"));
-        writable_note.add_css_class("warning-text");
+        writable_note.add_css_class("warning");
         writable_note.set_visible(false);
         bar.append(&run);
         bar.append(&cancel);
@@ -107,7 +107,7 @@ impl Database {
         error.set_xalign(0.0);
         error.set_wrap(true);
         error.set_selectable(true);
-        error.add_css_class("error-text");
+        error.add_css_class("error");
         error.set_visible(false);
 
         let rows = gio::ListStore::new::<glib::BoxedAnyObject>();
@@ -136,7 +136,7 @@ impl Database {
             .child(&grid)
             .vexpand(true)
             .build();
-        let results = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let results = gtk::Box::new(gtk::Orientation::Vertical, 8);
         results.append(&status);
         results.append(&error);
         results.append(&grid_scroller);
@@ -149,7 +149,7 @@ impl Database {
         work.set_position(180);
 
         let (tree, schemas) = schema_tree(node, sender);
-        let tree_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let tree_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let tree_title = gtk::Label::new(Some("Tables"));
         tree_title.set_xalign(0.0);
         tree_title.set_hexpand(true);
@@ -166,7 +166,7 @@ impl Database {
             .vexpand(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
-        let side = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let side = gtk::Box::new(gtk::Orientation::Vertical, 8);
         side.add_css_class("schema-tree");
         side.append(&tree_header);
         side.append(&tree_scroller);

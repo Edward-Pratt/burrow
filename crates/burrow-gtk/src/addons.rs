@@ -120,7 +120,7 @@ fn text(text: &str) -> gtk::Label {
 fn table(columns: &[String], rows: &[Vec<String>]) -> gtk::Widget {
     let grid = gtk::Grid::builder()
         .row_spacing(2)
-        .column_spacing(18)
+        .column_spacing(20)
         .build();
     grid.add_css_class("view-table");
     for (col, name) in columns.iter().enumerate() {
@@ -190,7 +190,7 @@ fn form(
     submit: &str,
     on_action: &OnAction,
 ) -> gtk::Widget {
-    let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
     let mut inputs = Vec::new();
     for field in fields {
         let (widget, input): (gtk::Widget, Input) = match &field.input {
@@ -282,11 +282,11 @@ pub fn review(parent: &impl IsA<gtk::Window>, addon: &AddonInfo, approve: impl F
         .transient_for(parent)
         .default_width(460)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
 
     let title = gtk::Label::new(Some(&format!("{} {}", addon.name, addon.version)));
     title.set_xalign(0.0);
@@ -298,7 +298,7 @@ pub fn review(parent: &impl IsA<gtk::Window>, addon: &AddonInfo, approve: impl F
         ));
         changed.set_xalign(0.0);
         changed.set_wrap(true);
-        changed.add_css_class("warning-text");
+        changed.add_css_class("warning");
         content.append(&changed);
     }
 
@@ -322,7 +322,7 @@ pub fn review(parent: &impl IsA<gtk::Window>, addon: &AddonInfo, approve: impl F
     };
     fields.push(("Can", permissions));
     let grid = gtk::Grid::builder()
-        .row_spacing(6)
+        .row_spacing(8)
         .column_spacing(16)
         .build();
     for (row, (label, value)) in fields.iter().enumerate() {
@@ -353,7 +353,7 @@ pub fn review(parent: &impl IsA<gtk::Window>, addon: &AddonInfo, approve: impl F
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(8);
     let cancel = gtk::Button::with_label("Cancel");
     let ok = gtk::Button::with_label("Approve");
     ok.add_css_class("suggested-action");
@@ -392,11 +392,11 @@ pub fn manage(
         .transient_for(parent)
         .default_width(480)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
 
     let (review, revoke) = (Rc::new(review), Rc::new(revoke));
     if addons.is_empty() {
@@ -456,7 +456,7 @@ pub fn manage(
 
     let folder = gtk::Button::with_label("Open addons folder");
     folder.set_halign(gtk::Align::Start);
-    folder.set_margin_top(6);
+    folder.set_margin_top(8);
     folder.connect_clicked(move |_| open_folder());
     content.append(&folder);
 

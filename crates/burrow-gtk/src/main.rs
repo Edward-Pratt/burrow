@@ -10,6 +10,7 @@ mod files;
 mod hosts;
 mod layout;
 mod monitor;
+mod motion;
 mod palette;
 mod remote;
 mod runtime;

@@ -77,7 +77,7 @@ impl Monitor {
         alerts.set_visible(false);
         page.append(&alerts);
 
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 20);
         let summary = label("");
         summary.add_css_class("dim");
         content.append(&summary);
@@ -87,7 +87,7 @@ impl Monitor {
         trend_note.set_visible(false);
         content.append(&trend_note);
 
-        let charts = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+        let charts = gtk::Box::new(gtk::Orientation::Horizontal, 20);
         charts.set_homogeneous(true);
         let cpu = Chart::new(&["#3584e4"]);
         let cpu_label = heading("CPU");
@@ -99,7 +99,7 @@ impl Monitor {
 
         let memory = Meter::new();
         let swap = Meter::new();
-        let memory_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let memory_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
         memory_box.append(&heading("Memory"));
         memory_box.append(&memory.row("Memory"));
         memory_box.append(&swap.row("Swap"));
@@ -107,13 +107,13 @@ impl Monitor {
 
         let disks = gtk::Grid::new();
         disks.set_column_spacing(12);
-        disks.set_row_spacing(6);
-        let disks_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        disks.set_row_spacing(8);
+        let disks_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
         disks_box.append(&heading("Disks"));
         disks_box.append(&disks);
         content.append(&disks_box);
 
-        let units_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let units_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
         let units_label = heading("Services");
         units_box.append(&units_label);
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -201,7 +201,7 @@ pub(super) fn heading(text: &str) -> gtk::Label {
 }
 
 pub(super) fn section(title: &gtk::Label, body: &impl IsA<gtk::Widget>) -> gtk::Box {
-    let section = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
     section.append(title);
     section.append(body);
     section

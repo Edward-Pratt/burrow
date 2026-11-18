@@ -170,15 +170,15 @@ impl UnitRow {
                 name.set_label(&printable(&unit.name));
                 state.set_label(&printable(&format!("{} ({})", unit.active, unit.sub)));
                 description.set_label(&printable(&unit.description));
-                for class in ["error-text", "running", "dim"] {
+                for class in ["error", "success", "dim"] {
                     name.remove_css_class(class);
                     state.remove_css_class(class);
                 }
                 if unit.active == "failed" {
-                    name.add_css_class("error-text");
-                    state.add_css_class("error-text");
+                    name.add_css_class("error");
+                    state.add_css_class("error");
                 } else if unit.active == "active" {
-                    state.add_css_class("running");
+                    state.add_css_class("success");
                 } else {
                     state.add_css_class("dim");
                 }

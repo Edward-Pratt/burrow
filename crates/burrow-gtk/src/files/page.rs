@@ -41,7 +41,7 @@ impl Files {
         let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
         page.add_css_class("files-view");
 
-        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         bar.append(&icon_button("go-up-symbolic", "Up (Backspace)", Msg::Up));
         bar.append(&icon_button("go-home-symbolic", "Home folder", Msg::Home));
         bar.append(&icon_button(
@@ -59,7 +59,7 @@ impl Files {
         bar.append(&path_entry);
         page.append(&bar);
 
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         actions.append(&button("New folder…", Msg::NewFolder));
         actions.append(&button("Upload files…", Msg::Upload { folder: false }));
         actions.append(&button("Upload folder…", Msg::Upload { folder: true }));
@@ -81,7 +81,7 @@ impl Files {
         error.set_xalign(0.0);
         error.set_wrap(true);
         error.set_selectable(true);
-        error.add_css_class("error-text");
+        error.add_css_class("error");
         error.set_visible(false);
         page.append(&error);
 
@@ -135,7 +135,7 @@ impl Files {
         let session = SessionPage::new(&scroller, send(Msg::Session(session::Msg::Reconnect)));
         page.append(session.widget());
 
-        let transfers_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let transfers_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
         page.append(&transfers_box);
 
         Files {
@@ -158,7 +158,7 @@ impl Files {
 }
 
 pub(super) fn row_content(entry: &FileEntry) -> gtk::Box {
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let icon = match entry.kind {
         FileKind::Dir => "folder-symbolic",
         FileKind::Symlink => "emblem-symbolic-link-symbolic",

@@ -328,7 +328,7 @@ impl Editor {
             overwrite: replace,
             expect: (!replace).then(|| expect.clone()),
         };
-        status.remove_css_class("error-text");
+        status.remove_css_class("error");
         status.set_label("Saving…");
         button.set_sensitive(false);
         let core = self.save.core.clone();
@@ -368,7 +368,7 @@ impl Editor {
             Err(error) => {
                 *self.expect.borrow_mut() = Some(expect);
                 button.set_sensitive(true);
-                status.add_css_class("error-text");
+                status.add_css_class("error");
                 let conflict = error.contains("changed on the server");
                 status.set_label(&if conflict {
                     "Changed on the server.".to_string()

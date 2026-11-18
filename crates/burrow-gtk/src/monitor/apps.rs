@@ -95,7 +95,7 @@ pub(super) struct AppRow {
 
 impl AppsSection {
     pub(super) fn new() -> AppsSection {
-        let section = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
         section.set_visible(false);
         let heading = heading("");
         let grid = gtk::Grid::new();
@@ -140,7 +140,7 @@ impl AppsSection {
         let mut line = 0;
         if let Some(error) = error {
             let text = label(&printable(error));
-            text.add_css_class("error-text");
+            text.add_css_class("error");
             text.set_wrap(true);
             self.grid.attach(&text, 0, line, 4, 1);
             line += 1;
@@ -162,10 +162,10 @@ impl AppsSection {
             detail.set_hexpand(true);
             detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
             if row.failed {
-                name.add_css_class("error-text");
-                state.add_css_class("error-text");
+                name.add_css_class("error");
+                state.add_css_class("error");
             } else if row.running {
-                state.add_css_class("running");
+                state.add_css_class("success");
             } else {
                 state.add_css_class("dim");
             }

@@ -142,9 +142,9 @@ pub fn status_text(status: &Status) -> (String, Option<&'static str>) {
     match &status.session {
         None | Some((_, SessionState::Closed { error: None })) => ("Stopped".into(), None),
         Some((_, SessionState::Connecting { step })) => (format!("{step}…"), None),
-        Some((_, SessionState::Connected)) => ("Running".into(), Some("running")),
+        Some((_, SessionState::Connected)) => ("Running".into(), Some("success")),
         Some((_, SessionState::Closed { error: Some(error) })) => {
-            (format!("Stopped: {error}"), Some("error-text"))
+            (format!("Stopped: {error}"), Some("error"))
         }
     }
 }
@@ -210,7 +210,7 @@ impl TunnelPage {
         ));
         stale.set_xalign(0.0);
         stale.set_wrap(true);
-        stale.add_css_class("warning-text");
+        stale.add_css_class("warning");
         stale.set_visible(false);
         page.append(&stale);
 
@@ -229,7 +229,7 @@ impl TunnelPage {
         page.append(&buttons);
 
         let autostart = gtk::CheckButton::with_label("Start with Burrow on this computer");
-        autostart.set_margin_top(6);
+        autostart.set_margin_top(8);
         page.append(&autostart);
 
         let tab = Rc::new(TunnelPage {
@@ -311,7 +311,7 @@ impl TunnelPage {
             set_text(value, text);
         }
         let state = &self.values[3];
-        for old in ["running", "error-text"] {
+        for old in ["success", "error"] {
             if Some(old) != class {
                 state.remove_css_class(old);
             }
@@ -374,10 +374,10 @@ pub fn edit(
         .default_width(420)
         .build();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
 
     let base = node.map(|n| n.props.clone()).unwrap_or_default();
     let (via, port, target) = Settings::from_props(&base);
@@ -498,13 +498,13 @@ pub fn edit(
     let error = gtk::Label::new(None);
     error.set_xalign(0.0);
     error.set_wrap(true);
-    error.add_css_class("error-text");
+    error.add_css_class("error");
     error.set_visible(false);
     content.append(&error);
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(8);
     let cancel = gtk::Button::with_label("Cancel");
     let ok = gtk::Button::with_label(if node.is_some() { "Save" } else { "Create" });
     ok.add_css_class("suggested-action");

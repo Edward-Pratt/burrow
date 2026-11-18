@@ -26,10 +26,10 @@ pub fn edit(
         .default_width(440)
         .build();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
     let props = node.map(|n| n.props.clone()).unwrap_or_default();
     let text = |key: &str| props.get(key).and_then(|v| v.as_str()).map(str::to_string);
 
@@ -85,14 +85,14 @@ pub fn edit(
     let error = gtk::Label::new(None);
     error.set_xalign(0.0);
     error.set_wrap(true);
-    error.add_css_class("error-text");
+    error.add_css_class("error");
     error.set_visible(hosts.is_empty());
     error.set_label("Add an SSH host first: a desktop is reached through one.");
     content.append(&error);
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(8);
     let cancel = gtk::Button::with_label("Cancel");
     let ok = gtk::Button::with_label(if node.is_some() { "Save" } else { "Create" });
     ok.add_css_class("suggested-action");

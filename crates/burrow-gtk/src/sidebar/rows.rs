@@ -69,7 +69,7 @@ pub(super) fn factory(state: &Rc<State>) -> gtk::SignalListItemFactory {
 
 impl Row {
     pub(super) fn new() -> Self {
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let icon = gtk::Image::new();
         content.append(&icon);
         let name = gtk::Label::new(None);
@@ -80,6 +80,7 @@ impl Row {
         let dot = gtk::Label::new(None);
         content.append(&dot);
         let running = gtk::Label::new(Some("running"));
+        running.add_css_class("success");
         running.add_css_class("running-badge");
         content.append(&running);
         // The expander draws the indent and, for folders, the disclosure
@@ -122,7 +123,7 @@ impl Row {
                 let Some(object) = row.and_downcast::<NodeObject>() else {
                     return;
                 };
-                let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                 content.add_css_class("sidebar-drag");
                 content.append(&gtk::Image::from_icon_name(&object.icon()));
                 content.append(&gtk::Label::new(Some(&object.name())));

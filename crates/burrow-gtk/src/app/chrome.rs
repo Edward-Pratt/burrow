@@ -157,7 +157,7 @@ pub(super) fn build(window: &gtk::ApplicationWindow, sender: &ComponentSender<Ap
 }
 
 pub(super) fn welcome() -> gtk::Box {
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     page.set_valign(gtk::Align::Center);
     page.set_halign(gtk::Align::Center);
     let title = gtk::Label::new(Some("Burrow"));
@@ -174,7 +174,7 @@ pub(super) fn welcome() -> gtk::Box {
         ("+", "Add a host, tunnel or database"),
         ("Right-click", "Open a host's files or monitor"),
     ] {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         let key = gtk::Label::new(Some(keys));
         key.add_css_class("kbd");
         key.set_width_chars(12);

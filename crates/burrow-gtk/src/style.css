@@ -11,13 +11,13 @@
 
 .sidebar row {
   padding: 4px 8px;
-  margin: 1px 6px;
+  margin: 1px 8px;
   border-radius: 6px;
 }
 
-/* 14 px per folder level, with the expander's 4 px spacing. */
+/* 16 px per folder level, with the expander's 4 px spacing. */
 .sidebar treeexpander indent {
-  -gtk-icon-size: 10px;
+  -gtk-icon-size: 12px;
 }
 
 /* The space a leaf gets in place of a folder's arrow, so names line up.
@@ -36,14 +36,14 @@
 /* A row being dragged. Opaque and square, since without a compositor the
    transparent parts of a drag icon show black. */
 .sidebar-drag {
-  padding: 6px 10px;
+  padding: 8px 12px;
   background-color: @theme_base_color;
   color: @theme_fg_color;
   border: 1px solid alpha(currentColor, 0.25);
 }
 
 .statusbar {
-  padding: 2px 10px;
+  padding: 2px 12px;
   font-size: smaller;
   border-top: 1px solid alpha(currentColor, 0.12);
 }
@@ -58,7 +58,7 @@
 
 .statusbar button.warning,
 .statusbar button.error {
-  padding: 0 6px;
+  padding: 0 8px;
   min-height: 0;
 }
 
@@ -70,7 +70,7 @@
 .props {
   font-family: monospace;
   margin-top: 8px;
-  padding: 8px 10px;
+  padding: 8px 12px;
   border-radius: 6px;
   background: alpha(currentColor, 0.05);
 }
@@ -92,21 +92,31 @@
   opacity: 0.5;
 }
 
-.running,
-.running-badge {
+/* A state's colour, under GNOME's class for what it means. Plain GTK
+   colours only label.error itself, so all three are set here. */
+label.success {
   color: #26a269;
+}
+
+label.warning {
+  color: #c88800;
+}
+
+label.error {
+  color: #e01b24;
+}
+
+/* Breeze draws .warning and .error as an info bar, with the window's
+   background behind the text, which shows as a patch in a list row.
+   .success is cleared too, so no theme can give a state a patch. */
+label.success,
+label.warning,
+label.error {
+  background: none;
 }
 
 .running-badge {
   font-size: smaller;
-}
-
-.error-text {
-  color: #e01b24;
-}
-
-.warning-text {
-  color: #c88800;
 }
 
 .dim {
@@ -114,7 +124,7 @@
 }
 
 .shell-bar {
-  padding: 2px 6px;
+  padding: 2px 8px;
 }
 
 .welcome-title {
@@ -126,7 +136,7 @@
 .kbd {
   font-family: monospace;
   font-size: smaller;
-  padding: 1px 6px;
+  padding: 1px 8px;
   border: 1px solid alpha(currentColor, 0.25);
   border-radius: 4px;
 }
@@ -156,7 +166,7 @@ popover.menu button {
 }
 
 .file-list row {
-  padding: 2px 6px;
+  padding: 2px 8px;
 }
 
 .transfer progressbar trough,
@@ -164,12 +174,21 @@ popover.menu button {
   min-height: 6px;
 }
 
+/* A monitor's meter over 90%, in the warning colour rather than the
+   theme's success colour for a full bar. Breeze paints every filled
+   block with a gradient image, which would cover that colour. */
+levelbar block.warning {
+  background-color: #c88800;
+  background-image: none;
+  border-color: #c88800;
+}
+
 .monitor-view {
   margin: 24px;
 }
 
 .unit-list row {
-  padding: 2px 6px;
+  padding: 2px 8px;
 }
 
 /* What a desktop doesn't cover, around a screen scaled to fit. */

@@ -28,11 +28,11 @@ pub fn prompt(
         .build();
     window.add_css_class("prompt");
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
 
     let text_label = gtk::Label::new(Some(label));
     text_label.set_xalign(0.0);
@@ -43,7 +43,7 @@ pub fn prompt(
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(8);
     let cancel = gtk::Button::with_label("Cancel");
     let ok = gtk::Button::with_label(confirm);
     ok.add_css_class("suggested-action");
@@ -206,11 +206,11 @@ pub fn answer(
         .resizable(false)
         .default_width(380)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
 
     let message = gtk::Label::new(Some(&prompt.message));
     message.set_xalign(0.0);
@@ -234,7 +234,7 @@ pub fn answer(
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(8);
     let cancel = gtk::Button::with_label("Cancel");
     let ok = gtk::Button::with_label("Continue");
     ok.add_css_class("suggested-action");
@@ -310,11 +310,11 @@ pub fn choose(
         .resizable(false)
         .default_width(420)
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
 
     let message = gtk::Label::new(Some(details));
     message.set_xalign(0.0);
@@ -334,7 +334,7 @@ pub fn choose(
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
-    buttons.set_margin_top(6);
+    buttons.set_margin_top(8);
     let cancel = gtk::Button::with_label("Cancel");
     let save = gtk::Button::with_label("Save");
     save.add_css_class("suggested-action");

@@ -21,7 +21,7 @@ impl Database {
             let popover = popover.clone();
             glib::idle_add_local_once(move || popover.unparent());
         });
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
         if entries.is_empty() {
             let empty = gtk::Label::new(Some("No queries yet."));
             empty.add_css_class("dim");
@@ -34,7 +34,7 @@ impl Database {
                 .map_or(0, |d| d.as_secs());
             let newest_first: Vec<HistoryEntry> = entries.into_iter().rev().collect();
             for entry in &newest_first {
-                let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                let line = gtk::Box::new(gtk::Orientation::Horizontal, 12);
                 let sql = gtk::Label::new(Some(&one_line(&entry.sql)));
                 sql.set_xalign(0.0);
                 sql.set_hexpand(true);
@@ -48,7 +48,7 @@ impl Database {
                 line.append(&sql);
                 if !entry.ok {
                     let failed = gtk::Label::new(Some("failed"));
-                    failed.add_css_class("error-text");
+                    failed.add_css_class("error");
                     line.append(&failed);
                 }
                 line.append(&when);

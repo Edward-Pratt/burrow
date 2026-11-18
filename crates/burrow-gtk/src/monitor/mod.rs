@@ -123,7 +123,7 @@ impl Monitor {
         }
         for alert in alerts {
             let text = label(&alert_text(&alert.kind));
-            text.add_css_class("warning-text");
+            text.add_css_class(alert_class(&alert.kind));
             text.set_wrap(true);
             self.alerts.append(&text);
         }
@@ -246,5 +246,31 @@ fn alert_text(kind: &AlertKind) -> String {
             format!("Container {}: {}", printable(container), printable(status))
         }
         AlertKind::AppFailed { app } => format!("PM2 app {} errored", printable(app)),
+    }
+}
+
+/// An alert's colour, by what it means: something down is an error, as a
+/// failed service is in the list below, and a resource running short is a
+/// warning.
+fn alert_class(kind: &AlertKind) -> &'static str {
+    match kind {
+        AlertKind::UnitFailed { .. }
+        | AlertKind::Unreachable { .. }
+        | AlertKind::ContainerFailed { .. }
+        | AlertKind::AppFailed { .. } => "error",
+        AlertKind::DiskFull { .. } | AlertKind::MemoryLow { .. } => "warning",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn down_is_an_error_and_short_is_a_warning() {
+        let (unit, error, percent) = (String::new(), String::new(), 93.0);
+        assert_eq!(alert_class(&AlertKind::UnitFailed { unit }), "error");
+        assert_eq!(alert_class(&AlertKind::Unreachable { error }), "error");
+        assert_eq!(alert_class(&AlertKind::MemoryLow { percent }), "warning");
     }
 }
