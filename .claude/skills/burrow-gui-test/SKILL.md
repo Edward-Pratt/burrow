@@ -30,7 +30,7 @@ $R/rig.sh stop                # always, at the end
 - **Dragging:** `x.py drag:X1,Y1,X2,Y2` presses, moves in steps and releases. Dropping a sidebar row on a folder row moves it there; below the rows moves it to the top level.
 - **Dialog buttons named like the dialog:** the dialog's frame matches first, so use `ui.py click Rename 1` or `ui.py click Move 1`.
 - **File chooser:** `x.py ctrl+l`, `ui.py set 1 /abs/path/`, then click the accept button ("Upload", "Download here").
-- **Layout:** the main window sits at (0,0), 1100×720. Sidebar rows are at y=81, 133, 185 and so on (52 px apart), x≈100; folder arrows at x≈25 plus 12 px per level. Over AT-SPI each row is a `button` named after the node. The file panel's path bar is at y≈130, and its first row at y≈209 with 26 px per row. Take a screenshot when unsure, because layouts shift: a warning line moves the buttons below it down.
+- **Layout:** the main window sits at (0,0), 1100×720. Sidebar rows are at y=78, 124, 170 and so on (46 px apart), x≈100; folder arrows at x≈29 plus 16 px per level. Over AT-SPI each row is a `button` named after the node. The file panel's path bar is at y≈129, and its first row at y≈208 with 22 px per row. Take a screenshot when unsure, because layouts shift: a warning line moves the buttons below it down.
 
 ## Rules
 
