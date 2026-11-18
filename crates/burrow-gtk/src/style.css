@@ -107,7 +107,9 @@ label.error {
 }
 
 /* Breeze draws .warning and .error as an info bar, with the window's
-   background behind the text, which shows as a patch in a list row. */
+   background behind the text, which shows as a patch in a list row.
+   .success is cleared too, so no theme can give a state a patch. */
+label.success,
 label.warning,
 label.error {
   background: none;
