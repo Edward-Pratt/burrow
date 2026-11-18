@@ -14,6 +14,7 @@ use relm4::gtk::{gio, glib};
 
 use crate::dialogs;
 use crate::files;
+use crate::motion;
 
 /// The binary to start in place of this one when the window has closed.
 static RESTART: OnceLock<PathBuf> = OnceLock::new();
@@ -95,8 +96,7 @@ struct Dialog {
 
 impl Dialog {
     fn busy(&self, message: &str) {
-        self.spinner.set_visible(true);
-        self.spinner.start();
+        motion::spin(&self.spinner);
         self.message.set_text(message);
         self.detail.set_text("");
         self.action.set_visible(false);
