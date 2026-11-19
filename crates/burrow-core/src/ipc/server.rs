@@ -21,14 +21,14 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use zeroize::Zeroize;
 
-use super::audit::{Rule, audit_entry, cap_strings, command_type, cut_error};
 use super::events::forward_events;
+
+mod mcp;
 use super::{
     BUILD, INVALID_PARAMS, Initialize, MAX_LINE, METHOD_NOT_FOUND, Role, SERVER_ERROR, ServerInfo,
     read_line,
 };
-use crate::api::{API_VERSION, Capability, Command, NodeId, Response, SessionId};
-use crate::class::McpRule;
+use crate::api::{API_VERSION, Command, Response, SessionId};
 use crate::engine::Core;
 use crate::error::{Error, Result};
 
@@ -321,127 +321,6 @@ impl Conn {
     }
 }
 
-impl Conn {
-    /// Runs a command for the MCP bridge if its grants allow it, and
-    /// records it in the audit log either way.
-    async fn execute_mcp(&self, command: Command) -> Result<Response> {
-        let rule = self.mcp_rule(&command);
-        let mut entry = audit_entry(&command, rule.as_ref().ok(), self.id);
-        let result = match rule {
-            Err(e) => Err(e),
-            Ok(Rule::Run) => self.core.execute(command).await,
-            Ok(Rule::ReadOnlyQuery) => match command {
-                Command::RunQuery {
-                    session,
-                    sql,
-                    limit,
-                } => self.core.run_query(session, sql, limit, true).await,
-                _ => unreachable!("only queries are read-only"),
-            },
-            Ok(Rule::MonitorWithoutInstall) => match command {
-                Command::OpenMonitor { node } => self
-                    .core
-                    .open_monitor(node, false)
-                    .map(|session| Response::Session { session }),
-                _ => unreachable!("only monitors install"),
-            },
-            Ok(Rule::GrantedAlerts) => {
-                self.core
-                    .execute(command)
-                    .await
-                    .map(|response| match response {
-                        Response::Alerts { alerts } => Response::Alerts {
-                            alerts: alerts
-                                .into_iter()
-                                .filter(|alert| {
-                                    self.core.granted(alert.node, Capability::MonitorRead)
-                                })
-                                .collect(),
-                        },
-                        other => other,
-                    })
-            }
-        };
-        entry["ok"] = json!(result.is_ok());
-        match &result {
-            // Commands on the session name only its id, so this ties them
-            // to the node it was opened on.
-            Ok(Response::Session { session }) => entry["session"] = json!(session),
-            Ok(_) => {}
-            Err(e) => entry["error"] = json!(cut_error(&e.to_string())),
-        }
-        cap_strings(&mut entry["command"]);
-        self.core.audit(&entry);
-        result
-    }
-
-    /// What the MCP bridge may run. The command's class says what it
-    /// needs (see [`McpRule`]); this checks that against the grants and
-    /// the sessions the bridge opened itself.
-    fn mcp_rule(&self, command: &Command) -> Result<Rule> {
-        match crate::class::of(command).mcp {
-            McpRule::Free => {}
-            McpRule::Node(node, capability) => self.require(node, capability)?,
-            McpRule::Session(session, capability) => {
-                let node = self.own_session(session)?;
-                self.require(node, capability)?;
-            }
-            McpRule::Query(session) => {
-                let node = self.own_session(session)?;
-                self.require(node, Capability::SqlRead)?;
-                if !self.core.granted(node, Capability::SqlWrite) {
-                    return Ok(Rule::ReadOnlyQuery);
-                }
-            }
-            McpRule::Monitor(node) => {
-                self.require(node, Capability::MonitorRead)?;
-                return Ok(Rule::MonitorWithoutInstall);
-            }
-            McpRule::Alerts => return Ok(Rule::GrantedAlerts),
-            McpRule::Close(session) => {
-                if self.own_session(session).is_err() {
-                    let tunnel = self.core.sessions().list().into_iter().find(|i| {
-                        i.session == session && i.kind == crate::api::SessionKind::Tunnel
-                    });
-                    match tunnel {
-                        Some(info) => self.require(info.node, Capability::Tunnel)?,
-                        None => return Err(denied("close a session it did not open")),
-                    }
-                }
-            }
-            McpRule::Denied => return Err(denied(&format!("run {}", command_type(command)))),
-        }
-        Ok(Rule::Run)
-    }
-
-    fn require(&self, node: NodeId, capability: Capability) -> Result<()> {
-        if self.core.granted(node, capability) {
-            return Ok(());
-        }
-        Err(denied(&format!(
-            "use {capability} on node {node}; the user can grant it in Burrow"
-        )))
-    }
-
-    /// The node of a running session this client opened.
-    fn own_session(&self, session: SessionId) -> Result<NodeId> {
-        if !self.owned.lock().unwrap().contains(&session) {
-            return Err(denied("use a session it did not open"));
-        }
-        self.core
-            .sessions()
-            .list()
-            .into_iter()
-            .find(|info| info.session == session)
-            .map(|info| info.node)
-            .ok_or(Error::SessionNotFound(session))
-    }
-}
-
-fn denied(what: &str) -> Error {
-    Error::PermissionDenied(format!("the MCP bridge may not {what}"))
-}
-
 /// Writes replies and events first, and terminal output when there are
 /// none waiting.
 async fn write_all(
@@ -469,58 +348,4 @@ fn parse<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, Failure> {
 
 fn failed(error: Error) -> Failure {
     (SERVER_ERROR, error.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use data_encoding::HEXLOWER;
-    use sha2::{Digest, Sha256};
-
-    use super::*;
-    use crate::ipc::audit::AUDIT_FIELD;
-
-    #[test]
-    fn an_audit_line_keeps_the_ends_and_hash_of_long_strings() {
-        let sql = format!("select '{}'", "é".repeat(1 << 20));
-        let command = Command::RunQuery {
-            session: SessionId(1),
-            sql: sql.clone(),
-            limit: None,
-        };
-        let mut entry = audit_entry(&command, Some(&Rule::ReadOnlyQuery), 1);
-        cap_strings(&mut entry["command"]);
-        assert!(entry.to_string().len() < 2 * AUDIT_FIELD);
-        let kept = &entry["command"]["sql"];
-        assert!(kept["head"].as_str().unwrap().starts_with("select 'éé"));
-        assert!(kept["tail"].as_str().unwrap().ends_with("éé'"));
-        assert_eq!(kept["bytes"], sql.len());
-        assert_eq!(kept["sha256"], HEXLOWER.encode(&Sha256::digest(&sql)));
-
-        let error = cut_error(&"x".repeat(AUDIT_FIELD + 1));
-        assert!(error.ends_with("… (4097 bytes)"));
-        assert_eq!(cut_error("short"), "short");
-
-        // Contents are kept by size and hash alone.
-        let command = Command::WriteFile {
-            session: SessionId(1),
-            path: "notes".into(),
-            data: b"abc".to_vec(),
-            overwrite: false,
-            expect: None,
-        };
-        let entry = audit_entry(&command, Some(&Rule::Run), 1);
-        assert_eq!(
-            entry["command"]["data"],
-            json!({
-                "bytes": 3,
-                "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-            })
-        );
-
-        // Short strings, and everything else, are left as they were.
-        let mut entry = audit_entry(&Command::ListNodes, Some(&Rule::Run), 2);
-        let before = entry.clone();
-        cap_strings(&mut entry["command"]);
-        assert_eq!(entry, before);
-    }
 }

@@ -115,3 +115,57 @@ pub(super) fn cut_error(text: &str) -> String {
 pub(super) fn sha256(bytes: &[u8]) -> String {
     HEXLOWER.encode(&Sha256::digest(bytes))
 }
+
+#[cfg(test)]
+mod tests {
+    use data_encoding::HEXLOWER;
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+    use crate::api::{Command, SessionId};
+
+    #[test]
+    fn an_audit_line_keeps_the_ends_and_hash_of_long_strings() {
+        let sql = format!("select '{}'", "é".repeat(1 << 20));
+        let command = Command::RunQuery {
+            session: SessionId(1),
+            sql: sql.clone(),
+            limit: None,
+        };
+        let mut entry = audit_entry(&command, Some(&Rule::ReadOnlyQuery), 1);
+        cap_strings(&mut entry["command"]);
+        assert!(entry.to_string().len() < 2 * AUDIT_FIELD);
+        let kept = &entry["command"]["sql"];
+        assert!(kept["head"].as_str().unwrap().starts_with("select 'éé"));
+        assert!(kept["tail"].as_str().unwrap().ends_with("éé'"));
+        assert_eq!(kept["bytes"], sql.len());
+        assert_eq!(kept["sha256"], HEXLOWER.encode(&Sha256::digest(&sql)));
+
+        let error = cut_error(&"x".repeat(AUDIT_FIELD + 1));
+        assert!(error.ends_with("… (4097 bytes)"));
+        assert_eq!(cut_error("short"), "short");
+
+        // Contents are kept by size and hash alone.
+        let command = Command::WriteFile {
+            session: SessionId(1),
+            path: "notes".into(),
+            data: b"abc".to_vec(),
+            overwrite: false,
+            expect: None,
+        };
+        let entry = audit_entry(&command, Some(&Rule::Run), 1);
+        assert_eq!(
+            entry["command"]["data"],
+            json!({
+                "bytes": 3,
+                "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            })
+        );
+
+        // Short strings, and everything else, are left as they were.
+        let mut entry = audit_entry(&Command::ListNodes, Some(&Rule::Run), 2);
+        let before = entry.clone();
+        cap_strings(&mut entry["command"]);
+        assert_eq!(entry, before);
+    }
+}
