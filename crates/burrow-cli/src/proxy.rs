@@ -4,14 +4,15 @@
 //!
 //! The key's `authorized_keys` line fixes the role, so the proxy checks the
 //! first line is `initialize` with that role before anything else, the
-//! daemon included, is touched. Only the first line: the daemon answers
-//! `initialize` before reading on, and closes a connection whose
-//! `initialize` failed, so a later line can't change the role.
+//! daemon included, is touched. Then it holds back what the client sends
+//! until the daemon has accepted that `initialize`, and gives up if it
+//! didn't, so no later line can ask for another role, whatever the
+//! daemon's build.
 
 use std::future::Future;
 use std::process::ExitCode;
 
-use burrow_api::rpc::{Initialize, Role, read_line};
+use burrow_api::rpc::{Initialize, MAX_LINE, Role, read_line};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -66,13 +67,15 @@ where
         Ok(daemon) => daemon,
         Err(message) => return Err(refuse(&mut output, id, message).await),
     };
-    let (mut from_daemon, mut to_daemon) = tokio::io::split(daemon);
+    let (from_daemon, mut to_daemon) = tokio::io::split(daemon);
+    let mut from_daemon = BufReader::new(from_daemon);
     // What was checked, written out again, rather than the client's own
     // bytes: a line with a key twice could otherwise read one way here
     // and another way in the daemon.
     let hello = json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": hello});
     let sent = to_daemon.write_all(format!("{hello}\n").as_bytes()).await;
     sent.map_err(|e| format!("could not write to burrowd: {e}"))?;
+    accepted(&mut from_daemon, &mut output, &id).await?;
 
     let upstream = async {
         // The client closing its side ends the daemon's connection, which
@@ -89,6 +92,40 @@ where
         () = upstream => {}
     }
     Ok(())
+}
+
+/// Passes the daemon's lines on until its answer to `initialize`, which
+/// has `id`. An error there is the proxy's end too.
+async fn accepted<D, O>(from_daemon: &mut D, output: &mut O, id: &Value) -> Result<(), String>
+where
+    D: tokio::io::AsyncBufRead + Unpin,
+    O: AsyncWrite + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        match read_line(from_daemon, &mut line, MAX_LINE).await {
+            Ok(Some(())) => {}
+            Ok(None) => return Err("burrowd closed the connection".to_string()),
+            Err(e) => return Err(format!("burrowd {e}")),
+        }
+        line.push(b'\n');
+        let written = output.write_all(&line).await;
+        written.map_err(|e| format!("could not write to the client: {e}"))?;
+        let Ok(message) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if message.get("method").is_some() || message.get("id") != Some(id) {
+            continue;
+        }
+        output.flush().await.map_err(|e| e.to_string())?;
+        return match message.get("error") {
+            None => Ok(()),
+            Some(error) => {
+                let error = error["message"].as_str().unwrap_or("no reason given");
+                Err(format!("burrowd refused initialize: {error}"))
+            }
+        };
+    }
 }
 
 #[derive(Deserialize)]

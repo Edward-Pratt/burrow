@@ -471,9 +471,9 @@ command="/home/<user>/.local/bin/burrow proxy --role mobile",no-port-forwarding,
 The path is absolute because sshd runs a forced command through the user's shell non-interactively, where `~/.local/bin` is usually not on `PATH`.
 
 - **The first line must be `initialize`,** a request with an id and the role the proxy was given. Anything else is answered with a JSON-RPC error (code `-32600`) and the proxy exits, before it finds or starts the daemon. The first line may be up to 64 KiB.
-- **Then it passes bytes on:** it finds or starts the daemon as the window does, sends it the `initialize` it checked, written out again from what it read so the daemon can't read the line differently, and passes everything else both ways unchanged. The daemon answers `initialize` before reading on and closes a connection whose `initialize` failed, so the role can't change afterwards.
+- **Then it passes bytes on:** it finds or starts the daemon as the window does and sends it the `initialize` it checked, written out again from what it read so the daemon can't read the line differently. It holds back the rest of what the client sends until the daemon has answered that `initialize`, and exits if the answer is an error, so no later line can ask for another role, whatever the daemon's build. After that it passes everything both ways unchanged.
 - **The same trust boundary:** the process on the socket is the proxy, running as the user, so `SO_PEERCRED` still holds and the daemon listens on no network.
-- **A daemon from another build** is replaced when nothing runs in it, as for the window. Otherwise the proxy uses it, and `build` in the answer to `initialize` says so.
+- **A daemon from another build** is replaced when nothing runs in it, as for the window. Otherwise the proxy uses it, and `build` in the answer to `initialize` says so. A daemon from before the `mobile` role refuses that role, so a phone can't connect until it stops.
 - **It ends** when the daemon closes the connection. The client closing its side makes the daemon do that, and the client's sessions close with it.
 
 ## MCP bridge

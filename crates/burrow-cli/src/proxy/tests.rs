@@ -95,13 +95,31 @@ async fn the_daemon_gets_initialize_as_checked_and_then_every_byte() {
     assert_eq!(sent["method"], "initialize");
     assert_eq!(sent["id"], 1);
     assert_eq!(sent["params"]["role"], "mobile");
+
+    // Nothing more reaches the daemon until it has answered; an event
+    // before the answer goes through.
+    let early = tokio::time::timeout(Duration::from_millis(100), daemon.read_line(&mut line));
+    assert!(
+        early.await.is_err(),
+        "sent on before initialize was answered"
+    );
+    let event = "{\"jsonrpc\":\"2.0\",\"method\":\"resync\"}\n";
+    let answer = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
+    daemon
+        .write_all(format!("{event}{answer}").as_bytes())
+        .await
+        .unwrap();
+    let mut lines = phone_read.lines();
+    for expected in [event, answer] {
+        let got = tokio::time::timeout(WAIT, lines.next_line()).await.unwrap();
+        assert_eq!(format!("{}\n", got.unwrap().unwrap()), expected);
+    }
     line.clear();
     daemon.read_line(&mut line).await.unwrap();
     assert_eq!(line.trim_end(), next);
 
     let reply = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"type\":\"nodes\",\"nodes\":[]}}\n";
     daemon.write_all(reply.as_bytes()).await.unwrap();
-    let mut lines = phone_read.lines();
     let got = tokio::time::timeout(WAIT, lines.next_line()).await.unwrap();
     assert_eq!(format!("{}\n", got.unwrap().unwrap()), reply);
 
@@ -114,4 +132,35 @@ async fn the_daemon_gets_initialize_as_checked_and_then_every_byte() {
     drop(daemon);
     let done = tokio::time::timeout(WAIT, relaying).await.unwrap();
     done.unwrap().unwrap();
+}
+
+/// A daemon from before it closed refused connections would leave one
+/// open for another `initialize`, so the proxy gives up itself.
+#[tokio::test]
+async fn a_refused_initialize_ends_the_proxy_before_anything_else_is_sent() {
+    let (proxy_out, mut phone_reads) = tokio::io::duplex(1 << 16);
+    let (daemon, proxy_daemon) = tokio::io::duplex(1 << 16);
+    let next = format!("{}\n", hello("gui"));
+    let sent = format!("{}\n{next}", hello("mobile"));
+    let relaying = tokio::spawn(async move {
+        let input = sent.as_bytes();
+        relay(Role::Mobile, input, proxy_out, async { Ok(proxy_daemon) }).await
+    });
+    let mut daemon = BufReader::new(daemon);
+    let mut line = String::new();
+    daemon.read_line(&mut line).await.unwrap();
+    let error = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"needs API 1"}}"#;
+    daemon
+        .write_all(format!("{error}\n").as_bytes())
+        .await
+        .unwrap();
+
+    let done = tokio::time::timeout(WAIT, relaying).await.unwrap().unwrap();
+    assert_eq!(done.unwrap_err(), "burrowd refused initialize: needs API 1");
+    let mut told = String::new();
+    phone_reads.read_to_string(&mut told).await.unwrap();
+    assert_eq!(told, format!("{error}\n"));
+    // The proxy has dropped its end, and never sent the second line.
+    line.clear();
+    assert_eq!(daemon.read_line(&mut line).await.unwrap(), 0);
 }
