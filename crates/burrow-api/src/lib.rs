@@ -1,11 +1,15 @@
-//! The command/event API. These types are the contract between the core and
-//! every client, so changes here must bump [`API_VERSION`] when they are not
-//! backwards compatible. All of them serialize to JSON for out-of-process
-//! clients (addons, CLI, MCP bridge).
+//! Burrow's command/event API: the contract between the core and every
+//! client. Changes here must bump [`API_VERSION`] when they are not
+//! backwards compatible. All of the types serialize to JSON for clients in
+//! other processes (addons, the CLI, the MCP bridge, the phone).
+//!
+//! This crate is apart from burrow-core so that a client which isn't on
+//! the Linux desktop can depend on it: it needs no D-Bus, Secret Service or
+//! XDG folders.
 //!
 //! The types are grouped by what they describe: `nodes`, `sessions`,
 //! `addons`, `grants`, `hosts` and `db`, then `command`, `response` and
-//! `event`. All of them are reached here, as `crate::api::Name`.
+//! `event`. All of them are reached here, as `burrow_api::Name`.
 
 mod addons;
 mod command;

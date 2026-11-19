@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+burrow-api = { version = "0.1.2", path = "../burrow-api" }
 burrow-agent = { version = "0.1.2", path = "../burrow-agent" }
 data-encoding = "2.11"
 des = "0.9"

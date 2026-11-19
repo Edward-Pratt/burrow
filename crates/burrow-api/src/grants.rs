@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::{Node, NodeId};
 
 /// A tunnel's settings as a client showed them, for
-/// [`Command::SetAutostart`](crate::api::Command::SetAutostart). It covers everything an autostart consent is
+/// [`Command::SetAutostart`](crate::Command::SetAutostart). It covers everything an autostart consent is
 /// pinned to: the tunnel's props, and the name and props of the SSH host it
 /// goes through, whose alias falls back to its name.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -29,7 +29,7 @@ pub enum Capability {
     SqlRead,
     /// SQL that writes.
     SqlWrite,
-    /// [`Command::Exec`](crate::api::Command::Exec) on an `ssh-host` node.
+    /// [`Command::Exec`](crate::Command::Exec) on an `ssh-host` node.
     Exec,
     /// Listing and reading files on an `ssh-host` node.
     FilesRead,
@@ -68,7 +68,7 @@ impl fmt::Display for Capability {
     }
 }
 
-/// What the MCP bridge may do on one node, as [`Command::ListGrants`](crate::api::Command::ListGrants)
+/// What the MCP bridge may do on one node, as [`Command::ListGrants`](crate::Command::ListGrants)
 /// reports it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
@@ -80,7 +80,7 @@ pub struct Grant {
 }
 
 /// A node as a client showed it when asking to grant it, for
-/// [`Command::SetGrant`](crate::api::Command::SetGrant): its name and props, and those of the node it goes
+/// [`Command::SetGrant`](crate::Command::SetGrant): its name and props, and those of the node it goes
 /// through (`props.via`), if any.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GrantShown {

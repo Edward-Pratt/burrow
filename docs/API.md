@@ -1,8 +1,8 @@
 # Burrow core API
 
-Every client drives `burrow-core` through one API: the GTK UI, addons, `burrow-cli` and the MCP bridge. In-process clients call `Core::execute(Command)` and `Core::subscribe()`. Out-of-process clients use the same types as JSON-RPC over a Unix socket; see [Socket](#socket).
+Every client drives `burrow-core` through one API: the GTK UI, addons, `burrow-cli` and the MCP bridge. In-process clients call `Core::execute(Command)` and `Core::subscribe()`. Out-of-process clients use the same types as JSON-RPC over a Unix socket; see [Socket](#socket). The types are in the `burrow-api` crate, which needs nothing from the Linux desktop, so a client elsewhere, such as a phone, can use them too.
 
-API version: **1** (`burrow_core::API_VERSION`). Breaking changes bump it.
+API version: **1** (`burrow_api::API_VERSION`). Breaking changes bump it.
 
 ## Nodes
 

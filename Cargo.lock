@@ -452,6 +452,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "burrow-api"
+version = "0.1.2"
+dependencies = [
+ "burrow-agent",
+ "data-encoding",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "burrow-cli"
 version = "0.1.2"
 dependencies = [
@@ -470,6 +484,7 @@ name = "burrow-core"
 version = "0.1.2"
 dependencies = [
  "burrow-agent",
+ "burrow-api",
  "data-encoding",
  "des",
  "directories",

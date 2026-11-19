@@ -73,7 +73,7 @@ pub enum Event {
     AlertCleared {
         alert: Alert,
     },
-    /// The session waits for [`Command::AnswerPrompt`](crate::api::Command::AnswerPrompt).
+    /// The session waits for [`Command::AnswerPrompt`](crate::Command::AnswerPrompt).
     PromptRequested {
         session: SessionId,
         prompt: Prompt,
