@@ -94,6 +94,27 @@ impl GrantShown {
     /// What to show of `node`, looking the node it goes through up in
     /// `nodes`.
     pub fn of(node: &Node, nodes: &[Node]) -> GrantShown {
-        crate::grants::shown(&|id| nodes.iter().find(|n| n.id == id).cloned(), node)
+        GrantShown::looked_up(node, &|id| nodes.iter().find(|n| n.id == id).cloned())
+    }
+
+    /// What to show of `node`, with `lookup` finding the node its
+    /// `props.via` names. This is also what a grant is pinned to.
+    pub fn looked_up(node: &Node, lookup: &impl Fn(NodeId) -> Option<Node>) -> GrantShown {
+        let via = node
+            .props
+            .get("via")
+            .and_then(|via| via.as_str()?.parse().ok())
+            .and_then(|via| lookup(NodeId(via)));
+        GrantShown {
+            name: node.name.clone(),
+            props: node.props.clone(),
+            via: via.map(|via| {
+                Box::new(GrantShown {
+                    name: via.name,
+                    props: via.props,
+                    via: None,
+                })
+            }),
+        }
     }
 }

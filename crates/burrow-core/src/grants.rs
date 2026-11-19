@@ -85,7 +85,7 @@ impl Grants {
             return self.0.remove(&node.id);
         }
         for capability in &capabilities {
-            if !capability.fits(&node.kind) {
+            if !fits(*capability, &node.kind) {
                 return Err(Error::invalid(
                     "capabilities",
                     format!("{capability} does not apply to a {} node", node.kind),
@@ -109,40 +109,22 @@ impl Grants {
     }
 }
 
-impl Capability {
-    /// Whether the capability means anything on a node of `kind`.
-    fn fits(self, kind: &str) -> bool {
-        match self {
-            Capability::SqlRead | Capability::SqlWrite => kind == POSTGRES_KIND,
-            Capability::Exec
-            | Capability::FilesRead
-            | Capability::FilesWrite
-            | Capability::MonitorRead => kind == SSH_HOST_KIND,
-            Capability::Tunnel => kind == SSH_TUNNEL_KIND,
-        }
+/// Whether `capability` means anything on a node of `kind`.
+fn fits(capability: Capability, kind: &str) -> bool {
+    match capability {
+        Capability::SqlRead | Capability::SqlWrite => kind == POSTGRES_KIND,
+        Capability::Exec
+        | Capability::FilesRead
+        | Capability::FilesWrite
+        | Capability::MonitorRead => kind == SSH_HOST_KIND,
+        Capability::Tunnel => kind == SSH_TUNNEL_KIND,
     }
 }
 
 /// What a client shows of `node` when asking to grant it, and what the
 /// grant is pinned to.
 pub(crate) fn shown(lookup: &impl Lookup, node: &Node) -> GrantShown {
-    GrantShown {
-        name: node.name.clone(),
-        props: node.props.clone(),
-        via: via(lookup, node).map(|via| {
-            Box::new(GrantShown {
-                name: via.name,
-                props: via.props,
-                via: None,
-            })
-        }),
-    }
-}
-
-/// The node `node` goes through, when its `props.via` names one.
-fn via(lookup: &impl Lookup, node: &Node) -> Option<Node> {
-    let via = node.props.get("via")?.as_str()?.parse().ok()?;
-    lookup(NodeId(via))
+    GrantShown::looked_up(node, lookup)
 }
 
 pub(crate) fn fingerprint(lookup: &impl Lookup, node: &Node) -> String {

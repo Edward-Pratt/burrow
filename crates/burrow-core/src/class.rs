@@ -64,103 +64,99 @@ pub(crate) enum AddonRule<'a> {
     Denied,
 }
 
-impl Command {
-    pub(crate) fn class(&self) -> Class<'_> {
-        use Capability::*;
-        // Every arm starts from a command that opens nothing, changes
-        // nothing, and is refused to the MCP bridge and to addons.
-        let base = Class {
-            opens_session: false,
-            changes_tree: false,
-            mcp: McpRule::Denied,
-            addon: AddonRule::Denied,
-        };
-        let mcp = |mcp| Class { mcp, ..base };
-        let changes = |addon| Class {
-            changes_tree: true,
-            addon,
+pub(crate) fn of(command: &Command) -> Class<'_> {
+    use Capability::*;
+    // Every arm starts from a command that opens nothing, changes
+    // nothing, and is refused to the MCP bridge and to addons.
+    let base = Class {
+        opens_session: false,
+        changes_tree: false,
+        mcp: McpRule::Denied,
+        addon: AddonRule::Denied,
+    };
+    let mcp = |mcp| Class { mcp, ..base };
+    let changes = |addon| Class {
+        changes_tree: true,
+        addon,
+        ..base
+    };
+    let opens = |mcp| Class {
+        opens_session: true,
+        mcp,
+        ..base
+    };
+    match command {
+        Command::Version => Class {
+            mcp: McpRule::Free,
+            addon: AddonRule::Free,
             ..base
-        };
-        let opens = |mcp| Class {
-            opens_session: true,
-            mcp,
+        },
+        Command::ListNodes | Command::GetNode { .. } => Class {
+            mcp: McpRule::Free,
+            addon: AddonRule::ReadNodes,
             ..base
-        };
-        match self {
-            Command::Version => Class {
-                mcp: McpRule::Free,
-                addon: AddonRule::Free,
-                ..base
-            },
-            Command::ListNodes | Command::GetNode { .. } => Class {
-                mcp: McpRule::Free,
-                addon: AddonRule::ReadNodes,
-                ..base
-            },
-            Command::CreateNode { kind, .. } => changes(AddonRule::CreateNode(kind)),
-            Command::UpdateNode { id, .. }
-            | Command::MoveNode { id, .. }
-            | Command::DeleteNode { id, .. } => changes(AddonRule::ChangeNode(*id)),
-            Command::SetSecret { .. }
-            | Command::ClearSecret { .. }
-            | Command::ListProblems
-            | Command::ReloadConfig
-            | Command::CheckSshInclude { .. }
-            | Command::AddSshHost { .. } => base,
+        },
+        Command::CreateNode { kind, .. } => changes(AddonRule::CreateNode(kind)),
+        Command::UpdateNode { id, .. }
+        | Command::MoveNode { id, .. }
+        | Command::DeleteNode { id, .. } => changes(AddonRule::ChangeNode(*id)),
+        Command::SetSecret { .. }
+        | Command::ClearSecret { .. }
+        | Command::ListProblems
+        | Command::ReloadConfig
+        | Command::CheckSshInclude { .. }
+        | Command::AddSshHost { .. } => base,
 
-            Command::OpenTerminal { .. } => opens(McpRule::Denied),
-            Command::WriteTerminal { .. }
-            | Command::ResizeTerminal { .. }
-            | Command::AnswerPrompt { .. } => base,
-            Command::CloseSession { session } => mcp(McpRule::Close(*session)),
-            Command::ListSessions => mcp(McpRule::Free),
-            Command::StartTunnel { node } => mcp(McpRule::Node(*node, Tunnel)),
+        Command::OpenTerminal { .. } => opens(McpRule::Denied),
+        Command::WriteTerminal { .. }
+        | Command::ResizeTerminal { .. }
+        | Command::AnswerPrompt { .. } => base,
+        Command::CloseSession { session } => mcp(McpRule::Close(*session)),
+        Command::ListSessions => mcp(McpRule::Free),
+        Command::StartTunnel { node } => mcp(McpRule::Node(*node, Tunnel)),
 
-            Command::OpenFiles { node } => opens(McpRule::Node(*node, FilesRead)),
-            Command::ListDir { session, .. } | Command::ReadFile { session, .. } => {
-                mcp(McpRule::Session(*session, FilesRead))
-            }
-            Command::MakeDir { session, .. }
-            | Command::RenamePath { session, .. }
-            | Command::RemovePath { session, .. }
-            | Command::WriteFile { session, .. } => mcp(McpRule::Session(*session, FilesWrite)),
-            Command::Download { .. } | Command::Upload { .. } | Command::CancelTransfer { .. } => {
-                base
-            }
-            // No more than `exec` could run.
-            Command::Exec { node, .. } | Command::ControlService { node, .. } => {
-                mcp(McpRule::Node(*node, Exec))
-            }
-
-            Command::OpenMonitor { node } => opens(McpRule::Monitor(*node)),
-            Command::MonitorHistory { session } => mcp(McpRule::Session(*session, MonitorRead)),
-            Command::MonitorTrend { node, .. } => mcp(McpRule::Node(*node, MonitorRead)),
-            Command::ListMonitoring => base,
-            Command::ListAlerts => mcp(McpRule::Alerts),
-            Command::SetMonitoring { .. } => changes(AddonRule::Denied),
-            Command::ListAutostart => base,
-            Command::SetAutostart { .. } => changes(AddonRule::Denied),
-            Command::ListGrants => mcp(McpRule::Free),
-            Command::SetGrant { .. } => changes(AddonRule::Denied),
-
-            Command::OpenDatabase { node } => opens(McpRule::Node(*node, SqlRead)),
-            // The bridge has no way to see a screen.
-            Command::OpenVnc { .. } => opens(McpRule::Denied),
-            Command::RunQuery { session, .. } => mcp(McpRule::Query(*session)),
-            Command::CancelQuery { session } | Command::ListSchema { session } => {
-                mcp(McpRule::Session(*session, SqlRead))
-            }
-            Command::SetReadOnly { session, .. } => mcp(McpRule::Session(*session, SqlWrite)),
-            Command::ExportQuery { .. }
-            | Command::ListHistory { .. }
-            | Command::ClearHistory { .. } => base,
-
-            Command::ListAddons
-            | Command::ApproveAddon { .. }
-            | Command::RevokeAddon { .. }
-            | Command::OpenView { .. }
-            | Command::InvokeAction { .. } => base,
+        Command::OpenFiles { node } => opens(McpRule::Node(*node, FilesRead)),
+        Command::ListDir { session, .. } | Command::ReadFile { session, .. } => {
+            mcp(McpRule::Session(*session, FilesRead))
         }
+        Command::MakeDir { session, .. }
+        | Command::RenamePath { session, .. }
+        | Command::RemovePath { session, .. }
+        | Command::WriteFile { session, .. } => mcp(McpRule::Session(*session, FilesWrite)),
+        Command::Download { .. } | Command::Upload { .. } | Command::CancelTransfer { .. } => base,
+        // No more than `exec` could run.
+        Command::Exec { node, .. } | Command::ControlService { node, .. } => {
+            mcp(McpRule::Node(*node, Exec))
+        }
+
+        Command::OpenMonitor { node } => opens(McpRule::Monitor(*node)),
+        Command::MonitorHistory { session } => mcp(McpRule::Session(*session, MonitorRead)),
+        Command::MonitorTrend { node, .. } => mcp(McpRule::Node(*node, MonitorRead)),
+        Command::ListMonitoring => base,
+        Command::ListAlerts => mcp(McpRule::Alerts),
+        Command::SetMonitoring { .. } => changes(AddonRule::Denied),
+        Command::ListAutostart => base,
+        Command::SetAutostart { .. } => changes(AddonRule::Denied),
+        Command::ListGrants => mcp(McpRule::Free),
+        Command::SetGrant { .. } => changes(AddonRule::Denied),
+
+        Command::OpenDatabase { node } => opens(McpRule::Node(*node, SqlRead)),
+        // The bridge has no way to see a screen.
+        Command::OpenVnc { .. } => opens(McpRule::Denied),
+        Command::RunQuery { session, .. } => mcp(McpRule::Query(*session)),
+        Command::CancelQuery { session } | Command::ListSchema { session } => {
+            mcp(McpRule::Session(*session, SqlRead))
+        }
+        Command::SetReadOnly { session, .. } => mcp(McpRule::Session(*session, SqlWrite)),
+        Command::ExportQuery { .. }
+        | Command::ListHistory { .. }
+        | Command::ClearHistory { .. } => base,
+
+        Command::ListAddons
+        | Command::ApproveAddon { .. }
+        | Command::RevokeAddon { .. }
+        | Command::OpenView { .. }
+        | Command::InvokeAction { .. } => base,
     }
 }
 
@@ -191,13 +187,13 @@ mod tests {
                 path: "/tmp/a.csv".into(),
             },
         ] {
-            let class = command.class();
+            let class = of(&command);
             assert_eq!(class.mcp, McpRule::Denied, "{command:?}");
             assert_eq!(class.addon, AddonRule::Denied, "{command:?}");
         }
         // A tunnel belongs to the daemon and outlives the client.
         let node = NodeId::new();
-        assert!(!Command::StartTunnel { node }.class().opens_session);
-        assert!(Command::OpenFiles { node }.class().opens_session);
+        assert!(!of(&Command::StartTunnel { node }).opens_session);
+        assert!(of(&Command::OpenFiles { node }).opens_session);
     }
 }

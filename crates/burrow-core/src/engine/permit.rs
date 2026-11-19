@@ -33,7 +33,7 @@ impl Inner {
                 )))
             }
         };
-        match command.class().addon {
+        match crate::class::of(command).addon {
             AddonRule::Free => Ok(()),
             AddonRule::ReadNodes => need(Permission::NodesRead),
             AddonRule::CreateNode(kind) => {

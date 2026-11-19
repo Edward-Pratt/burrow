@@ -219,7 +219,7 @@ impl Conn {
         match method {
             "execute" => {
                 let command: Command = parse(params)?;
-                let owns = command.class().opens_session;
+                let owns = crate::class::of(&command).opens_session;
                 let response = match role {
                     Role::Gui | Role::Cli => self.core.execute(command).await,
                     // Nobody at the bridge can answer a session's questions. The
@@ -379,7 +379,7 @@ impl Conn {
     /// needs (see [`McpRule`]); this checks that against the grants and
     /// the sessions the bridge opened itself.
     fn mcp_rule(&self, command: &Command) -> Result<Rule> {
-        match command.class().mcp {
+        match crate::class::of(command).mcp {
             McpRule::Free => {}
             McpRule::Node(node, capability) => self.require(node, capability)?,
             McpRule::Session(session, capability) => {
