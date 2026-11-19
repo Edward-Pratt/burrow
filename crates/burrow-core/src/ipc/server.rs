@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use data_encoding::BASE64;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -24,6 +23,7 @@ use zeroize::Zeroize;
 use super::events::forward_events;
 
 mod mcp;
+mod output;
 use super::{
     BUILD, INVALID_PARAMS, Initialize, MAX_LINE, METHOD_NOT_FOUND, Role, SERVER_ERROR, ServerInfo,
     read_line,
@@ -280,44 +280,6 @@ impl Conn {
             addons_dir: self.core.addons_dir(),
         };
         Ok(serde_json::to_value(info).unwrap_or_default())
-    }
-
-    /// Passes a terminal's output on as `output` notifications, then
-    /// `output_ended`. Both go through the output queue so the end never
-    /// overtakes the last bytes.
-    fn take_output(&self, session: SessionId) -> Result<()> {
-        let mut stream = self.core.take_output(session)?;
-        let output = self.output.clone();
-        let mut alive = self.alive.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                let message = tokio::select! {
-                    data = stream.recv() => match data {
-                        Some(data) => json!({
-                            "jsonrpc": "2.0",
-                            "method": "output",
-                            "params": {"session": session, "data": BASE64.encode(&data)},
-                        }),
-                        None => break,
-                    },
-                    _ = alive.changed() => return,
-                };
-                if output.send(message.to_string()).await.is_err() {
-                    return;
-                }
-            }
-            let ended = json!({
-                "jsonrpc": "2.0",
-                "method": "output_ended",
-                "params": {"session": session},
-            });
-            let _ = output.send(ended.to_string()).await;
-        });
-        self.forwarders
-            .lock()
-            .unwrap()
-            .insert(session, task.abort_handle());
-        Ok(())
     }
 }
 
