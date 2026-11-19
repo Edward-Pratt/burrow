@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::{Command, NodeId, Response, SSH_HOST_KIND};
 use relm4::gtk;
 use relm4::gtk::prelude::*;

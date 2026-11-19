@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::{Command, Event, NodeId, Response, SessionId, SessionState, TerminalRun};
 use relm4::ComponentSender;
 use vte4::TerminalExt;

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::{AddonInfo, Alert, Node, NodeId, Problem, SessionId};
 use relm4::gtk::glib;
 use relm4::gtk::prelude::*;

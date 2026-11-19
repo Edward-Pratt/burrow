@@ -526,6 +526,7 @@ dependencies = [
 name = "burrow-gtk"
 version = "0.1.2"
 dependencies = [
+ "burrow-api",
  "burrow-core",
  "gtk4",
  "relm4",

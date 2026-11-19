@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::monitor::Sample;
 use burrow_core::{Command, Response, TrendRange};
 use relm4::ComponentSender;

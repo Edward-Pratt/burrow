@@ -2,7 +2,7 @@
 //! the core runs for the tab, and the page that stands in for the tab's
 //! content until it connects, or after it ends.
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::{Command, Response, SessionId, SessionState};
 use relm4::gtk::prelude::*;
 use relm4::{ComponentSender, gtk};

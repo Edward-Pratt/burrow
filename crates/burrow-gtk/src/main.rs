@@ -21,7 +21,8 @@ mod terminal;
 mod tunnels;
 mod update;
 
-use burrow_core::ipc::{self, Role};
+use burrow_api::Role;
+use burrow_core::ipc;
 use burrow_core::{Paths, doctor};
 use relm4::gtk;
 use relm4::gtk::{gio, glib};

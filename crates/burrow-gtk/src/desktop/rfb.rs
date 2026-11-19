@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::{Command, NodeId, SessionId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;

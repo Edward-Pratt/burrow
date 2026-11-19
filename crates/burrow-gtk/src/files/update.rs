@@ -1,6 +1,6 @@
 //! The panel's messages: what the user does, and what the core answers.
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::{Command, FileKind};
 use relm4::gtk::prelude::*;
 use relm4::{ComponentSender, gtk};

@@ -1,6 +1,6 @@
 //! The page's messages: running queries, browsing tables and everything the user does on the page.
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::{Command, Response};
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gio, glib};

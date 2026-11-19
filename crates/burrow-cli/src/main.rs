@@ -66,7 +66,7 @@ async fn run(command: Cmd) -> Result<ExitCode> {
         _ => {}
     }
     let client = ipc::connect(Role::Cli).await?;
-    if client.info().build != ipc::BUILD {
+    if client.info().build != burrow_api::BUILD {
         eprintln!(
             "burrow: burrowd {} is still running from before an update; \
              stop what runs in it, then run `burrow daemon stop`",

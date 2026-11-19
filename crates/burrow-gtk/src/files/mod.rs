@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::{Command, FileEntry, NodeId, Response, SessionId, SessionState, TransferId};
 use relm4::gtk::prelude::*;
 use relm4::{ComponentSender, gtk};

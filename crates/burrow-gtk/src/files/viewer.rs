@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::{Command, SessionId, sha256_hex};
 use relm4::gtk;
 use relm4::gtk::glib;
