@@ -12,15 +12,18 @@
 
 mod audit;
 mod events;
+mod lock;
 mod server;
 mod start;
 
 pub use burrow_api::rpc::{BUILD, Role, ServerInfo};
 pub(crate) use burrow_api::rpc::{Initialize, MAX_LINE, read_line};
 pub use burrow_api::{Client, Events};
+pub use lock::stop;
+pub(crate) use lock::{LOCK, take_lock};
 pub use server::serve;
-pub(crate) use start::{LOCK, SOCKET, take_lock};
-pub use start::{connect, ensure_private_dir, runtime_dir, stop};
+pub(crate) use start::SOCKET;
+pub use start::{connect, ensure_private_dir, runtime_dir};
 
 /// JSON-RPC error codes.
 const METHOD_NOT_FOUND: i64 = -32601;
