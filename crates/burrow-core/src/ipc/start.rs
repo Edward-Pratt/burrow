@@ -7,6 +7,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+use tokio::net::UnixStream;
 
 use super::{BUILD, Client, Role, stop};
 use crate::api::{Command, Response};
@@ -106,6 +107,19 @@ pub async fn connect(role: Role) -> Result<Client> {
     drop(client);
     stop(&dir).await?;
     connect_or_start(&socket, role).await
+}
+
+/// Finds or starts the daemon as [`connect`] does, and opens a bare
+/// connection to it that hasn't said `initialize`, for a program that
+/// speaks the protocol itself, such as `burrow proxy`.
+pub async fn connect_stream(role: Role) -> Result<UnixStream> {
+    // Held until the bare connection is open, so the daemon can't stop
+    // for having no clients in between.
+    let _client = connect(role).await?;
+    let socket = runtime_dir()?.join(SOCKET);
+    UnixStream::connect(&socket)
+        .await
+        .map_err(|e| Error::io(&socket, e))
 }
 
 async fn connect_or_start(socket: &Path, role: Role) -> Result<Client> {

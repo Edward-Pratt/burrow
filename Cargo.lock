@@ -472,10 +472,12 @@ dependencies = [
 name = "burrow-cli"
 version = "0.1.2"
 dependencies = [
+ "burrow-api",
  "burrow-core",
  "clap",
  "data-encoding",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

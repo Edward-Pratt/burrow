@@ -1,5 +1,6 @@
 //! What `burrow` takes on its command line.
 
+use burrow_api::Role;
 use burrow_core::Capability;
 use clap::{Parser, Subcommand};
 
@@ -77,6 +78,14 @@ pub enum Cmd {
     /// Check that this machine has what Burrow needs, and say what is
     /// missing and how to get it.
     Doctor,
+    /// Pass the daemon's protocol between stdin and stdout, as an SSH key's
+    /// forced command runs it for the phone. The first line must be
+    /// `initialize` with this role.
+    Proxy {
+        /// gui, cli, mcp or mobile.
+        #[arg(long)]
+        role: Role,
+    },
 }
 
 #[derive(Subcommand)]

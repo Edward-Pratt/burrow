@@ -23,7 +23,7 @@ pub use lock::stop;
 pub(crate) use lock::{LOCK, take_lock};
 pub use server::serve;
 pub(crate) use start::SOCKET;
-pub use start::{connect, ensure_private_dir, runtime_dir};
+pub use start::{connect, connect_stream, ensure_private_dir, runtime_dir};
 
 /// JSON-RPC error codes.
 const METHOD_NOT_FOUND: i64 = -32601;

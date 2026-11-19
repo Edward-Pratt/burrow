@@ -29,10 +29,11 @@ Cargo workspace:
 
 | Crate | Role |
 |---|---|
+| `burrow-api` | The API's types, and the JSON-RPC client for `burrowd` over any stream. Nothing from the Linux desktop, so the phone app can depend on it. |
 | `burrow-core` | Connections, secrets, sessions, addon host, config. No UI code. |
 | `burrow-gtk` | Thin GTK4 client of the core in `burrowd`. |
 | `burrowd` | The core as a process of its own, so tunnels and monitoring keep running with the window closed. Started by a client, or by a systemd user unit. |
-| `burrow-cli` | The `burrow` command-line client, and the MCP bridge (`burrow mcp serve`). |
+| `burrow-cli` | The `burrow` command-line client, the MCP bridge (`burrow mcp serve`), and `burrow proxy` for clients that come in over SSH. |
 | `burrow-agent` | A small static program that runs on servers and reports their state over SSH. Its library is the wire format the core parses. |
 
 ### One versioned API for every client

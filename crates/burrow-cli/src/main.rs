@@ -3,6 +3,7 @@
 
 mod args;
 mod mcp;
+mod proxy;
 mod tty;
 
 use std::collections::HashMap;
@@ -12,8 +13,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use args::{Cli, Cmd, DaemonCmd, McpCmd, TunnelCmd};
+use burrow_api::{Client, Events, Role};
 use burrow_core::doctor::Check;
-use burrow_core::ipc::{self, Client, Events, Role};
+use burrow_core::ipc;
 use burrow_core::{
     Capability, Command, Event, Grant, GrantShown, Node, NodeId, Response, SSH_TUNNEL_KIND,
     SessionId, SessionKind, SessionState, StatementResult,
@@ -54,17 +56,14 @@ fn fail(error: &dyn Error) -> ExitCode {
 }
 
 async fn run(command: Cmd) -> Result<ExitCode> {
-    if let Cmd::Daemon { action } = &command {
-        return daemon(action).await;
-    }
-    if let Cmd::Doctor = &command {
-        return doctor().await;
-    }
-    if let Cmd::Mcp {
-        action: McpCmd::Serve,
-    } = &command
-    {
-        return mcp::serve(ipc::connect(Role::Mcp).await?).await;
+    match &command {
+        Cmd::Daemon { action } => return daemon(action).await,
+        Cmd::Doctor => return doctor().await,
+        Cmd::Proxy { role } => return Ok(proxy::run(*role).await?),
+        Cmd::Mcp {
+            action: McpCmd::Serve,
+        } => return mcp::serve(ipc::connect(Role::Mcp).await?).await,
+        _ => {}
     }
     let client = ipc::connect(Role::Cli).await?;
     if client.info().build != ipc::BUILD {
@@ -98,7 +97,7 @@ async fn run(command: Cmd) -> Result<ExitCode> {
         }
         Cmd::Events => events(&client).await,
         Cmd::Mcp { action } => mcp(&client, action).await,
-        Cmd::Daemon { .. } | Cmd::Doctor => unreachable!("handled above"),
+        Cmd::Daemon { .. } | Cmd::Doctor | Cmd::Proxy { .. } => unreachable!("handled above"),
     }
 }
 
