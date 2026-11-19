@@ -1,6 +1,7 @@
 //! The role a client gives in `initialize`, and how firmly it sticks:
 //! `burrow proxy` checks only the first line it is sent, so the daemon
-//! must never let a connection change its role afterwards.
+//! must never let a connection change its role afterwards. And what the
+//! phone's role may do.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -143,4 +144,34 @@ async fn a_failed_initialize_ends_the_connection() {
     assert_eq!(refused["id"], 1);
     assert!(refused.get("error").is_some(), "{refused}");
     assert_eq!(raw.answer().await, None);
+}
+
+/// The phone's role may do what the window's may, and hears what it
+/// hears.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mobile_role_runs_what_the_window_runs() {
+    use burrow_core::ipc::{Client, Role};
+    use burrow_core::{Event, Response};
+    let dir = TempDir::new().unwrap();
+    let socket = serve(core(dir.path()), dir.path());
+    let gui = Client::connect(&socket, Role::Gui).await.unwrap();
+    let mobile = Client::connect(&socket, Role::Mobile).await.unwrap();
+    let mut heard = mobile.subscribe();
+
+    let Response::Node { node } = gui.execute(folder("Work")).await.unwrap() else {
+        panic!("expected a node");
+    };
+    match tokio::time::timeout(WAIT, heard.recv()).await.unwrap() {
+        Ok(Event::NodeCreated { node: created }) => assert_eq!(created.id, node.id),
+        other => panic!("expected node_created, got {other:?}"),
+    }
+    let made = mobile.execute(folder("Phone")).await.unwrap();
+    assert!(matches!(made, Response::Node { .. }), "{made:?}");
+    let deleted = mobile
+        .execute(Command::DeleteNode {
+            id: node.id,
+            recursive: false,
+        })
+        .await;
+    assert_eq!(deleted.unwrap(), Response::Ok);
 }

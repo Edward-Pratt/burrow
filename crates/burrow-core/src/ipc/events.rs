@@ -44,7 +44,7 @@ pub(super) async fn forward_events(
 /// it gone.
 fn may_see(role: Role, event: &Event, owned: &[SessionId]) -> bool {
     match role {
-        Role::Gui | Role::Cli => true,
+        Role::Gui | Role::Cli | Role::Mobile => true,
         Role::Mcp => match event {
             Event::SessionChanged { session, .. } => owned.contains(session),
             _ => matches!(

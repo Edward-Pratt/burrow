@@ -456,7 +456,7 @@ The daemon sends:
 | `output_ended` (notification) | `{ session }` | The terminal has no more output. It always comes after the last `output`. |
 
 - **`initialize` first, and once:** anything else before it is refused. `api` must be the daemon's `API_VERSION`. The daemon answers it before reading the next line, so the role is set before any later request runs. A second `initialize` is refused and the role stays, and one that fails closes the connection, so a client refused one role can't ask for another on the same connection. `build` is the client's version, naming the commit in installed builds; the daemon's comes back, so a client can tell it is talking to a daemon from before an upgrade.
-- **Roles:** `role` is `gui` (the GTK window), `cli` or `mcp` (the MCP bridge). `gui` and `cli` may run every command. `mcp` may only do what the user granted; see [MCP bridge](#mcp-bridge).
+- **Roles:** `role` is `gui` (the GTK window), `cli`, `mcp` (the MCP bridge) or `mobile` (the phone app, through [`burrow proxy`](#over-ssh)). `gui`, `cli` and `mobile` may run every command and hear every event. `mcp` may only do what the user granted; see [MCP bridge](#mcp-bridge). `mobile` is where the daemon would limit a phone, if that is ever wanted, with no change to the protocol.
 - **Sessions belong to their client:** terminals, file sessions and database sessions close when the client that opened them disconnects. Tunnels belong to the daemon and keep running.
 - **Output and events:** replies and events are sent before terminal output, so a busy terminal does not hold them up. Terminal output that the client reads slowly slows the session down rather than being dropped.
 

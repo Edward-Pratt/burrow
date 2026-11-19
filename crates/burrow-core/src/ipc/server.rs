@@ -228,7 +228,7 @@ impl Conn {
                 let command: Command = parse(params)?;
                 let owns = crate::class::of(&command).opens_session;
                 let response = match role {
-                    Role::Gui | Role::Cli => self.core.execute(command).await,
+                    Role::Gui | Role::Cli | Role::Mobile => self.core.execute(command).await,
                     // Nobody at the bridge can answer a session's questions. The
                     // window shows a tunnel's, whoever started it.
                     Role::Mcp if matches!(command, Command::StartTunnel { .. }) => {

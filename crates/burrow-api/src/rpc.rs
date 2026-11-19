@@ -25,10 +25,14 @@ pub enum Role {
     Cli,
     /// The MCP bridge, through which an AI assistant acts.
     Mcp,
+    /// The phone app, through `burrow proxy --role mobile` over SSH. It
+    /// may do what the window may; this is where the daemon would limit a
+    /// phone, if that is ever wanted, with no change to the protocol.
+    Mobile,
 }
 
 impl Role {
-    pub const ALL: [Role; 3] = [Role::Gui, Role::Cli, Role::Mcp];
+    pub const ALL: [Role; 4] = [Role::Gui, Role::Cli, Role::Mcp, Role::Mobile];
 
     /// The role's name on the wire, as `initialize` sends it.
     pub fn name(self) -> &'static str {
@@ -36,6 +40,7 @@ impl Role {
             Role::Gui => "gui",
             Role::Cli => "cli",
             Role::Mcp => "mcp",
+            Role::Mobile => "mobile",
         }
     }
 }
@@ -151,7 +156,7 @@ mod tests {
             "root"
                 .parse::<Role>()
                 .unwrap_err()
-                .contains("gui, cli, mcp")
+                .contains("gui, cli, mcp, mobile")
         );
     }
 }
