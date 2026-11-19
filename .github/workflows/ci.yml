@@ -20,7 +20,8 @@ jobs:
     container: archlinux:latest
     # Lint and test build mostly different artifacts, so they run side by
     # side rather than one after the other. agent builds burrow-agent the
-    # way servers get it, for both targets.
+    # way servers get it, for both targets, and checks burrow-api for
+    # Android.
     strategy:
       fail-fast: false
       matrix:
@@ -88,6 +89,15 @@ jobs:
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             su builder -c "cargo build -p burrow-agent --profile agent --target $target"
           done
+
+      # The phone app depends on burrow-api, so it must build for Android,
+      # which also shows nothing from the Linux desktop got into it.
+      # Checking needs only the target's standard library, not the NDK.
+      - name: Check burrow-api for Android
+        if: matrix.check == 'agent'
+        run: |
+          su builder -c 'rustup target add aarch64-linux-android'
+          su builder -c 'cargo check -p burrow-api --target aarch64-linux-android'
 
   # Each green push to main becomes the build that `burrow-update`
   # downloads, so nobody compiles Burrow to install or update it. It
