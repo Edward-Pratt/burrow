@@ -119,7 +119,7 @@ pub async fn connect(role: Role) -> Result<Client> {
 async fn connect_or_start(socket: &Path, role: Role) -> Result<Client> {
     match Client::connect(socket, role).await {
         Err(e) if not_running(&e) => {}
-        other => return other,
+        other => return other.map_err(Error::from),
     }
     let (mut child, log) = start()?;
     let deadline = Instant::now() + START_TIMEOUT;
@@ -127,7 +127,7 @@ async fn connect_or_start(socket: &Path, role: Role) -> Result<Client> {
         tokio::time::sleep(Duration::from_millis(50)).await;
         match Client::connect(socket, role).await {
             Err(e) if not_running(&e) => {}
-            other => return other,
+            other => return other.map_err(Error::from),
         }
         // A second daemon started at the same time gives up quietly, so
         // an exit is only a failure once the deadline passes.
@@ -238,9 +238,9 @@ fn last_line(log: &Path) -> Option<String> {
     Some(line.strip_prefix("burrowd: ").unwrap_or(line).to_string())
 }
 
-fn not_running(error: &Error) -> bool {
+fn not_running(error: &burrow_api::Error) -> bool {
     use std::io::ErrorKind::{ConnectionRefused, NotFound};
-    matches!(error, Error::Io { source, .. } if matches!(source.kind(), NotFound | ConnectionRefused))
+    matches!(error, burrow_api::Error::Io { source, .. } if matches!(source.kind(), NotFound | ConnectionRefused))
 }
 
 /// Starts this program again as the daemon, so it is always the same build

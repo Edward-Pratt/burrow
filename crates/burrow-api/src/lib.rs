@@ -12,23 +12,29 @@
 //! `event`. All of them are reached here, as `burrow_api::Name`.
 
 mod addons;
+mod client;
 mod command;
 mod db;
+mod error;
 mod event;
 mod grants;
 mod hosts;
 mod nodes;
 mod response;
+pub mod rpc;
 mod sessions;
 
 pub use addons::*;
+pub use client::{Client, Events};
 pub use command::*;
 pub use db::*;
+pub use error::{Error, Result};
 pub use event::*;
 pub use grants::*;
 pub use hosts::*;
 pub use nodes::*;
 pub use response::*;
+pub use rpc::{BUILD, Role, ServerInfo};
 pub use sessions::*;
 
 /// What burrow-agent reports, as monitor events carry it.
