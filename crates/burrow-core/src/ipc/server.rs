@@ -149,6 +149,17 @@ async fn connection(core: Core, stream: UnixStream, _connected: Connected) {
         // Commands can carry secrets; this copy at least is not left behind.
         line.zeroize();
         match message {
+            // Answered before the next line is read, so no request races
+            // the role being set. A client gets one try: a role refused,
+            // or one asked for with the wrong API, ends the connection
+            // rather than leave it open for another. `burrow proxy`
+            // relies on that, since it checks only the first line.
+            Ok(message) if message.method == "initialize" => {
+                conn.clone().handle(message).await;
+                if conn.role.get().is_none() {
+                    break;
+                }
+            }
             Ok(message) => {
                 let conn = conn.clone();
                 // Requests run on their own task, so a slow command does not
