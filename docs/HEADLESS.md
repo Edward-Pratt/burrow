@@ -68,3 +68,9 @@ systemctl --user restart burrowd.service
 ```
 
 The monitors reconnect, and their history on disk stays.
+
+## Check the phone's way in
+
+Before a phone has a key, check the path with a throwaway one: add its line with the `command="…/burrow proxy --role mobile",…` options from [Over SSH](API.md#over-ssh), send `initialize` with `"role": "mobile"` and then `execute` lines, and remove the line afterwards. The answer to `initialize` names the daemon's build, and `list_sessions` shows the background monitors. Asking for another role, or for a shell or a terminal, must be refused.
+
+Connect with `ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -i <key>`. Otherwise ssh can offer a key from your agent or your config first, sign in with that, and give a shell that looks like the forced command failed.
