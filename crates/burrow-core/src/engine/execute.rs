@@ -233,6 +233,13 @@ impl Core {
                 sessions.answer(session, prompt, answer)?;
                 return Ok(Response::Ok);
             }
+            Command::KeepTerminal { session } => {
+                sessions.keep(session)?;
+                // Keeping changes what clients list but sends no event of
+                // its own, so the session says where it stands again.
+                self.inner.repeat(session);
+                return Ok(Response::Ok);
+            }
             Command::WriteTerminal { session, data } => (session, Input::Write(data)),
             Command::ResizeTerminal {
                 session,

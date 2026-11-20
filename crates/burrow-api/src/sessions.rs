@@ -119,6 +119,13 @@ pub struct SessionInfo {
     /// off stops it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub background: bool,
+    /// A terminal kept with [`Command::KeepTerminal`](crate::Command::KeepTerminal): it outlives the
+    /// client that opened it, and any client may attach to it again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kept: bool,
+    /// A kept terminal that a client is reading now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attached: bool,
 }
 
 /// A question a session needs answered before it can go on, such as

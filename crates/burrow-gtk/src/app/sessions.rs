@@ -26,6 +26,7 @@ impl App {
             }
             _ => return,
         };
+        self.kept_event(&event, sender);
         // A tunnel's events name the tunnel, so they need no claiming.
         if let Event::SessionChanged { node, state, .. } = &event
             && self
@@ -114,6 +115,7 @@ impl App {
         window: &gtk::ApplicationWindow,
         sender: &ComponentSender<Self>,
     ) {
+        self.kept.take(&sessions);
         for info in sessions {
             if info.kind != SessionKind::Tunnel {
                 continue;

@@ -28,6 +28,7 @@ mod dispatch;
 mod editors;
 mod events;
 mod grants;
+mod kept;
 mod menus;
 mod message;
 mod monitors;
@@ -87,6 +88,8 @@ pub struct App {
     /// Whether a `list_sessions` to place an unknown session's prompt is
     /// on its way.
     looking_up: bool,
+    /// Terminals the daemon keeps with no client, such as the phone's.
+    kept: kept::Kept,
     /// Every tunnel that has run, by node, whether or not its tab is open.
     tunnels: HashMap<NodeId, crate::tunnels::Status>,
     /// Tunnels to start again once their session has closed.
@@ -183,6 +186,7 @@ impl Component for App {
             next_tab: 1,
             unclaimed: Unclaimed::default(),
             looking_up: false,
+            kept: kept::Kept::default(),
             tunnels: HashMap::new(),
             restarting: HashSet::new(),
             autostart: HashSet::new(),

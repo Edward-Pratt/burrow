@@ -77,6 +77,10 @@ impl App {
                     entries.push(("New shell".into(), AppMsg::NewShell(node.id)));
                     entries.push(("Browse files".into(), AppMsg::OpenFiles(node.id)));
                     entries.push(("Monitor".into(), AppMsg::OpenMonitor(node.id)));
+                    if !self.kept.on(node.id).is_empty() {
+                        let close = AppMsg::CloseKept(node.id);
+                        entries.push(("Close phone terminals".into(), close));
+                    }
                 }
                 if node.kind == SSH_TUNNEL_KIND {
                     let running = self.tunnels.get(&node.id).and_then(|s| s.running());

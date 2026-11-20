@@ -17,13 +17,13 @@ use super::daemon::run;
 use super::editors::shown;
 use crate::runtime::runtime;
 impl App {
-    /// The nodes the sidebar marks as running: tunnels that are up.
+    /// The nodes the sidebar marks as running: tunnels that are up, and
+    /// hosts with a kept terminal.
     pub(super) fn running(&self) -> HashSet<NodeId> {
-        self.tunnels
-            .iter()
-            .filter(|(_, status)| status.is_up())
-            .map(|(id, _)| *id)
-            .collect()
+        let up = self.tunnels.iter().filter(|(_, status)| status.is_up());
+        let mut running: HashSet<NodeId> = up.map(|(id, _)| *id).collect();
+        running.extend(self.kept.hosts());
+        running
     }
 
     pub(super) fn tunnel_of(&self, session: SessionId) -> Option<NodeId> {

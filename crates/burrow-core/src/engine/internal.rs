@@ -17,7 +17,7 @@ use crate::db;
 use crate::error::{Error, Result};
 use crate::ssh::alerts::{Alerts, Rule};
 use crate::ssh::trend::{self, Trends};
-use crate::ssh::{self, Agents, Connections, Sessions, Transfers, Waits};
+use crate::ssh::{self, Agents, AttachedOutput, Connections, Sessions, Transfers, Waits};
 
 use super::{Core, WeakCore};
 
@@ -97,6 +97,15 @@ impl Core {
     /// let go of it.
     pub fn take_output(&self, session: SessionId) -> Result<mpsc::Receiver<Vec<u8>>> {
         self.inner.sessions.take_output(session)
+    }
+
+    /// Attaches to a kept terminal as its one reader: what it kept, and its
+    /// output from there on. Its state and any question it waits on are
+    /// said again, since it may have asked while nobody was attached.
+    pub(crate) fn attach_output(&self, session: SessionId) -> Result<AttachedOutput> {
+        let attached = self.inner.sessions.attach_output(session)?;
+        self.inner.repeat(session);
+        Ok(attached)
     }
 
     /// Runs a command an addon sent, if its permissions allow it.

@@ -141,6 +141,7 @@ impl App {
                 execute(&self.core, &sender, Command::StartTunnel { node });
             }
             AppMsg::StopTunnel(node) => self.stop_tunnel(node, &sender),
+            AppMsg::CloseKept(node) => self.close_kept(node, &sender),
             AppMsg::RestartTunnel(node) => self.restart_tunnel(node, &sender),
             AppMsg::EditTunnel(node) => self.edit_tunnel(Some(node), None, window, &sender),
             AppMsg::Database {

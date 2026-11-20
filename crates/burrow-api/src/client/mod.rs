@@ -5,6 +5,7 @@
 //! same computer, or an SSH channel running `burrow proxy` from a phone.
 
 mod events;
+mod output;
 mod reader;
 #[cfg(test)]
 mod tests;
@@ -61,6 +62,9 @@ struct Shared {
     next: AtomicU64,
     events: broadcast::Sender<Signal>,
     outputs: Mutex<HashMap<SessionId, mpsc::Sender<Vec<u8>>>>,
+    /// Attaches waiting for their `output_replay`: where the replay goes,
+    /// and the stream that takes over from there.
+    replays: Mutex<HashMap<SessionId, output::Replay>>,
     /// Set once the daemon's side has ended. Nothing more will be answered.
     closed: AtomicBool,
 }
@@ -96,6 +100,7 @@ impl Client {
             next: AtomicU64::new(0),
             events,
             outputs: Mutex::default(),
+            replays: Mutex::default(),
             closed: AtomicBool::new(false),
         });
         tokio::spawn(write_all(write, outbox_rx));
@@ -131,21 +136,6 @@ impl Client {
             self.shared.events.subscribe(),
             self.shared.closed.load(Ordering::SeqCst),
         )
-    }
-
-    /// Takes a session's terminal output stream, as burrow-core's
-    /// `Core::take_output` does. Dropping it ends the session once the
-    /// next output finds nobody reading, as in-process.
-    pub async fn take_output(&self, session: SessionId) -> Result<mpsc::Receiver<Vec<u8>>> {
-        let (tx, rx) = mpsc::channel(OUTPUT_BUFFER);
-        self.shared.outputs.lock().unwrap().insert(session, tx);
-        if let Err(e) =
-            call::<Value>(&self.shared, "take_output", json!({"session": session})).await
-        {
-            self.shared.outputs.lock().unwrap().remove(&session);
-            return Err(e);
-        }
-        Ok(rx)
     }
 }
 
