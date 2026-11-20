@@ -5,6 +5,7 @@
 //! same computer, or an SSH channel running `burrow proxy` from a phone.
 
 mod events;
+mod output;
 mod reader;
 #[cfg(test)]
 mod tests;
@@ -131,21 +132,6 @@ impl Client {
             self.shared.events.subscribe(),
             self.shared.closed.load(Ordering::SeqCst),
         )
-    }
-
-    /// Takes a session's terminal output stream, as burrow-core's
-    /// `Core::take_output` does. Dropping it ends the session once the
-    /// next output finds nobody reading, as in-process.
-    pub async fn take_output(&self, session: SessionId) -> Result<mpsc::Receiver<Vec<u8>>> {
-        let (tx, rx) = mpsc::channel(OUTPUT_BUFFER);
-        self.shared.outputs.lock().unwrap().insert(session, tx);
-        if let Err(e) =
-            call::<Value>(&self.shared, "take_output", json!({"session": session})).await
-        {
-            self.shared.outputs.lock().unwrap().remove(&session);
-            return Err(e);
-        }
-        Ok(rx)
     }
 }
 

@@ -42,6 +42,7 @@ Commands are JSON objects tagged by `type`. Each returns a response or an error.
 | `open_terminal` | `node`, `cols`, `rows`, `run?` | `session { session }` |
 | `write_terminal` | `session`, `data` (base64) | `ok` (to a terminal or a desktop) |
 | `resize_terminal` | `session`, `cols`, `rows` | `ok` |
+| `keep_terminal` | `session` | `ok`; see [Kept terminals](#kept-terminals) |
 | `answer_prompt` | `session`, `prompt`, `answer` | `ok` |
 | `close_session` | `session` | `ok` |
 | `list_sessions` | | `sessions { sessions }` |
@@ -143,7 +144,7 @@ A `service` is something a monitor lists: `{"kind": "unit", "name": "nginx.servi
 
 `result` is the command's `exec` result, so a failed action is a reply with a non-zero `status` and the server's words in `stderr`, not an error. `needs_password` is true when sudo wanted a password, so nothing was done: run the same action with `open_terminal`'s `run` instead, where the user can type it. Burrow never sees that password. Names come from the server, so they are checked and quoted in one place before any of these lines is built: a name that is empty, over 256 bytes, starts with `-`, or has a `'` or a control character is refused, and so is a `runtime` other than `docker` or `podman`, a `pm2` that isn't an absolute path, and an action the service doesn't take.
 
-Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files`, `database`, `exec`, `monitor` or `vnc`) and `state`, and `background: true` on a background monitor.
+Terminals, tunnels and file sessions on the same host share one SSH connection, so a passphrase or one-time code is asked for once. The connection closes when its last session does. Session ids grow: a later session has a larger id. `list_sessions` reports each running session's `session`, `node`, `kind` (`terminal`, `tunnel`, `files`, `database`, `exec`, `monitor` or `vnc`) and `state`, `background: true` on a background monitor, and `kept: true` on a [kept terminal](#kept-terminals), with `attached: true` while a client reads it.
 
 - **Host settings** come from `ssh -G <alias>`, so `Include`, `Match`, `Host` patterns and defaults apply exactly as for `ssh <alias>`. `props.alias` is the alias (the node's name when missing). An alias that is empty, starts with `-`, or has spaces or control characters is refused, because node files can come from a shared folder.
 - **Host keys** are checked against the `UserKnownHostsFile` and `GlobalKnownHostsFile` files, following `StrictHostKeyChecking`. A changed or `@revoked` key is always refused. A new key is asked about (`ask`) or added (`accept-new`/`no`), except when the host has known keys of another type, which is always asked about. New keys go into the first user file, hashed if `HashKnownHosts` is on.
@@ -190,6 +191,17 @@ A prompt left unanswered when the session closes counts as cancelled. Any client
 ### Output stream
 
 Terminal output is not sent as events: a burst of output would push every subscriber past its event buffer. In-process clients take each session's output with `Core::take_output(session)`, once. It is a bounded stream, so a slow reader slows the SSH channel down instead of losing output. Dropping the stream ends the session. Socket clients ask for it with `take_output` and receive it as `output` notifications; see [Socket](#socket).
+
+### Kept terminals
+
+`keep_terminal` keeps a terminal running after the client that opened it goes, so a phone's shell survives its screen locking. Keep a terminal before taking its output: once a client has its stream, `keep_terminal` is refused. A kept terminal ends only when its shell does, on `close_session` from any client that may run it, when its node is deleted, or when the daemon stops. The MCP bridge can't keep or reach terminals.
+
+- **Its output waits in a ring:** the daemon reads a kept terminal's output all the time and keeps the latest 256 KiB of it. The replay is raw bytes, so a full-screen program such as `htop` may look partly drawn until it next redraws; a client that attaches and then resizes usually makes it.
+- **Attaching:** `take_output` on a kept terminal may be called again, by any client. Its answer is `{ replay }`, what the ring holds, in base64, and the output from there on follows as `output` notifications, with nothing lost or repeated in between.
+- **One reader, the latest:** attaching takes over from any reader before, here or in another client, whose stream ends with `output_ended`. A client that sees `output_ended` while the session still runs was detached, not closed. Refusing the second reader instead would lock out a phone whose old connection hasn't timed out yet.
+- **A slow reader is detached, not waited on:** unlike other terminals, a kept terminal's reader that leaves output unread for 3 seconds is detached, so a build doesn't stop because the phone is in a pocket. Until then it slows the session as any reader does. It can attach again and gets the replay.
+- **Dropping or releasing the stream detaches** the reader; the terminal runs on.
+- **The daemon stays up:** a kept terminal is a session, so the daemon doesn't stop for being idle, and a daemon from an older build isn't replaced while one runs. An upgrade then waits for the shell to be closed rather than killing it.
 
 ## SSH tunnels
 
@@ -443,7 +455,7 @@ The client sends:
 |---|---|---|
 | `initialize` | `{ api, role, build }` | `{ api, build, addons_dir }` |
 | `execute` | a [command](#commands) | its response, or an error |
-| `take_output` | `{ session }` | null; the terminal's output follows as `output` |
+| `take_output` | `{ session }` | null, or `{ replay }` for a [kept terminal](#kept-terminals); the terminal's output follows as `output` |
 | `release_output` (notification) | `{ session }` | ends the session, as dropping the stream does in-process |
 
 The daemon sends:
@@ -457,8 +469,8 @@ The daemon sends:
 
 - **`initialize` first, and once:** anything else before it is refused. `api` must be the daemon's `API_VERSION`. The daemon answers it before reading the next line, so the role is set before any later request runs. A second `initialize` is refused and the role stays, and one that fails closes the connection, so a client refused one role can't ask for another on the same connection. `build` is the client's version, naming the commit in installed builds; the daemon's comes back, so a client can tell it is talking to a daemon from before an upgrade.
 - **Roles:** `role` is `gui` (the GTK window), `cli`, `mcp` (the MCP bridge) or `mobile` (the phone app, through [`burrow proxy`](#over-ssh)). `gui`, `cli` and `mobile` may run every command and hear every event. `mcp` may only do what the user granted; see [MCP bridge](#mcp-bridge). `mobile` is where the daemon would limit a phone, if that is ever wanted, with no change to the protocol.
-- **Sessions belong to their client:** terminals, file sessions and database sessions close when the client that opened them disconnects. Tunnels belong to the daemon and keep running.
-- **Output and events:** replies and events are sent before terminal output, so a busy terminal does not hold them up. Terminal output that the client reads slowly slows the session down rather than being dropped.
+- **Sessions belong to their client:** terminals, file sessions and database sessions close when the client that opened them disconnects. Tunnels and [kept terminals](#kept-terminals) belong to the daemon and keep running.
+- **Output and events:** replies and events are sent before terminal output, so a busy terminal does not hold them up. Terminal output that the client reads slowly slows the session down rather than being dropped, except a kept terminal's, whose reader is detached after 3 seconds.
 
 ### Over SSH
 

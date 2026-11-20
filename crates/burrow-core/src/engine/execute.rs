@@ -233,6 +233,10 @@ impl Core {
                 sessions.answer(session, prompt, answer)?;
                 return Ok(Response::Ok);
             }
+            Command::KeepTerminal { session } => {
+                sessions.keep(session)?;
+                return Ok(Response::Ok);
+            }
             Command::WriteTerminal { session, data } => (session, Input::Write(data)),
             Command::ResizeTerminal {
                 session,

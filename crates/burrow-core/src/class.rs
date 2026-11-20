@@ -110,6 +110,7 @@ pub(crate) fn of(command: &Command) -> Class<'_> {
         Command::OpenTerminal { .. } => opens(McpRule::Denied),
         Command::WriteTerminal { .. }
         | Command::ResizeTerminal { .. }
+        | Command::KeepTerminal { .. }
         | Command::AnswerPrompt { .. } => base,
         Command::CloseSession { session } => mcp(McpRule::Close(*session)),
         Command::ListSessions => mcp(McpRule::Free),
@@ -191,6 +192,11 @@ mod tests {
             assert_eq!(class.mcp, McpRule::Denied, "{command:?}");
             assert_eq!(class.addon, AddonRule::Denied, "{command:?}");
         }
+        // Terminals are never the bridge's, kept or not.
+        let keep = Command::KeepTerminal { session };
+        let keep = of(&keep);
+        assert_eq!(keep.mcp, McpRule::Denied);
+        assert!(!keep.opens_session);
         // A tunnel belongs to the daemon and outlives the client.
         let node = NodeId::new();
         assert!(!of(&Command::StartTunnel { node }).opens_session);

@@ -18,6 +18,8 @@ pub(crate) mod exec;
 pub(crate) mod files;
 pub(crate) mod hosts;
 mod join;
+mod keeper;
+mod kept;
 mod known_hosts;
 mod monitor;
 mod prompter;
@@ -181,6 +183,7 @@ where
             output,
             attached: None,
             background,
+            keeper: None,
         },
     );
     drop(map);

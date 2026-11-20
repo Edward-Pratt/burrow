@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use russh_sftp::client::SftpSession;
 use tokio::sync::mpsc;
 
+use super::keeper::Keeper;
 use super::monitor;
 use super::prompter::Pending;
 use crate::api::{NodeId, PromptAnswer, SessionId, SessionInfo, SessionKind, SessionState};
@@ -47,6 +48,8 @@ pub(super) struct Entry {
     pub(super) attached: Option<Attached>,
     /// A background monitor, which clients may use but not close.
     pub(super) background: bool,
+    /// A kept terminal's output, once [`Sessions::keep`] took it.
+    pub(super) keeper: Option<Arc<Keeper>>,
 }
 
 /// A connected session's client, which commands on it use.
@@ -105,6 +108,8 @@ impl Sessions {
                 kind: e.kind,
                 state: e.state.clone(),
                 background: e.background,
+                kept: e.keeper.is_some(),
+                attached: e.keeper.as_ref().is_some_and(|k| k.attached()),
             })
             .collect();
         sessions.sort_by_key(|s| s.session.0);

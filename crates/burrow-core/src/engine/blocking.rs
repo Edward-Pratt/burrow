@@ -231,6 +231,7 @@ impl Inner {
             Command::OpenTerminal { .. }
             | Command::WriteTerminal { .. }
             | Command::ResizeTerminal { .. }
+            | Command::KeepTerminal { .. }
             | Command::AnswerPrompt { .. }
             | Command::CloseSession { .. }
             | Command::ListSessions
