@@ -70,7 +70,7 @@ Burrow finds it in the workspace it runs from, in `lib/burrow/` beside the folde
 cargo run -p burrow-gtk
 ```
 
-The window starts `burrowd` when none is running, and the daemon stops by itself a minute after nothing uses it. To start it at login instead, so tunnels set to autostart come up without the window, install the units in `dist/systemd/` and run `systemctl --user enable --now burrowd.socket burrowd.service`.
+The window starts `burrowd` when none is running, and the daemon stops by itself a minute after nothing uses it. To start it at login instead, so tunnels set to autostart come up without the window, install the units in `dist/systemd/` and run `systemctl --user enable --now burrowd.socket burrowd.service`. To run it on a computer that stays on, for the phone, see [docs/HEADLESS.md](docs/HEADLESS.md).
 
 Set `BURROW_CONFIG_DIR=/some/folder` to use a different config folder from `~/.config/burrow`, for example while developing. A run with it set gets a daemon of its own.
 
