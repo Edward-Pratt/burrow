@@ -9,15 +9,16 @@
 
 use std::collections::HashMap;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use burrow_api::Client;
 use burrow_core::{Command, Node, NodeId, Response, SessionId};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::{Result, find};
+use crate::{Result, nodes::find};
 
+mod calls;
+mod monitor;
 mod sessions;
 mod tools;
 
@@ -31,13 +32,6 @@ const VERSIONS: [&str; 3] = ["2026-07-28", "2025-11-25", "2025-06-18"];
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const UNSUPPORTED_VERSION: i64 = -32022;
-
-/// How long the monitor tool waits for a new monitor's first sample.
-const FIRST_SAMPLE: Duration = Duration::from_secs(5);
-
-/// Rows a query keeps when the assistant doesn't say. Results go into its
-/// context, so fewer than the window's default.
-const DEFAULT_ROWS: u32 = 200;
 
 const INSTRUCTIONS: &str = "Burrow manages the user's SSH hosts, tunnels and Postgres \
 databases. Call list_nodes first: it shows every node and what you may do on each. \
@@ -163,194 +157,6 @@ impl Bridge {
         Ok(result)
     }
 
-    async fn call(&mut self, tool: &str, args: &Value) -> Result<String, Called> {
-        let text = |key: &str| {
-            args[key]
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| Called::Invalid(format!("{key} is missing")))
-        };
-        let number = |key: &str| args[key].as_u64();
-        let response = match tool {
-            "list_nodes" => return self.list_nodes().await,
-            "run_command" => {
-                let node = self.node(&text("node")?).await?;
-                let timeout = number("timeout_seconds").map(|t| t.min(3600) as u32);
-                let command = Command::Exec {
-                    node: node.id,
-                    command: text("command")?,
-                    timeout,
-                };
-                self.execute(command).await?
-            }
-            "query" => {
-                let session = self.session(&text("node")?, Kind::Database).await?;
-                let limit = number("max_rows").map_or(DEFAULT_ROWS, |n| n.min(10_000) as u32);
-                let command = Command::RunQuery {
-                    session,
-                    sql: text("sql")?,
-                    limit: Some(limit),
-                };
-                self.execute(command).await?
-            }
-            "list_schema" => {
-                let session = self.session(&text("node")?, Kind::Database).await?;
-                self.execute(Command::ListSchema { session }).await?
-            }
-            "list_files" => {
-                let session = self.session(&text("node")?, Kind::Files).await?;
-                let path = args["path"].as_str().unwrap_or_default().to_string();
-                self.execute(Command::ListDir { session, path }).await?
-            }
-            "read_file" => {
-                let session = self.session(&text("node")?, Kind::Files).await?;
-                let command = Command::ReadFile {
-                    session,
-                    path: text("path")?,
-                    limit: number("max_bytes"),
-                };
-                match self.execute(command).await? {
-                    Response::File { data, size, .. } => return Ok(file_text(&data, size)),
-                    other => other,
-                }
-            }
-            "write_file" => {
-                let session = self.session(&text("node")?, Kind::Files).await?;
-                let command = Command::WriteFile {
-                    session,
-                    path: text("path")?,
-                    data: text("content")?.into_bytes(),
-                    overwrite: args["overwrite"].as_bool().unwrap_or(false),
-                    expect: None,
-                };
-                self.execute(command).await?
-            }
-            "make_dir" => {
-                let session = self.session(&text("node")?, Kind::Files).await?;
-                let path = text("path")?;
-                self.execute(Command::MakeDir { session, path }).await?
-            }
-            "rename_path" => {
-                let session = self.session(&text("node")?, Kind::Files).await?;
-                let (from, to) = (text("from")?, text("to")?);
-                self.execute(Command::RenamePath { session, from, to })
-                    .await?
-            }
-            "remove_path" => {
-                let session = self.session(&text("node")?, Kind::Files).await?;
-                let path = text("path")?;
-                self.execute(Command::RemovePath { session, path }).await?
-            }
-            "start_tunnel" => {
-                let node = self.node(&text("node")?).await?;
-                let mut events = self.client.subscribe();
-                let session = match self.execute(Command::StartTunnel { node: node.id }).await? {
-                    Response::Session { session } => session,
-                    other => return Ok(pretty(&other)),
-                };
-                self.wait(session, &mut events).await?;
-                return Ok(format!("{} is up", node.name));
-            }
-            "stop_tunnel" => {
-                let node = self.node(&text("node")?).await?;
-                let running = self
-                    .sessions_list()
-                    .await?
-                    .into_iter()
-                    .find(|s| s.node == node.id && s.kind == burrow_core::SessionKind::Tunnel);
-                let Some(running) = running else {
-                    return Ok(format!("{} was not running", node.name));
-                };
-                let command = Command::CloseSession {
-                    session: running.session,
-                };
-                self.execute(command).await?
-            }
-            "monitor" => {
-                let session = self.session(&text("node")?, Kind::Monitor).await?;
-                let all_units = args["units"].as_str() == Some("all");
-                return self.monitor(session, all_units).await;
-            }
-            _ => return Err(Called::Invalid(format!("no tool is called {tool:?}"))),
-        };
-        Ok(pretty(&response))
-    }
-
-    /// Every node, with what the assistant may do on it.
-    async fn list_nodes(&self) -> Result<String, Called> {
-        let nodes = match self.execute(Command::ListNodes).await? {
-            Response::Nodes { nodes } => nodes,
-            other => return Ok(pretty(&other)),
-        };
-        let grants = match self.execute(Command::ListGrants).await? {
-            Response::Grants { grants } => grants,
-            _ => Vec::new(),
-        };
-        let path = |node: &Node| {
-            let mut names = vec![node.name.clone()];
-            let mut parent = node.parent;
-            while let Some(id) = parent {
-                let Some(up) = nodes.iter().find(|n| n.id == id) else {
-                    break;
-                };
-                names.push(up.name.clone());
-                parent = up.parent;
-            }
-            names.reverse();
-            names.join("/")
-        };
-        let listed: Vec<Value> = nodes
-            .iter()
-            .filter(|n| !n.is_folder())
-            .map(|node| {
-                let grant = grants.iter().find(|g| g.node == node.id && !g.stale);
-                let allowed: Vec<String> = grant
-                    .map(|g| g.capabilities.iter().map(|c| c.to_string()).collect())
-                    .unwrap_or_default();
-                json!({
-                    "id": node.id,
-                    "name": node.name,
-                    "path": path(node),
-                    "kind": node.kind,
-                    "settings": node.props,
-                    "allowed": allowed,
-                })
-            })
-            .collect();
-        Ok(serde_json::to_string_pretty(&listed).unwrap_or_default())
-    }
-
-    /// The latest stats and a summary of the history, rather than every
-    /// sample, which would fill the assistant's context.
-    async fn monitor(&self, session: SessionId, all_units: bool) -> Result<String, Called> {
-        // A monitor that just started has no sample yet.
-        let deadline = tokio::time::Instant::now() + FIRST_SAMPLE;
-        let history = loop {
-            let history = match self.execute(Command::MonitorHistory { session }).await? {
-                Response::Monitor { history } => history,
-                other => return Ok(pretty(&other)),
-            };
-            if !history.samples.is_empty() || tokio::time::Instant::now() >= deadline {
-                break history;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        };
-        let mut summary = monitor_summary(&history, all_units);
-        // A host monitored in the background has alerts too.
-        let running = self.sessions_list().await?;
-        let info = running.iter().find(|s| s.session == session);
-        if let Some(info) = info.filter(|info| info.background) {
-            let alerts = match self.execute(Command::ListAlerts).await? {
-                Response::Alerts { alerts } => alerts,
-                _ => Vec::new(),
-            };
-            let alerts: Vec<_> = alerts.into_iter().filter(|a| a.node == info.node).collect();
-            summary["background"] = json!(true);
-            summary["alerts"] = json!(alerts);
-        }
-        Ok(serde_json::to_string_pretty(&summary).unwrap_or_default())
-    }
-
     async fn node(&self, arg: &str) -> Result<Node, Called> {
         find(&self.client, arg)
             .await
@@ -371,69 +177,6 @@ enum Called {
     /// The tool ran and failed, or Burrow refused it.
     Failed(String),
 }
-
-/// The latest sample, the lowest, mean and highest CPU and memory use
-/// over the history, and the services: the failed ones, or all of them.
-fn monitor_summary(history: &burrow_core::MonitorHistory, all_units: bool) -> Value {
-    let samples = &history.samples;
-    let spread = |value: &dyn Fn(&burrow_core::monitor::Sample) -> f64| {
-        let values: Vec<f64> = samples.iter().map(value).collect();
-        if values.is_empty() {
-            return Value::Null;
-        }
-        let mean = values.iter().sum::<f64>() / values.len() as f64;
-        let low = values.iter().copied().fold(f64::INFINITY, f64::min);
-        let high = values.iter().copied().fold(0.0, f64::max);
-        let round = |v: f64| (v * 10.0).round() / 10.0;
-        json!({"min": round(low), "mean": round(mean), "max": round(high)})
-    };
-    let memory_used = |s: &burrow_core::monitor::Sample| {
-        let total = s.memory.total.max(1) as f64;
-        (total - s.memory.available as f64) * 100.0 / total
-    };
-    let minutes = match (samples.first(), samples.last()) {
-        (Some(first), Some(last)) => last.time.saturating_sub(first.time) as f64 / 60_000.0,
-        _ => 0.0,
-    };
-    let units = history.units.as_ref().map(|units| {
-        let failed: Vec<_> = units.iter().filter(|u| u.active == "failed").collect();
-        if all_units {
-            json!({"count": units.len(), "failed": failed.len(), "units": units})
-        } else {
-            json!({"count": units.len(), "failed": failed})
-        }
-    });
-    json!({
-        "latest": samples.last(),
-        "history": {
-            "samples": samples.len(),
-            "minutes": (minutes * 10.0).round() / 10.0,
-            "cpu_percent": spread(&|s| s.cpu.percent),
-            "memory_used_percent": spread(&memory_used),
-        },
-        "systemd": history.systemd,
-        "services": units,
-        "apps": history.apps,
-    })
-}
-
 fn pretty(response: &Response) -> String {
     serde_json::to_string_pretty(response).unwrap_or_default()
-}
-
-/// A file's start as text when it is UTF-8, otherwise as base64.
-fn file_text(data: &[u8], size: u64) -> String {
-    let shown = data.len() as u64;
-    let note = if shown < size {
-        format!("(first {shown} of {size} bytes)\n")
-    } else {
-        String::new()
-    };
-    match std::str::from_utf8(data) {
-        Ok(text) => format!("{note}{text}"),
-        Err(_) => format!(
-            "{note}(not UTF-8, so in base64)\n{}",
-            data_encoding::BASE64.encode(data)
-        ),
-    }
 }
