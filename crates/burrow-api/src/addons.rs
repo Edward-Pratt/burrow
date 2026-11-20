@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// An addon found in the `addons/` folder, as [`Command::ListAddons`](crate::api::Command::ListAddons)
+/// An addon found in the `addons/` folder, as [`Command::ListAddons`](crate::Command::ListAddons)
 /// reports it. Everything but `state` comes from its `addon.toml`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AddonInfo {
@@ -25,7 +25,7 @@ pub struct AddonInfo {
     pub program: PathBuf,
     /// A hash of everything an approval covers: the id, permissions, kinds,
     /// program path and arguments, and every file in the addon's folder.
-    /// [`Command::ApproveAddon`](crate::api::Command::ApproveAddon) must repeat it, so the user approves
+    /// [`Command::ApproveAddon`](crate::Command::ApproveAddon) must repeat it, so the user approves
     /// exactly what they were shown.
     pub fingerprint: String,
     #[serde(flatten)]
@@ -118,7 +118,7 @@ pub struct Field {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FormField {
-    /// The key of its value in [`Command::InvokeAction`](crate::api::Command::InvokeAction)'s `values`.
+    /// The key of its value in [`Command::InvokeAction`](crate::Command::InvokeAction)'s `values`.
     pub name: String,
     pub label: String,
     #[serde(flatten)]

@@ -6,7 +6,6 @@
 //! so it can run behind a GTK main loop today and inside `burrowd` later.
 
 mod addon;
-mod api;
 mod class;
 pub mod daemon;
 mod db;
@@ -24,6 +23,10 @@ mod ssh;
 mod tree;
 mod vnc;
 mod watch;
+
+/// The API types live in burrow-api, which clients off the desktop can
+/// build. The core reaches them as `crate::api`, as before they moved.
+use burrow_api as api;
 
 pub use api::{
     API_VERSION, AddonAction, AddonCommand, AddonInfo, AddonKind, AddonState, Alert, AlertId,

@@ -1,8 +1,8 @@
 # Burrow core API
 
-Every client drives `burrow-core` through one API: the GTK UI, addons, `burrow-cli` and the MCP bridge. In-process clients call `Core::execute(Command)` and `Core::subscribe()`. Out-of-process clients use the same types as JSON-RPC over a Unix socket; see [Socket](#socket).
+Every client drives `burrow-core` through one API: the GTK UI, addons, `burrow-cli` and the MCP bridge. In-process clients call `Core::execute(Command)` and `Core::subscribe()`. Out-of-process clients use the same types as JSON-RPC over a Unix socket; see [Socket](#socket). The types are in the `burrow-api` crate, which needs nothing from the Linux desktop, so a client elsewhere, such as a phone, can use them too.
 
-API version: **1** (`burrow_core::API_VERSION`). Breaking changes bump it.
+API version: **1** (`burrow_api::API_VERSION`). Breaking changes bump it.
 
 ## Nodes
 
@@ -433,7 +433,7 @@ A view is a list of blocks, drawn top to bottom with native widgets:
 
 ## Socket
 
-`burrowd` serves the API on a Unix socket to clients in other processes: the GTK window, `burrow` (the CLI) and its MCP bridge. Only processes running as the same user may connect; the daemon checks the peer's uid with `SO_PEERCRED`.
+`burrowd` serves the API on a Unix socket to clients in other processes: the GTK window, `burrow` (the CLI), its MCP bridge and, through [`burrow proxy`](#over-ssh), the phone app. Only processes running as the same user may connect; the daemon checks the peer's uid with `SO_PEERCRED`. `burrow_api::Client` is the client's side, over the socket or any other stream.
 
 JSON-RPC 2.0, one message per line (UTF-8, `\n`-terminated), in both directions. A line over 64 MiB drops the connection.
 
@@ -455,10 +455,26 @@ The daemon sends:
 | `output` (notification) | `{ session, data }` | Terminal output, `data` in base64. |
 | `output_ended` (notification) | `{ session }` | The terminal has no more output. It always comes after the last `output`. |
 
-- **`initialize` first:** anything else before it is refused. `api` must be the daemon's `API_VERSION`. `build` is the client's version, naming the commit in installed builds; the daemon's comes back, so a client can tell it is talking to a daemon from before an upgrade.
-- **Roles:** `role` is `gui` (the GTK window), `cli` or `mcp` (the MCP bridge). `gui` and `cli` may run every command. `mcp` may only do what the user granted; see [MCP bridge](#mcp-bridge).
+- **`initialize` first, and once:** anything else before it is refused. `api` must be the daemon's `API_VERSION`. The daemon answers it before reading the next line, so the role is set before any later request runs. A second `initialize` is refused and the role stays, and one that fails closes the connection, so a client refused one role can't ask for another on the same connection. `build` is the client's version, naming the commit in installed builds; the daemon's comes back, so a client can tell it is talking to a daemon from before an upgrade.
+- **Roles:** `role` is `gui` (the GTK window), `cli`, `mcp` (the MCP bridge) or `mobile` (the phone app, through [`burrow proxy`](#over-ssh)). `gui`, `cli` and `mobile` may run every command and hear every event. `mcp` may only do what the user granted; see [MCP bridge](#mcp-bridge). `mobile` is where the daemon would limit a phone, if that is ever wanted, with no change to the protocol.
 - **Sessions belong to their client:** terminals, file sessions and database sessions close when the client that opened them disconnects. Tunnels belong to the daemon and keep running.
 - **Output and events:** replies and events are sent before terminal output, so a busy terminal does not hold them up. Terminal output that the client reads slowly slows the session down rather than being dropped.
+
+### Over SSH
+
+`burrow proxy --role <role>` speaks the socket's protocol on its stdin and stdout, for a client on another computer that reaches this one with SSH, such as the phone app. It is meant as an SSH key's forced command, so that key can only ever be that client, never a shell:
+
+```
+command="/home/<user>/.local/bin/burrow proxy --role mobile",no-port-forwarding,no-pty,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA… burrow-mobile
+```
+
+The path is absolute because sshd runs a forced command through the user's shell non-interactively, where `~/.local/bin` is usually not on `PATH`.
+
+- **The first line must be `initialize`,** a request with an id and the role the proxy was given. Anything else is answered with a JSON-RPC error (code `-32600`) and the proxy exits, before it finds or starts the daemon. The first line may be up to 64 KiB.
+- **Then it passes bytes on:** it finds or starts the daemon as the window does and sends it the `initialize` it checked, written out again from what it read so the daemon can't read the line differently. It holds back the rest of what the client sends until the daemon has answered that `initialize`, and exits if the answer is an error, so no later line can ask for another role, whatever the daemon's build. After that it passes everything both ways unchanged.
+- **The same trust boundary:** the process on the socket is the proxy, running as the user, so `SO_PEERCRED` still holds and the daemon listens on no network.
+- **A daemon from another build** is replaced when nothing runs in it, as for the window. Otherwise the proxy uses it, and `build` in the answer to `initialize` says so. A daemon from before the `mobile` role refuses that role, so a phone can't connect until it stops.
+- **It ends** when the daemon closes the connection. The client closing its side makes the daemon do that, and the client's sessions close with it.
 
 ## MCP bridge
 

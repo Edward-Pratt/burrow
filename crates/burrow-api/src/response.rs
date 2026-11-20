@@ -71,7 +71,7 @@ pub enum Response {
     },
     /// The start of a file, its whole size, and the SHA-256 of `data` in
     /// lower-case hex. When `data` is the whole file, that hash can go in
-    /// [`Command::WriteFile`](crate::api::Command::WriteFile)'s `expect`.
+    /// [`Command::WriteFile`](crate::Command::WriteFile)'s `expect`.
     File {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,

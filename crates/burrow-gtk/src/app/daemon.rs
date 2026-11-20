@@ -2,7 +2,8 @@
 
 use std::time::Duration;
 
-use burrow_core::ipc::{self, Client, Role};
+use burrow_api::{Client, Role};
+use burrow_core::ipc;
 use burrow_core::{Command, Event, NodeId, Response, SessionId, SessionState};
 use relm4::{ComponentSender, gtk};
 use tokio::sync::broadcast::error::RecvError;
@@ -219,7 +220,7 @@ pub(super) fn listen(core: &Client, sender: &ComponentSender<App>) {
 /// running through an upgrade because tunnels or terminals run in it.
 pub(super) fn stale_daemon(core: &Client) -> Option<String> {
     let build = &core.info().build;
-    (*build != ipc::BUILD).then(|| {
+    (*build != burrow_api::BUILD).then(|| {
         format!(
             "Burrow's core ({}) is from before an update. Stop what runs in it, \
              then run \"burrow daemon stop\".",

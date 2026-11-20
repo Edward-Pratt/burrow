@@ -452,13 +452,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "burrow-api"
+version = "0.1.2"
+dependencies = [
+ "burrow-agent",
+ "data-encoding",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "burrow-cli"
 version = "0.1.2"
 dependencies = [
+ "burrow-api",
  "burrow-core",
  "clap",
  "data-encoding",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -470,6 +489,7 @@ name = "burrow-core"
 version = "0.1.2"
 dependencies = [
  "burrow-agent",
+ "burrow-api",
  "data-encoding",
  "des",
  "directories",
@@ -506,6 +526,7 @@ dependencies = [
 name = "burrow-gtk"
 version = "0.1.2"
 dependencies = [
+ "burrow-api",
  "burrow-core",
  "gtk4",
  "relm4",

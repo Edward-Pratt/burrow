@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+burrow-api = { version = "0.1.2", path = "../burrow-api" }
 burrow-core = { version = "0.1.2", path = "../burrow-core" }
 gtk = { version = "0.11", package = "gtk4", features = ["v4_20"] }
 relm4 = "0.11"

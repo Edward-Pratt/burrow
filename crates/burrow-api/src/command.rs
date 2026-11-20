@@ -1,8 +1,8 @@
 //! modular-exempt: one enum, every command of the API in one place with
 //! its documentation; it is read as one list.
 //!
-//! Every command a client can send, as [`Core::execute`](crate::Core::execute)
-//! takes it, with what each returns.
+//! Every command a client can send, as burrow-core's `Core::execute` takes
+//! it, with what each returns.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -18,9 +18,9 @@ use super::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
-    /// Returns [`Response::Version`](crate::api::Response::Version).
+    /// Returns [`Response::Version`](crate::Response::Version).
     Version,
-    /// Returns every node as [`Response::Nodes`](crate::api::Response::Nodes).
+    /// Returns every node as [`Response::Nodes`](crate::Response::Nodes).
     ListNodes,
     GetNode {
         id: NodeId,
@@ -73,7 +73,7 @@ pub enum Command {
     /// that [`Command::AddSshHost`] would refuse, so a client asks about
     /// the Include line only for a host it can add. Creates that file,
     /// with only a comment, if it is missing, since `ssh` only reports reading files that
-    /// exist. Returns [`Response::SshInclude`](crate::api::Response::SshInclude).
+    /// exist. Returns [`Response::SshInclude`](crate::Response::SshInclude).
     CheckSshInclude {
         alias: String,
     },
@@ -82,7 +82,7 @@ pub enum Command {
     /// the alias. `add_include` allows putting the `Include` line for that
     /// file at the top of the config, which the user must have agreed to.
     /// Refuses an alias the config already names. Returns
-    /// [`Response::Node`](crate::api::Response::Node).
+    /// [`Response::Node`](crate::Response::Node).
     AddSshHost {
         #[serde(default)]
         parent: Option<NodeId>,
@@ -98,9 +98,9 @@ pub enum Command {
         add_include: bool,
     },
     /// Connects to an SSH host node and starts a shell in a terminal of
-    /// `cols` x `rows`. Returns [`Response::Session`](crate::api::Response::Session) straight away; progress
-    /// arrives as [`Event::SessionChanged`](crate::api::Event::SessionChanged) and output on the session's
-    /// output stream ([`Core::take_output`](crate::Core::take_output)).
+    /// `cols` x `rows`. Returns [`Response::Session`](crate::Response::Session) straight away; progress
+    /// arrives as [`Event::SessionChanged`](crate::Event::SessionChanged) and output on the session's
+    /// output stream (`take_output`).
     OpenTerminal {
         node: NodeId,
         cols: u16,
@@ -131,26 +131,26 @@ pub enum Command {
         answer: PromptAnswer,
     },
     /// Disconnects a terminal or stops a tunnel. The session then reports
-    /// [`SessionState::Closed`](crate::api::SessionState::Closed).
+    /// [`SessionState::Closed`](crate::SessionState::Closed).
     CloseSession {
         session: SessionId,
     },
-    /// Returns every running session as [`Response::Sessions`](crate::api::Response::Sessions).
+    /// Returns every running session as [`Response::Sessions`](crate::Response::Sessions).
     ListSessions,
-    /// Starts an SSH tunnel node. Returns [`Response::Session`](crate::api::Response::Session) straight
+    /// Starts an SSH tunnel node. Returns [`Response::Session`](crate::Response::Session) straight
     /// away, or the tunnel's session if it is already running. Progress
-    /// arrives as [`Event::SessionChanged`](crate::api::Event::SessionChanged), as for a terminal.
+    /// arrives as [`Event::SessionChanged`](crate::Event::SessionChanged), as for a terminal.
     StartTunnel {
         node: NodeId,
     },
     /// Opens an SFTP session on an SSH host node, for a file panel. Returns
-    /// [`Response::Session`](crate::api::Response::Session) straight away; progress arrives as
-    /// [`Event::SessionChanged`](crate::api::Event::SessionChanged), as for a terminal.
+    /// [`Response::Session`](crate::Response::Session) straight away; progress arrives as
+    /// [`Event::SessionChanged`](crate::Event::SessionChanged), as for a terminal.
     OpenFiles {
         node: NodeId,
     },
     /// Lists a remote folder. An empty `path` is the home folder. Returns
-    /// [`Response::Dir`](crate::api::Response::Dir).
+    /// [`Response::Dir`](crate::Response::Dir).
     ListDir {
         session: SessionId,
         #[serde(default)]
@@ -173,7 +173,7 @@ pub enum Command {
         path: String,
     },
     /// Reads up to `limit` bytes (1 MiB when missing, at most 16 MiB) from
-    /// the start of a remote file. Returns [`Response::File`](crate::api::Response::File). For clients
+    /// the start of a remote file. Returns [`Response::File`](crate::Response::File). For clients
     /// that work with contents rather than local files.
     ReadFile {
         session: SessionId,
@@ -185,7 +185,7 @@ pub enum Command {
     /// replacing one already there only with `overwrite`. Like an upload, it
     /// goes through a temporary file and never writes through a symlink.
     ///
-    /// With `expect`, the SHA-256 a [`Response::File`](crate::api::Response::File) gave for the whole
+    /// With `expect`, the SHA-256 a [`Response::File`](crate::Response::File) gave for the whole
     /// file, it replaces the file only if it still has that hash, and fails
     /// if it changed or is gone. Then `overwrite` isn't needed.
     WriteFile {
@@ -201,8 +201,8 @@ pub enum Command {
     /// Copies a remote file or folder to `local`, an absolute path that
     /// names the copy itself. Fails if `local` exists, unless `overwrite`
     /// is set: then files are replaced and folders merged. Returns
-    /// [`Response::Transfer`](crate::api::Response::Transfer); progress arrives as
-    /// [`Event::TransferChanged`](crate::api::Event::TransferChanged).
+    /// [`Response::Transfer`](crate::Response::Transfer); progress arrives as
+    /// [`Event::TransferChanged`](crate::Event::TransferChanged).
     Download {
         session: SessionId,
         remote: String,
@@ -224,7 +224,7 @@ pub enum Command {
     },
     /// Runs `command` on an SSH host node without a terminal, as
     /// `ssh host command` does, and waits for it. `timeout` covers
-    /// connecting too. Returns [`Response::Exec`](crate::api::Response::Exec).
+    /// connecting too. Returns [`Response::Exec`](crate::Response::Exec).
     Exec {
         node: NodeId,
         command: String,
@@ -234,7 +234,7 @@ pub enum Command {
     },
     /// Connects to a `vnc` node's desktop through its SSH host and signs
     /// in, asking for the password if the server wants one. Returns
-    /// [`Response::Session`](crate::api::Response::Session). Once `connected`, the session's output is the
+    /// [`Response::Session`](crate::Response::Session). Once `connected`, the session's output is the
     /// server's RFB stream, as if from a server that needs no password and
     /// speaks RFB 3.8: the client reads it with `take_output`, writes with
     /// [`Command::WriteTerminal`], and speaks RFB itself.
@@ -246,37 +246,37 @@ pub enum Command {
     /// root, with `sudo -n` unless the user is root: when sudo wants a
     /// password, it fails with `needs_password`, and the same action can
     /// run in a terminal with [`TerminalRun::Control`], where the user
-    /// types it. Returns [`Response::Controlled`](crate::api::Response::Controlled).
+    /// types it. Returns [`Response::Controlled`](crate::Response::Controlled).
     ControlService {
         node: NodeId,
         service: Service,
         action: ServiceAction,
     },
     /// Starts burrow-agent on an SSH host node, putting it there first if
-    /// needed, and reports what it sees as [`Event::MonitorSample`](crate::api::Event::MonitorSample),
-    /// [`Event::MonitorUnits`](crate::api::Event::MonitorUnits) and [`Event::MonitorApps`](crate::api::Event::MonitorApps). Returns [`Response::Session`](crate::api::Response::Session): the host's
+    /// needed, and reports what it sees as [`Event::MonitorSample`](crate::Event::MonitorSample),
+    /// [`Event::MonitorUnits`](crate::Event::MonitorUnits) and [`Event::MonitorApps`](crate::Event::MonitorApps). Returns [`Response::Session`](crate::Response::Session): the host's
     /// background monitor if it has one, otherwise a new session. A
     /// background monitor then repeats its state and the prompts it waits
     /// on, as events, since the caller may have missed them.
     OpenMonitor {
         node: NodeId,
     },
-    /// What a monitor session has seen so far, as [`Response::Monitor`](crate::api::Response::Monitor).
+    /// What a monitor session has seen so far, as [`Response::Monitor`](crate::Response::Monitor).
     MonitorHistory {
         session: SessionId,
     },
     /// A background monitor's history on disk over `range`, as
-    /// [`Response::Trend`](crate::api::Response::Trend). It reads by host, so it works while no monitor
+    /// [`Response::Trend`](crate::Response::Trend). It reads by host, so it works while no monitor
     /// runs.
     MonitorTrend {
         node: NodeId,
         range: TrendRange,
     },
     /// Returns the SSH hosts monitored in the background, as
-    /// [`Response::Monitoring`](crate::api::Response::Monitoring).
+    /// [`Response::Monitoring`](crate::Response::Monitoring).
     ListMonitoring,
     /// Returns the alerts that hold now, oldest first, as
-    /// [`Response::Alerts`](crate::api::Response::Alerts).
+    /// [`Response::Alerts`](crate::Response::Alerts).
     ListAlerts,
     /// Monitors an SSH host in the background, from when Burrow starts, or
     /// stops doing so. Like autostart, the choice is kept on this computer
@@ -288,7 +288,7 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expect: Option<GrantShown>,
     },
-    /// Returns the tunnels that start with Burrow, as [`Response::Autostart`](crate::api::Response::Autostart).
+    /// Returns the tunnels that start with Burrow, as [`Response::Autostart`](crate::Response::Autostart).
     ListAutostart,
     /// Makes a tunnel start with Burrow, or stops it doing so. The choice is
     /// kept on this computer, not in the tunnel's file, and only holds while
@@ -302,7 +302,7 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expect: Option<TunnelShown>,
     },
-    /// Returns what the MCP bridge may do, as [`Response::Grants`](crate::api::Response::Grants).
+    /// Returns what the MCP bridge may do, as [`Response::Grants`](crate::Response::Grants).
     ListGrants,
     /// Lets the MCP bridge do `capabilities` on `node`, replacing what it
     /// could; none takes everything away. Like autostart, this is kept on
@@ -314,15 +314,15 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expect: Option<GrantShown>,
     },
-    /// Connects to a database node. Returns [`Response::Session`](crate::api::Response::Session) straight
-    /// away; progress arrives as [`Event::SessionChanged`](crate::api::Event::SessionChanged), as for a
+    /// Connects to a database node. Returns [`Response::Session`](crate::Response::Session) straight
+    /// away; progress arrives as [`Event::SessionChanged`](crate::Event::SessionChanged), as for a
     /// terminal. The connection starts read-only.
     OpenDatabase {
         node: NodeId,
     },
     /// Runs SQL on a connected database session and waits for it. Each
     /// statement keeps at most `limit` rows (1000 when missing). Returns
-    /// [`Response::Query`](crate::api::Response::Query).
+    /// [`Response::Query`](crate::Response::Query).
     RunQuery {
         session: SessionId,
         sql: String,
@@ -340,27 +340,27 @@ pub enum Command {
         read_only: bool,
     },
     /// Returns the database's schemas, tables and columns as
-    /// [`Response::Schema`](crate::api::Response::Schema).
+    /// [`Response::Schema`](crate::Response::Schema).
     ListSchema {
         session: SessionId,
     },
     /// Runs SQL in a read-only transaction and writes every row it returns
     /// to `path`, an absolute local path, as CSV. Returns
-    /// [`Response::Exported`](crate::api::Response::Exported).
+    /// [`Response::Exported`](crate::Response::Exported).
     ExportQuery {
         session: SessionId,
         sql: String,
         path: PathBuf,
     },
     /// Returns the queries run on a database node, oldest first, as
-    /// [`Response::History`](crate::api::Response::History).
+    /// [`Response::History`](crate::Response::History).
     ListHistory {
         node: NodeId,
     },
     ClearHistory {
         node: NodeId,
     },
-    /// Returns every addon as [`Response::Addons`](crate::api::Response::Addons), sorted by id.
+    /// Returns every addon as [`Response::Addons`](crate::Response::Addons), sorted by id.
     ListAddons,
     /// Lets an addon run. `fingerprint` must match the one `list_addons`
     /// reported, so a change made meanwhile is not approved unseen.
@@ -373,14 +373,14 @@ pub enum Command {
         id: String,
     },
     /// Asks the addon that owns the node's kind what to draw for it.
-    /// Returns [`Response::View`](crate::api::Response::View). Later versions of the view arrive as
-    /// [`Event::ViewChanged`](crate::api::Event::ViewChanged).
+    /// Returns [`Response::View`](crate::Response::View). Later versions of the view arrive as
+    /// [`Event::ViewChanged`](crate::Event::ViewChanged).
     OpenView {
         node: NodeId,
     },
     /// Sends an action to an addon: a palette command (no `node`), a
     /// context-menu action, or a button or form in one of its views.
-    /// Returns [`Response::Invoked`](crate::api::Response::Invoked).
+    /// Returns [`Response::Invoked`](crate::Response::Invoked).
     InvokeAction {
         addon: String,
         action: String,

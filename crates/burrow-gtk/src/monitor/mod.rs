@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Instant;
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::monitor::{Sample, Unit};
 use burrow_core::{
     Alert, AlertKind, Command, MonitorHistory, NodeId, Response, SessionState, TrendRange,

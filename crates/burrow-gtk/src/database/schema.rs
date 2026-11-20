@@ -1,6 +1,6 @@
 //! The schema tree beside the editor: loading it, drawing it and naming its tables.
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::{Command, DbTableKind, NodeId, Response};
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gio, glib};

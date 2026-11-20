@@ -79,7 +79,7 @@ impl Inner {
     }
 
     pub(super) fn execute(&self, command: Command) -> Result<Response> {
-        let changes_tree = command.class().changes_tree;
+        let changes_tree = crate::class::of(&command).changes_tree;
         let response = self.execute_inner(command);
         if changes_tree {
             self.check_autostart();

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use burrow_core::ipc::Client;
+use burrow_api::Client;
 use burrow_core::{Command, Node, NodeId, Response, SessionId};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -107,7 +107,7 @@ impl Bridge {
                 json!({"supported": VERSIONS, "requested": version}),
             ));
         }
-        let server_info = json!({"name": "burrow", "version": burrow_core::ipc::BUILD});
+        let server_info = json!({"name": "burrow", "version": burrow_api::BUILD});
         let mut result = match method {
             "server/discover" => json!({
                 "supportedVersions": VERSIONS,

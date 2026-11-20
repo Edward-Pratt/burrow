@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use burrow_core::ipc::Events;
+use burrow_api::Events;
 use burrow_core::{Command, Event, Response, SessionId, SessionInfo, SessionState};
 use tokio::sync::broadcast::error::RecvError;
 

@@ -60,6 +60,16 @@ pub enum Error {
     Task(String),
 }
 
+/// A client's error, as the CLI and the window get it from the daemon.
+impl From<burrow_api::Error> for Error {
+    fn from(error: burrow_api::Error) -> Self {
+        match error {
+            burrow_api::Error::Io { path, source } => Error::Io { path, source },
+            burrow_api::Error::Remote(message) => Error::Remote(message),
+        }
+    }
+}
+
 impl Error {
     pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Error::Io {

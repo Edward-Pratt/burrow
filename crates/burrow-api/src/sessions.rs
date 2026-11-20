@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{NodeId, SecretValue};
 
-/// Identifies a session opened with [`Command::OpenTerminal`](crate::api::Command::OpenTerminal),
-/// [`Command::StartTunnel`](crate::api::Command::StartTunnel) or [`Command::OpenFiles`](crate::api::Command::OpenFiles). Unique for as long as
+/// Identifies a session opened with [`Command::OpenTerminal`](crate::Command::OpenTerminal),
+/// [`Command::StartTunnel`](crate::Command::StartTunnel) or [`Command::OpenFiles`](crate::Command::OpenFiles). Unique for as long as
 /// the core runs, and a later session has a larger id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -44,11 +44,11 @@ pub enum SessionKind {
     Files,
     /// A connection to a database.
     Database,
-    /// One command run with [`Command::Exec`](crate::api::Command::Exec).
+    /// One command run with [`Command::Exec`](crate::Command::Exec).
     Exec,
-    /// burrow-agent reporting a server's state, for [`Command::OpenMonitor`](crate::api::Command::OpenMonitor).
+    /// burrow-agent reporting a server's state, for [`Command::OpenMonitor`](crate::Command::OpenMonitor).
     Monitor,
-    /// A VNC desktop, for [`Command::OpenVnc`](crate::api::Command::OpenVnc).
+    /// A VNC desktop, for [`Command::OpenVnc`](crate::Command::OpenVnc).
     Vnc,
 }
 
@@ -103,7 +103,7 @@ pub struct FileEntry {
     pub permissions: Option<u32>,
 }
 
-/// A running session, as [`Command::ListSessions`](crate::api::Command::ListSessions) reports it.
+/// A running session, as [`Command::ListSessions`](crate::Command::ListSessions) reports it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session: SessionId,
@@ -114,7 +114,7 @@ pub struct SessionInfo {
     pub kind: SessionKind,
     #[serde(flatten)]
     pub state: SessionState,
-    /// A monitor the core runs for [`Command::SetMonitoring`](crate::api::Command::SetMonitoring) rather than
+    /// A monitor the core runs for [`Command::SetMonitoring`](crate::Command::SetMonitoring) rather than
     /// for a client. It reconnects by itself, and only turning monitoring
     /// off stops it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

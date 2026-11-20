@@ -102,7 +102,7 @@ impl ServiceAction {
     }
 }
 
-/// What an [`Command::OpenTerminal`](crate::api::Command::OpenTerminal) session runs instead of a shell.
+/// What an [`Command::OpenTerminal`](crate::Command::OpenTerminal) session runs instead of a shell.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TerminalRun {
@@ -115,7 +115,7 @@ pub enum TerminalRun {
     },
 }
 
-/// How far back [`Command::MonitorTrend`](crate::api::Command::MonitorTrend) looks.
+/// How far back [`Command::MonitorTrend`](crate::Command::MonitorTrend) looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrendRange {
@@ -124,7 +124,7 @@ pub enum TrendRange {
     Week,
 }
 
-/// What a monitor has seen, for [`Command::MonitorHistory`](crate::api::Command::MonitorHistory).
+/// What a monitor has seen, for [`Command::MonitorHistory`](crate::Command::MonitorHistory).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MonitorHistory {
     /// Whether the server runs systemd, so whether `units` will come.
@@ -138,7 +138,7 @@ pub struct MonitorHistory {
     pub apps: Option<monitor::Apps>,
 }
 
-/// What a command run with [`Command::Exec`](crate::api::Command::Exec) did. Output is decoded as
+/// What a command run with [`Command::Exec`](crate::Command::Exec) did. Output is decoded as
 /// UTF-8, with invalid bytes replaced, and each stream is cut at 1 MiB.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecResult {

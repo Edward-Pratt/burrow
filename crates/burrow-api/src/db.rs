@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// What a query sent with [`Command::RunQuery`](crate::api::Command::RunQuery) returned. A query can hold
+/// What a query sent with [`Command::RunQuery`](crate::Command::RunQuery) returned. A query can hold
 /// several statements; each one that finished has an entry in
 /// `statements`, in order. If one failed, `error` says why and the
 /// statements after it did not run.

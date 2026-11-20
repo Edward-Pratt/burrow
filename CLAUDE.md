@@ -4,14 +4,15 @@ A Linux-first desktop app for servers and databases, in Rust + GTK4 (gtk4-rs + r
 
 ## Layout
 
-- `crates/burrow-core`: everything that isn't drawing. It owns config, secrets, SSH, tunnels, SFTP and the addon host. Clients drive it only through `Core::execute(Command)` and `Core::subscribe()` (`src/api/` is the contract).
+- `crates/burrow-api`: the contract. The API's types, the socket protocol's own types (`rpc.rs`: roles, `initialize`) and the JSON-RPC client over any stream (`client/`). It must build without the Linux desktop (no D-Bus, Secret Service or XDG), since the phone app depends on it by git; burrow-core re-exports its types.
+- `crates/burrow-core`: everything that isn't drawing. It owns config, secrets, SSH, tunnels, SFTP and the addon host. Clients drive it only through `Core::execute(Command)` and `Core::subscribe()`, with the types in `burrow-api` (reached inside the core as `crate::api`).
   - `src/ssh/`: `connection.rs` shares one connection per host; `session.rs` holds terminals, `tunnel.rs` tunnels, `files.rs` SFTP.
   - `src/addon/`: manifests, approval, JSON-RPC over stdio.
 - `crates/burrow-gtk`: a thin client of the core in `burrowd`. State flows one way: user action → `Command` → core `Event` → redraw. Each tab kind has a module: `terminal.rs`/`remote.rs` (terminals), `tunnels.rs`, `files/`, `monitor/`, `database/`, `desktop/` (VNC), `addons.rs`; the folders keep their struct and messages in `mod.rs`, the page builder in `page.rs` and the message handler in `update.rs`. `session.rs` is the session page the file panel, monitor and database share, and `sidebar/` the tree. `app/` is the window: `mod.rs` holds `App` and its relm4 `Component`, `dispatch.rs` routes each `AppMsg` to the module that owns the work (`tabs`, `panels`, `shells`, `sessions`, `tunnels`, `monitors`, `nodes`, `editors`, `menus`, `grants`, `views`, `status`, `window`), and `daemon.rs` talks to the core.
 - `crates/burrow-addon-notes`: the example addon, plus the addon integration tests.
-- `crates/burrowd`: the daemon binary. The daemon itself is `burrow-core/src/daemon.rs`, and the socket protocol (server, client, finding and starting the daemon, and what each role may run) is `src/ipc/`.
+- `crates/burrowd`: the daemon binary. The daemon itself is `burrow-core/src/daemon.rs`, and the daemon's side of the socket (the server, finding and starting the daemon, its lock, and what each role may run) is `src/ipc/`.
 - `crates/burrow-agent`: the program monitors run on servers, and its wire format. The core's side is `ssh/agent.rs` (install) and `ssh/monitor.rs` (session). Its sshd tests live here so they can upload its real binary. Build it for servers with `cargo build -p burrow-agent --profile agent --target x86_64-unknown-linux-musl`.
-- `crates/burrow-cli`: the `burrow` command, and `burrow mcp serve` in `src/mcp/`. What the MCP bridge may do is decided in the daemon, never in the bridge: `class.rs` says what each command needs, and `ipc/server.rs` and `grants.rs` enforce it.
+- `crates/burrow-cli`: the `burrow` command, `burrow mcp serve` in `src/mcp/`, and `burrow proxy` in `src/proxy.rs`, which an SSH key's forced command runs for the phone. What the MCP bridge may do is decided in the daemon, never in the bridge: `class.rs` says what each command needs, and `ipc/server.rs` and `grants.rs` enforce it.
 
 ## Checks
 
@@ -25,6 +26,7 @@ cargo test --workspace
 ```
 
 - Source files stay under 300 lines. `check-file-length` fails on a changed file over that which grew, or a new one, unless its first 10 lines say `modular-exempt: <reason>` (one cohesive unit, generated, or a table); a move or a cut of a long file passes. Touching a long file: move the part you change into its own module first, then change it.
+- CI also checks that `burrow-api` builds for Android: `cargo check -p burrow-api --target aarch64-linux-android` (after `rustup target add aarch64-linux-android`).
 - `crates/burrow-core/tests/ssh.rs` starts a throwaway `sshd` per test. It skips silently if `/usr/bin/sshd` is missing, so check those tests actually ran.
 - Put unit tests in the module they test, in a `#[cfg(test)] mod tests`.
 - To see a UI change working, use the `burrow-gui-test` skill (`.claude/skills/burrow-gui-test/`). It runs the app on a headless Xvfb display, never on the user's desktop.
