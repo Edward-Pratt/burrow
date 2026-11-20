@@ -132,6 +132,8 @@ pub enum AppMsg {
     },
     StartTunnel(NodeId),
     StopTunnel(NodeId),
+    /// Closes the terminals kept on a host, such as the phone's.
+    CloseKept(NodeId),
     /// Stops the tunnel and starts it again once it has closed.
     RestartTunnel(NodeId),
     EditTunnel(NodeId),
@@ -260,6 +262,7 @@ impl AppMsg {
                 | AppMsg::OpenMonitor(_)
                 | AppMsg::StartTunnel(_)
                 | AppMsg::StopTunnel(_)
+                | AppMsg::CloseKept(_)
                 | AppMsg::RestartTunnel(_)
                 | AppMsg::EditTunnel(_)
                 | AppMsg::EditDatabase(_)
