@@ -33,6 +33,7 @@ mod tunnel;
 pub(crate) use agent::Agents;
 pub(crate) use connection::{Connection, Connections, alias};
 pub(crate) use files::Transfers;
+pub(crate) use kept::AttachedOutput;
 pub(crate) use monitor::Waits;
 pub(crate) use prompter::{Prompter, unattended};
 use registry::Entry;

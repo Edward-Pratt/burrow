@@ -249,15 +249,9 @@ impl Conn {
                 }
                 Ok(serde_json::to_value(response).unwrap_or_default())
             }
-            "take_output" => {
+            "take_output" | "attach_output" | "release_output" => {
                 let SessionParams { session } = parse(params)?;
-                self.take_output(session).map_err(failed)
-            }
-            "release_output" => {
-                let SessionParams { session } = parse(params)?;
-                if let Some(forwarder) = self.forwarders.lock().unwrap().remove(&session) {
-                    forwarder.abort();
-                }
+                self.output_method(method, session).map_err(failed)?;
                 Ok(Value::Null)
             }
             _ => Err((METHOD_NOT_FOUND, format!("unknown method {method:?}"))),

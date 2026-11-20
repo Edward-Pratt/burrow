@@ -64,6 +64,7 @@ pub(super) async fn read_all<R: AsyncRead + Unpin>(read: R, shared: Arc<Shared>)
     shared.closed.store(true, Ordering::SeqCst);
     shared.pending.lock().unwrap().clear();
     shared.outputs.lock().unwrap().clear();
+    shared.replays.lock().unwrap().clear();
     let _ = shared.events.send(Signal::Closed);
 }
 
@@ -97,6 +98,18 @@ async fn dispatch(shared: &Shared, method: &str, params: Value) {
                 shared.outputs.lock().unwrap().remove(&session);
                 notify(shared, "release_output", json!({"session": session})).await;
             }
+        }
+        // Output before it was for an earlier stream, already dropped.
+        "output_replay" => {
+            let Ok(Output { session, data }) = serde_json::from_value(params) else {
+                return;
+            };
+            let Some((replay, tx)) = shared.replays.lock().unwrap().remove(&session) else {
+                return;
+            };
+            let data = BASE64.decode(data.as_bytes()).unwrap_or_default();
+            shared.outputs.lock().unwrap().insert(session, tx);
+            let _ = replay.send(data);
         }
         "output_ended" => {
             if let Ok(Output { session, .. }) = serde_json::from_value(params) {

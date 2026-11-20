@@ -62,6 +62,9 @@ struct Shared {
     next: AtomicU64,
     events: broadcast::Sender<Signal>,
     outputs: Mutex<HashMap<SessionId, mpsc::Sender<Vec<u8>>>>,
+    /// Attaches waiting for their `output_replay`: where the replay goes,
+    /// and the stream that takes over from there.
+    replays: Mutex<HashMap<SessionId, output::Replay>>,
     /// Set once the daemon's side has ended. Nothing more will be answered.
     closed: AtomicBool,
 }
@@ -97,6 +100,7 @@ impl Client {
             next: AtomicU64::new(0),
             events,
             outputs: Mutex::default(),
+            replays: Mutex::default(),
             closed: AtomicBool::new(false),
         });
         tokio::spawn(write_all(write, outbox_rx));

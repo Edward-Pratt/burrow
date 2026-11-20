@@ -194,10 +194,11 @@ Terminal output is not sent as events: a burst of output would push every subscr
 
 ### Kept terminals
 
-`keep_terminal` keeps a terminal running after the client that opened it goes, so a phone's shell survives its screen locking. Keep a terminal before taking its output: once a client has its stream, `keep_terminal` is refused. A kept terminal ends only when its shell does, on `close_session` from any client that may run it, when its node is deleted, or when the daemon stops. The MCP bridge can't keep or reach terminals.
+`keep_terminal` keeps a terminal running after the client that opened it goes, so a phone's shell survives its screen locking. Keep a terminal before taking its output: once a client has its stream, `keep_terminal` is refused. A kept terminal ends only when its shell does, on `close_session` from any client that may run it, when its node is deleted, or when the daemon stops. The MCP bridge can't keep, take or attach to terminals.
 
 - **Its output waits in a ring:** the daemon reads a kept terminal's output all the time and keeps the latest 256 KiB of it. The replay is raw bytes, so a full-screen program such as `htop` may look partly drawn until it next redraws; a client that attaches and then resizes usually makes it.
-- **Attaching:** `take_output` on a kept terminal may be called again, by any client. Its answer is `{ replay }`, what the ring holds, in base64, and the output from there on follows as `output` notifications, with nothing lost or repeated in between.
+- **Attaching:** socket clients attach with `attach_output`, as often as they like, from any client. The daemon then sends `output_replay` with what the ring holds, and the output from there on as `output` notifications, with nothing lost or repeated in between. Output for that session that arrives before the replay belongs to an earlier stream and is dropped, which `Client::attach_output` does. `take_output` is refused once a terminal is kept, and `attach_output` on a terminal that isn't kept is refused without touching it.
+- **What it asked meanwhile:** keeping and attaching both have the session say where it stands again, as `session_changed` and a `prompt_requested` for each question it waits on, so a client that attaches can answer a passphrase asked while nobody was there. Clients that heard them already hear them twice, and match prompts by id.
 - **One reader, the latest:** attaching takes over from any reader before, here or in another client, whose stream ends with `output_ended`. A client that sees `output_ended` while the session still runs was detached, not closed. Refusing the second reader instead would lock out a phone whose old connection hasn't timed out yet.
 - **A slow reader is detached, not waited on:** unlike other terminals, a kept terminal's reader that leaves output unread for 3 seconds is detached, so a build doesn't stop because the phone is in a pocket. Until then it slows the session as any reader does. It can attach again and gets the replay.
 - **Dropping or releasing the stream detaches** the reader; the terminal runs on.
@@ -455,7 +456,8 @@ The client sends:
 |---|---|---|
 | `initialize` | `{ api, role, build }` | `{ api, build, addons_dir }` |
 | `execute` | a [command](#commands) | its response, or an error |
-| `take_output` | `{ session }` | null, or `{ replay }` for a [kept terminal](#kept-terminals); the terminal's output follows as `output` |
+| `take_output` | `{ session }` | null; the terminal's output follows as `output` |
+| `attach_output` | `{ session }` | null; a [kept terminal](#kept-terminals)'s `output_replay` follows, then its output as `output` |
 | `release_output` (notification) | `{ session }` | ends the session, as dropping the stream does in-process |
 
 The daemon sends:
@@ -465,7 +467,8 @@ The daemon sends:
 | `event` (notification) | an [event](#events) | Every event the client's role may see. |
 | `resync` (notification) | | The client fell behind and missed events; list again. |
 | `output` (notification) | `{ session, data }` | Terminal output, `data` in base64. |
-| `output_ended` (notification) | `{ session }` | The terminal has no more output. It always comes after the last `output`. |
+| `output_replay` (notification) | `{ session, data }` | What a kept terminal kept, in base64, after `attach_output`. Output before it was for an earlier stream. |
+| `output_ended` (notification) | `{ session }` | The terminal has no more output. It always comes after the last `output`. For a kept terminal that still runs, the reader was detached. |
 
 - **`initialize` first, and once:** anything else before it is refused. `api` must be the daemon's `API_VERSION`. The daemon answers it before reading the next line, so the role is set before any later request runs. A second `initialize` is refused and the role stays, and one that fails closes the connection, so a client refused one role can't ask for another on the same connection. `build` is the client's version, naming the commit in installed builds; the daemon's comes back, so a client can tell it is talking to a daemon from before an upgrade.
 - **Roles:** `role` is `gui` (the GTK window), `cli`, `mcp` (the MCP bridge) or `mobile` (the phone app, through [`burrow proxy`](#over-ssh)). `gui`, `cli` and `mobile` may run every command and hear every event. `mcp` may only do what the user granted; see [MCP bridge](#mcp-bridge). `mobile` is where the daemon would limit a phone, if that is ever wanted, with no change to the protocol.

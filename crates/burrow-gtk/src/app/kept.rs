@@ -13,40 +13,47 @@ use super::daemon::{execute, list_sessions};
 
 /// Kept terminals by session, with their host.
 #[derive(Default)]
-pub(super) struct Kept(HashMap<SessionId, NodeId>);
+pub(super) struct Kept {
+    running: HashMap<SessionId, NodeId>,
+    /// Sessions seen closing since the last list, which a list asked for
+    /// before they closed may still name.
+    closed: HashSet<SessionId>,
+}
 
 impl Kept {
     /// Takes the core's list: the kept terminals in it are all there are.
     pub(super) fn take(&mut self, sessions: &[SessionInfo]) {
-        self.0 = sessions
+        let closed = std::mem::take(&mut self.closed);
+        self.running = sessions
             .iter()
-            .filter(|s| s.kept)
+            .filter(|s| s.kept && !closed.contains(&s.session))
             .map(|s| (s.session, s.node))
             .collect();
     }
 
     /// The hosts that have one.
     pub(super) fn hosts(&self) -> HashSet<NodeId> {
-        self.0.values().copied().collect()
+        self.running.values().copied().collect()
     }
 
     pub(super) fn on(&self, node: NodeId) -> Vec<SessionId> {
-        let on_node = self.0.iter().filter(|(_, n)| **n == node);
+        let on_node = self.running.iter().filter(|(_, n)| **n == node);
         on_node.map(|(s, _)| *s).collect()
     }
 }
 
 impl App {
-    /// Keeps the list of kept terminals current from session events. A
-    /// terminal is kept just after it opens, and keeping it says nothing,
-    /// so a session someone else opened is looked up once it connects.
+    /// Keeps the list of kept terminals current from session events. Events
+    /// don't say whether a session is kept, so one someone else opened is
+    /// looked up once it says it is connected, which keeping it says again.
     pub(super) fn kept_event(&mut self, event: &Event, sender: &ComponentSender<Self>) {
         let Event::SessionChanged { session, state, .. } = event else {
             return;
         };
         match state {
             SessionState::Closed { .. } => {
-                self.kept.0.remove(session);
+                self.kept.running.remove(session);
+                self.kept.closed.insert(*session);
             }
             SessionState::Connected if self.tab_of(*session).is_none() && !self.looking_up => {
                 self.looking_up = true;

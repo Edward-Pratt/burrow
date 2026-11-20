@@ -9,6 +9,9 @@ use super::keeper::Keeper;
 use crate::api::{SessionId, SessionKind};
 use crate::error::{Error, Result};
 
+/// A kept terminal's replay, and its output stream from there on.
+pub(crate) type AttachedOutput = (Vec<u8>, mpsc::Receiver<Vec<u8>>);
+
 impl Sessions {
     /// Keeps a running terminal. It must be kept before any client takes
     /// its output, so that no output goes to a reader that isn't attached.
@@ -43,7 +46,7 @@ impl Sessions {
 
     /// Attaches to a kept terminal as its one reader: what it kept, and its
     /// output from there on. A reader attached before is detached.
-    pub fn attach_output(&self, id: SessionId) -> Result<(Vec<u8>, mpsc::Receiver<Vec<u8>>)> {
+    pub fn attach_output(&self, id: SessionId) -> Result<AttachedOutput> {
         let map = self.map.lock().unwrap();
         let entry = map
             .get(&id)
