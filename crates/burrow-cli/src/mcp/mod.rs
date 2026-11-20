@@ -16,7 +16,7 @@ use burrow_core::{Command, Node, NodeId, Response, SessionId};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::{Result, find};
+use crate::{Result, nodes::find};
 
 mod sessions;
 mod tools;

@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 
 use burrow_core::{Prompt, PromptAnswer, PromptKind, SecretValue};
 
-use crate::clean;
+use crate::text::clean;
 
 /// Asks the user `prompt` on the terminal. `None` when there is no
 /// terminal to ask on.
