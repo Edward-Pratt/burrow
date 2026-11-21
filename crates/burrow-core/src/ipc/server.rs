@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use zeroize::Zeroize;
 
+mod execute;
 mod hello;
 mod mcp;
 mod output;
@@ -231,16 +232,7 @@ impl Conn {
             "execute" => {
                 let command: Command = parse(params)?;
                 let owns = crate::class::of(&command).opens_session;
-                let response = match role {
-                    Role::Gui | Role::Cli | Role::Mobile => self.core.execute(command).await,
-                    // Nobody at the bridge can answer a session's questions. The
-                    // window shows a tunnel's, whoever started it.
-                    Role::Mcp if matches!(command, Command::StartTunnel { .. }) => {
-                        self.execute_mcp(command).await
-                    }
-                    Role::Mcp => crate::ssh::unattended(self.execute_mcp(command)).await,
-                }
-                .map_err(failed)?;
+                let response = self.execute_as(role, command).await.map_err(failed)?;
                 if owns && let Response::Session { session } = response {
                     let running = self.core.sessions().list();
                     let mut owned = self.owned.lock().unwrap();
