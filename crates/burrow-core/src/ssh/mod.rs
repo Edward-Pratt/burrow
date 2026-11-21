@@ -62,7 +62,7 @@ pub(crate) fn open_terminal(
     let (output_tx, output_rx) = mpsc::channel(OUTPUT_BUFFER);
     spawn(
         core,
-        node,
+        session::for_shell(node),
         SessionKind::Terminal,
         Some(output_rx),
         move |core, node, input, prompter| async move {

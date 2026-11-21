@@ -16,6 +16,19 @@ fn text(error: impl Display) -> String {
     error.to_string()
 }
 
+/// The node as a terminal signs in to it: with `props.shell_alias`, when
+/// it has one, in place of its alias. A host can then be monitored with a
+/// key limited to that (one installed with `restrict`, as a user without
+/// sudo), and give shells with another, as one node. The shell alias is
+/// read and checked exactly as the alias is, and its connection is its own.
+pub(super) fn for_shell(mut node: Node) -> Node {
+    let shell = node.props.get("shell_alias").and_then(|v| v.as_str());
+    if let Some(shell) = shell.map(str::to_owned) {
+        node.props.insert("alias".into(), shell.into());
+    }
+    node
+}
+
 const REFUSED_PTY: &str = "the server refused a terminal. The key Burrow signs in with may be \
      limited with no-pty or restrict in authorized_keys there, as a monitoring key often is";
 
