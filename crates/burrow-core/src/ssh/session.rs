@@ -16,6 +16,34 @@ fn text(error: impl Display) -> String {
     error.to_string()
 }
 
+/// The node as a terminal signs in to it: with `props.shell_alias`, when
+/// it has one, in place of its alias. A host can then be monitored with a
+/// key limited to that (one installed with `restrict`, as a user without
+/// sudo), and give shells with another, as one node. The shell alias is
+/// read and checked exactly as the alias is, and its connection is its own.
+pub(super) fn for_shell(mut node: Node) -> Node {
+    let shell = node.props.get("shell_alias").and_then(|v| v.as_str());
+    if let Some(shell) = shell.map(str::to_owned) {
+        node.props.insert("alias".into(), shell.into());
+    }
+    node
+}
+
+const REFUSED_PTY: &str = "the server refused a terminal. The key Burrow signs in with may be \
+     limited with no-pty or restrict in authorized_keys there, as a monitoring key often is";
+
+/// Waits for the server's answer to a request sent with a reply wanted.
+async fn answered_yes(channel: &mut russh::Channel<russh::client::Msg>) -> Result<bool> {
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Success) => return Ok(true),
+            Some(ChannelMsg::Failure) => return Ok(false),
+            Some(_) => {}
+            None => return Err("the connection closed while asking for a terminal".into()),
+        }
+    }
+}
+
 /// Runs the session to the end. `Err` carries a message for the user.
 pub(super) async fn run(
     core: &Core,
@@ -57,10 +85,16 @@ pub(super) async fn run(
         .channel_open_session()
         .await
         .map_err(text)?;
+    // Asked with a reply: a server that refuses a terminal, as a key
+    // limited with no-pty or restrict does, would otherwise give a shell
+    // with no prompt or echo, where Enter never ends a line.
     channel
-        .request_pty(false, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
+        .request_pty(true, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
         .await
         .map_err(text)?;
+    if !answered_yes(&mut channel).await? {
+        return Err(REFUSED_PTY.to_string());
+    }
     match command {
         Some(command) => channel.exec(false, command).await.map_err(text)?,
         None => channel.request_shell(false).await.map_err(text)?,
