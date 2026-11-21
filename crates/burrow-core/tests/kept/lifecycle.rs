@@ -115,3 +115,33 @@ async fn closing_a_kept_terminal_ends_it() {
     .expect("no close");
     assert!(info(&window, session).await.is_none());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_terminal_names_the_role_that_kept_it_first() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    let (socket, node) = daemon(&server).await;
+    let phone = Client::connect(&socket, Role::Mobile).await.unwrap();
+    let cli = Client::connect(&socket, Role::Cli).await.unwrap();
+
+    let phones = kept(&phone, &node).await;
+    let clis = kept(&cli, &node).await;
+    assert_eq!(
+        info(&phone, phones).await.unwrap().kept_by,
+        Some(Role::Mobile)
+    );
+    assert_eq!(info(&phone, clis).await.unwrap().kept_by, Some(Role::Cli));
+
+    // Keeping it again doesn't make it another client's.
+    cli.execute(Command::KeepTerminal { session: phones })
+        .await
+        .unwrap();
+    assert_eq!(
+        info(&cli, phones).await.unwrap().kept_by,
+        Some(Role::Mobile)
+    );
+    // A terminal that isn't kept has no keeper.
+    let open = terminal(&phone, &node).await;
+    assert_eq!(info(&phone, open).await.unwrap().kept_by, None);
+}

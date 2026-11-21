@@ -234,10 +234,7 @@ impl Core {
                 return Ok(Response::Ok);
             }
             Command::KeepTerminal { session } => {
-                sessions.keep(session)?;
-                // Keeping changes what clients list but sends no event of
-                // its own, so the session says where it stands again.
-                self.inner.repeat(session);
+                self.keep_terminal(session, None)?;
                 return Ok(Response::Ok);
             }
             Command::WriteTerminal { session, data } => (session, Input::Write(data)),

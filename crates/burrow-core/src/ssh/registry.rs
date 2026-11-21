@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use super::keeper::Keeper;
 use super::monitor;
 use super::prompter::Pending;
+use crate::api::rpc::Role;
 use crate::api::{NodeId, PromptAnswer, SessionId, SessionInfo, SessionKind, SessionState};
 use crate::db;
 use crate::error::{Error, Result};
@@ -50,6 +51,8 @@ pub(super) struct Entry {
     pub(super) background: bool,
     /// A kept terminal's output, once [`Sessions::keep`] took it.
     pub(super) keeper: Option<Arc<Keeper>>,
+    /// The role of the client that kept it.
+    pub(super) kept_by: Option<Role>,
 }
 
 /// A connected session's client, which commands on it use.
@@ -109,6 +112,7 @@ impl Sessions {
                 state: e.state.clone(),
                 background: e.background,
                 kept: e.keeper.is_some(),
+                kept_by: e.kept_by,
                 attached: e.keeper.as_ref().is_some_and(|k| k.attached()),
             })
             .collect();
