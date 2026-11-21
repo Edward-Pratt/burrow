@@ -5,7 +5,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::{NodeId, SecretValue};
+use super::{NodeId, Role, SecretValue};
 
 /// Identifies a session opened with [`Command::OpenTerminal`](crate::Command::OpenTerminal),
 /// [`Command::StartTunnel`](crate::Command::StartTunnel) or [`Command::OpenFiles`](crate::Command::OpenFiles). Unique for as long as
@@ -123,6 +123,12 @@ pub struct SessionInfo {
     /// client that opened it, and any client may attach to it again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kept: bool,
+    /// The role of the client that kept it, such as `mobile` for the
+    /// phone's shells, so a client can tell its own from another's. Absent
+    /// for a terminal that isn't kept, or one kept by a process that hosts
+    /// the core itself rather than over the socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_by: Option<Role>,
     /// A kept terminal that a client is reading now.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub attached: bool,

@@ -185,6 +185,7 @@ where
             attached: None,
             background,
             keeper: None,
+            kept_by: None,
         },
     );
     drop(map);

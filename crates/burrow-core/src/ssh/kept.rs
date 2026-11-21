@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use super::Sessions;
 use super::keeper::Keeper;
+use crate::api::rpc::Role;
 use crate::api::{SessionId, SessionKind};
 use crate::error::{Error, Result};
 
@@ -13,9 +14,11 @@ use crate::error::{Error, Result};
 pub(crate) type AttachedOutput = (Vec<u8>, mpsc::Receiver<Vec<u8>>);
 
 impl Sessions {
-    /// Keeps a running terminal. It must be kept before any client takes
-    /// its output, so that no output goes to a reader that isn't attached.
-    pub fn keep(&self, id: SessionId) -> Result<()> {
+    /// Keeps a running terminal for a client playing `by`. It must be kept
+    /// before any client takes its output, so that no output goes to a
+    /// reader that isn't attached. Keeping it again changes nothing, so
+    /// the first client to keep it stays its keeper.
+    pub fn keep(&self, id: SessionId, by: Option<Role>) -> Result<()> {
         let mut map = self.map.lock().unwrap();
         let entry = map
             .get_mut(&id)
@@ -34,6 +37,7 @@ impl Sessions {
             )
         })?;
         entry.keeper = Some(Keeper::start(output));
+        entry.kept_by = by;
         Ok(())
     }
 

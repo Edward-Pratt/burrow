@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::addon::{Host, Manifest};
+use crate::api::rpc::Role;
 use crate::api::{
     AlertKind, Capability, Command, Event, Node, NodeId, Response, SSH_HOST_KIND, SecretValue,
     SessionId, View,
@@ -97,6 +98,15 @@ impl Core {
     /// let go of it.
     pub fn take_output(&self, session: SessionId) -> Result<mpsc::Receiver<Vec<u8>>> {
         self.inner.sessions.take_output(session)
+    }
+
+    /// Keeps a terminal for a client playing `by`, which a socket client's
+    /// `keep_terminal` gives. Keeping changes what clients list but sends
+    /// no event of its own, so the session says where it stands again.
+    pub(crate) fn keep_terminal(&self, session: SessionId, by: Option<Role>) -> Result<()> {
+        self.inner.sessions.keep(session, by)?;
+        self.inner.repeat(session);
+        Ok(())
     }
 
     /// Attaches to a kept terminal as its one reader: what it kept, and its
