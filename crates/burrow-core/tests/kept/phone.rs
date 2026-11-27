@@ -2,7 +2,7 @@
 //! and keeps using its own terminals after it reconnects.
 
 use burrow_core::ipc::{Client, Role};
-use burrow_core::{Command, PromptAnswer, SessionId};
+use burrow_core::{Command, PromptAnswer, Response, SessionId};
 
 use super::common::*;
 use super::helpers::*;
@@ -111,6 +111,47 @@ async fn the_phone_uses_its_kept_terminal_again_after_reconnecting() {
         .unwrap();
     phone
         .execute(Command::CloseSession { session })
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_phone_may_not_cancel_another_clients_transfer() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    let (socket, node) = daemon(&server).await;
+    let window = Client::connect(&socket, Role::Gui).await.unwrap();
+    let phone = Client::connect(&socket, Role::Mobile).await.unwrap();
+
+    // Sparse, so it takes no disk but long enough to copy that it is
+    // still running when the phone tries.
+    let big = server.path("big");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(8 << 30)
+        .unwrap();
+    let files = open_and_wait(&window, Command::OpenFiles { node: node.id }).await;
+    let download = Command::Download {
+        session: files,
+        remote: big.to_string_lossy().into_owned(),
+        local: server.path("big-copy"),
+        overwrite: false,
+    };
+    let transfer = match window.execute(download).await.unwrap() {
+        Response::Transfer { transfer } => transfer,
+        other => panic!("expected a transfer, got {other:?}"),
+    };
+    let error = phone
+        .execute(Command::CancelTransfer { transfer })
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("the phone may only use"),
+        "{error}"
+    );
+    window
+        .execute(Command::CancelTransfer { transfer })
         .await
         .unwrap();
 }

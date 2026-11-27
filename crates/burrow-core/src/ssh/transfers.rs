@@ -30,6 +30,11 @@ impl Transfers {
         Ok(())
     }
 
+    /// The files session a running transfer belongs to.
+    pub fn session_of(&self, id: TransferId) -> Option<SessionId> {
+        self.map.lock().unwrap().get(&id).map(|r| r.session)
+    }
+
     /// Cancels every transfer of a session that ended.
     pub fn cancel_session(&self, session: SessionId) {
         for running in self.map.lock().unwrap().values() {

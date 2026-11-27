@@ -12,6 +12,10 @@ impl Conn {
                 if let Some(session) = crate::class::of(&command).session {
                     self.may_use(session)?;
                 }
+                // A transfer names its session only in the daemon.
+                if let Command::CancelTransfer { transfer } = command {
+                    self.may_cancel(transfer)?;
+                }
                 match command {
                     // The daemon records who kept a terminal, so the phone
                     // may use its own shells again after it reconnects.

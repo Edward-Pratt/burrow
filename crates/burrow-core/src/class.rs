@@ -135,6 +135,7 @@ pub(crate) fn of(command: &Command) -> Class<'_> {
             on(session, mcp(McpRule::Session(*session, FilesWrite)))
         }
         Command::Download { session, .. } | Command::Upload { session, .. } => on(session, base),
+        // Its session is the transfer's, which only the daemon knows.
         Command::CancelTransfer { .. } => base,
         // No more than `exec` could run.
         Command::Exec { node, .. } | Command::ControlService { node, .. } => {

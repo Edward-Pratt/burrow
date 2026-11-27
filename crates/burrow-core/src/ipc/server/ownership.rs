@@ -9,7 +9,7 @@
 
 use super::Conn;
 use crate::api::rpc::Role;
-use crate::api::{SessionId, SessionKind};
+use crate::api::{SessionId, SessionKind, TransferId};
 use crate::error::{Error, Result};
 
 impl Conn {
@@ -39,5 +39,20 @@ impl Conn {
         Err(Error::PermissionDenied(
             "the phone may only use sessions it opened and terminals it kept".to_string(),
         ))
+    }
+
+    /// Refuses the phone a transfer of a session it may not use. One that
+    /// isn't running is refused too, so its id can't become another
+    /// client's transfer in between.
+    pub(super) fn may_cancel(&self, transfer: TransferId) -> Result<()> {
+        if self.role.get() != Some(&Role::Mobile) {
+            return Ok(());
+        }
+        let session = self
+            .core
+            .transfers()
+            .session_of(transfer)
+            .ok_or_else(|| Error::invalid("transfer", format!("{transfer} is not running")))?;
+        self.may_use(session)
     }
 }
