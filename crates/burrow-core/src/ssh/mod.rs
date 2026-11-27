@@ -27,17 +27,18 @@ mod registry;
 pub(crate) mod services;
 mod session;
 mod socks;
+mod transfers;
 pub(crate) mod trend;
 mod tunnel;
 
 pub(crate) use agent::Agents;
 pub(crate) use connection::{Connection, Connections, alias};
-pub(crate) use files::Transfers;
 pub(crate) use kept::AttachedOutput;
 pub(crate) use monitor::Waits;
 pub(crate) use prompter::{Prompter, unattended};
 use registry::Entry;
 pub(crate) use registry::{Attached, Input, OUTPUT_BUFFER, Sessions};
+pub(crate) use transfers::Transfers;
 pub(crate) use tunnel::Autostart;
 
 use std::sync::Arc;
