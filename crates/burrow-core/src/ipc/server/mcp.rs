@@ -113,7 +113,7 @@ impl Conn {
 
     /// The node of a running session this client opened.
     fn own_session(&self, session: SessionId) -> Result<NodeId> {
-        if !self.owned.lock().unwrap().contains(&session) {
+        if !self.owns(session) {
             return Err(denied("use a session it did not open"));
         }
         self.core

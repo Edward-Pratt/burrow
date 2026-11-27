@@ -10,10 +10,9 @@
 //! the SFTP channel and the local file, and reports progress as
 //! [`Event::TransferChanged`] a few times a second.
 
-use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +21,7 @@ use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
+use super::transfers::Running;
 use super::{Input, Prompter};
 use crate::api::{
     Event, FileEntry, FileKind, Node, SessionId, SessionState, TransferId, TransferState,
@@ -209,38 +209,6 @@ pub(crate) async fn remove(sftp: &SftpSession, path: &str) -> Result<()> {
         Box::pin(remove(sftp, &join(path, &name))).await?;
     }
     sftp.remove_dir(path).await.map_err(text)
-}
-
-/// Running transfers, so they can be cancelled.
-#[derive(Default)]
-pub(crate) struct Transfers {
-    next: AtomicU64,
-    map: Mutex<HashMap<TransferId, Running>>,
-}
-
-struct Running {
-    session: SessionId,
-    cancel: watch::Sender<bool>,
-}
-
-impl Transfers {
-    pub fn cancel(&self, id: TransferId) -> crate::error::Result<()> {
-        let map = self.map.lock().unwrap();
-        let running = map.get(&id).ok_or_else(|| {
-            crate::error::Error::invalid("transfer", format!("{id} is not running"))
-        })?;
-        running.cancel.send_replace(true);
-        Ok(())
-    }
-
-    /// Cancels every transfer of a session that ended.
-    pub fn cancel_session(&self, session: SessionId) {
-        for running in self.map.lock().unwrap().values() {
-            if running.session == session {
-                running.cancel.send_replace(true);
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

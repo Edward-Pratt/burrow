@@ -132,7 +132,7 @@ pub enum Command {
     },
     /// Keeps a terminal running after the client that opened it goes, such
     /// as a phone whose screen locked. Its output then waits in a ring of
-    /// the latest 256 KiB, and any client may attach to it again with
+    /// the latest 256 KiB, and a client may attach to it again with
     /// `take_output`. Keep a terminal before taking its output.
     KeepTerminal {
         session: SessionId,

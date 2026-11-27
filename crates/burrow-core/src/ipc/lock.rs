@@ -106,6 +106,13 @@ mod tests {
             .spawn()
             .unwrap();
         writeln!(lock, "{}", old.id()).unwrap();
+        // `spawn` can return while the child is still inside `exec`, with
+        // its arguments not yet in /proc; `stop` would then take it for a
+        // daemon still starting. A real daemon is long past that.
+        let cmdline = format!("/proc/{}/cmdline", old.id());
+        while std::fs::read(&cmdline).unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         // The new daemon's pid replaces the old one's without the lock
         // ever coming free.
         let replace = std::thread::spawn(move || {
