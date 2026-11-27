@@ -3,11 +3,20 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::tokens::{self, Local};
 use super::{HostConfig, StrictHostKeyChecking};
 
 /// Parses `ssh -G` output: one `keyword value` pair per line, keywords in
 /// lowercase, list settings repeated or space-separated.
-pub(super) fn parse(output: &str, home: &Path, auth_sock: Option<PathBuf>) -> HostConfig {
+/// `alias` is the name `ssh -G` was given, which `IdentityFile`'s `%n`
+/// stands for.
+pub(super) fn parse(
+    output: &str,
+    alias: &str,
+    local: &Local,
+    auth_sock: Option<PathBuf>,
+) -> HostConfig {
+    let home = local.home.as_path();
     let mut config = HostConfig {
         hostname: String::new(),
         port: 22,
@@ -31,6 +40,8 @@ pub(super) fn parse(output: &str, home: &Path, auth_sock: Option<PathBuf>) -> Ho
         "none" => Vec::new(),
         _ => value.split_whitespace().map(expand).collect(),
     };
+    // Expanded once the host is known: their tokens name it.
+    let mut identity_files = Vec::new();
     for line in output.lines() {
         let Some((key, value)) = line.split_once(' ') else {
             continue;
@@ -40,7 +51,7 @@ pub(super) fn parse(output: &str, home: &Path, auth_sock: Option<PathBuf>) -> Ho
             "hostname" => config.hostname = value.to_string(),
             "port" => config.port = value.parse().unwrap_or(22),
             "user" => config.user = value.to_string(),
-            "identityfile" => config.identity_files.push(expand(value)),
+            "identityfile" => identity_files.push(tilde(value, home)),
             "identityagent" => {
                 config.identity_agent = match value {
                     "none" => None,
@@ -67,6 +78,10 @@ pub(super) fn parse(output: &str, home: &Path, auth_sock: Option<PathBuf>) -> Ho
             _ => {}
         }
     }
+    config.identity_files = identity_files
+        .iter()
+        .map(|value| PathBuf::from(tokens::expand(value, alias, &config, local)))
+        .collect();
     config
 }
 
@@ -85,12 +100,17 @@ fn seconds(value: &str) -> Option<Duration> {
 
 /// `ssh -G` leaves `~` and `%d` in some paths for the client to expand.
 fn expand_path(value: &str, home: &Path) -> PathBuf {
+    PathBuf::from(tilde(&value.replace("%d", &home.to_string_lossy()), home))
+}
+
+/// A leading `~` as the home folder. `ssh` expands it before any `%`
+/// token, so a `%%` that leaves `%d` stays as written.
+fn tilde(value: &str, home: &Path) -> String {
     let home = home.to_string_lossy();
-    let value = value.replace("%d", &home);
     match value.strip_prefix("~/") {
-        Some(rest) => Path::new(home.as_ref()).join(rest),
-        None if value == "~" => PathBuf::from(home.as_ref()),
-        None => PathBuf::from(value),
+        Some(rest) => format!("{}/{rest}", home.trim_end_matches('/')),
+        None if value == "~" => home.into_owned(),
+        None => value.to_string(),
     }
 }
 
@@ -116,7 +136,16 @@ proxyjump bastion
 ";
 
     fn parsed(output: &str) -> HostConfig {
-        parse(output, Path::new("/home/edward"), Some("/run/agent".into()))
+        parse(output, "web", &local(), Some("/run/agent".into()))
+    }
+
+    fn local() -> Local {
+        Local {
+            home: "/home/edward".into(),
+            user: "edward".into(),
+            uid: 1000,
+            host: "desk.lan".into(),
+        }
     }
 
     #[test]
@@ -147,6 +176,15 @@ proxyjump bastion
         assert_eq!(config.connect_timeout, None);
         assert_eq!(config.server_alive_interval, Some(Duration::from_secs(30)));
         assert_eq!(config.proxy_jump.as_deref(), Some("bastion"));
+    }
+
+    #[test]
+    fn identity_files_have_their_tokens_expanded() {
+        let config = parsed("hostname example.com\nuser bob\nidentityfile ~/.ssh/key_%n_%h_%r\n");
+        assert_eq!(
+            config.identity_files,
+            [PathBuf::from("/home/edward/.ssh/key_web_example.com_bob")]
+        );
     }
 
     #[test]

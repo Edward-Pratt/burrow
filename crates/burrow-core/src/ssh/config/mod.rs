@@ -6,6 +6,7 @@
 //! `ssh <alias>` would.
 
 mod parse;
+mod tokens;
 mod trace;
 
 use std::path::{Path, PathBuf};
@@ -85,10 +86,10 @@ pub fn check_alias(alias: &str) -> Result<(), String> {
 /// as `ssh -F` does.
 pub async fn resolve(alias: &str, config_file: Option<&Path>) -> Result<HostConfig, String> {
     let output = ssh_g(alias, config_file, false).await?;
-    let home = std::env::home_dir().unwrap_or_default();
     Ok(parse::parse(
         &String::from_utf8_lossy(&output.stdout),
-        &home,
+        alias,
+        &tokens::Local::current(),
         std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
     ))
 }
