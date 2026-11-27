@@ -5,7 +5,8 @@
 //! sessions it opened, and the terminals it kept so that it gets them back
 //! after reconnecting: it is the one client on another device, so it must
 //! not type into the window's shells, read its desktops or browse its file
-//! panels, and the daemon decides that rather than the app.
+//! panels, and the daemon decides that rather than the app. It guards
+//! live sessions, not hosts: the phone may open its own on any host.
 
 use super::Conn;
 use crate::api::rpc::Role;
