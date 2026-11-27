@@ -20,9 +20,9 @@ pub(crate) struct Class<'a> {
     /// May change what autostart consents, background monitors and grants
     /// cover, so those are checked again after it runs.
     pub changes_tree: bool,
-    /// The session it acts on, when that may be a terminal. The phone may
-    /// use only the terminals it opened or kept.
-    pub terminal: Option<SessionId>,
+    /// The running session it acts on. The phone may use only the
+    /// sessions it opened, and the terminals it kept.
+    pub session: Option<SessionId>,
     pub mcp: McpRule,
     pub addon: AddonRule<'a>,
 }
@@ -74,7 +74,7 @@ pub(crate) fn of(command: &Command) -> Class<'_> {
     let base = Class {
         opens_session: false,
         changes_tree: false,
-        terminal: None,
+        session: None,
         mcp: McpRule::Denied,
         addon: AddonRule::Denied,
     };
@@ -88,6 +88,10 @@ pub(crate) fn of(command: &Command) -> Class<'_> {
         opens_session: true,
         mcp,
         ..base
+    };
+    let on = |session: &SessionId, class| Class {
+        session: Some(*session),
+        ..class
     };
     match command {
         Command::Version => Class {
@@ -115,33 +119,32 @@ pub(crate) fn of(command: &Command) -> Class<'_> {
         Command::WriteTerminal { session, .. }
         | Command::ResizeTerminal { session, .. }
         | Command::KeepTerminal { session }
-        | Command::AnswerPrompt { session, .. } => Class {
-            terminal: Some(*session),
-            ..base
-        },
-        Command::CloseSession { session } => Class {
-            terminal: Some(*session),
-            ..mcp(McpRule::Close(*session))
-        },
+        | Command::AnswerPrompt { session, .. } => on(session, base),
+        Command::CloseSession { session } => on(session, mcp(McpRule::Close(*session))),
         Command::ListSessions => mcp(McpRule::Free),
         Command::StartTunnel { node } => mcp(McpRule::Node(*node, Tunnel)),
 
         Command::OpenFiles { node } => opens(McpRule::Node(*node, FilesRead)),
         Command::ListDir { session, .. } | Command::ReadFile { session, .. } => {
-            mcp(McpRule::Session(*session, FilesRead))
+            on(session, mcp(McpRule::Session(*session, FilesRead)))
         }
         Command::MakeDir { session, .. }
         | Command::RenamePath { session, .. }
         | Command::RemovePath { session, .. }
-        | Command::WriteFile { session, .. } => mcp(McpRule::Session(*session, FilesWrite)),
-        Command::Download { .. } | Command::Upload { .. } | Command::CancelTransfer { .. } => base,
+        | Command::WriteFile { session, .. } => {
+            on(session, mcp(McpRule::Session(*session, FilesWrite)))
+        }
+        Command::Download { session, .. } | Command::Upload { session, .. } => on(session, base),
+        Command::CancelTransfer { .. } => base,
         // No more than `exec` could run.
         Command::Exec { node, .. } | Command::ControlService { node, .. } => {
             mcp(McpRule::Node(*node, Exec))
         }
 
         Command::OpenMonitor { node } => opens(McpRule::Monitor(*node)),
-        Command::MonitorHistory { session } => mcp(McpRule::Session(*session, MonitorRead)),
+        Command::MonitorHistory { session } => {
+            on(session, mcp(McpRule::Session(*session, MonitorRead)))
+        }
         Command::MonitorTrend { node, .. } => mcp(McpRule::Node(*node, MonitorRead)),
         Command::ListMonitoring => base,
         Command::ListAlerts => mcp(McpRule::Alerts),
@@ -154,14 +157,15 @@ pub(crate) fn of(command: &Command) -> Class<'_> {
         Command::OpenDatabase { node } => opens(McpRule::Node(*node, SqlRead)),
         // The bridge has no way to see a screen.
         Command::OpenVnc { .. } => opens(McpRule::Denied),
-        Command::RunQuery { session, .. } => mcp(McpRule::Query(*session)),
+        Command::RunQuery { session, .. } => on(session, mcp(McpRule::Query(*session))),
         Command::CancelQuery { session } | Command::ListSchema { session } => {
-            mcp(McpRule::Session(*session, SqlRead))
+            on(session, mcp(McpRule::Session(*session, SqlRead)))
         }
-        Command::SetReadOnly { session, .. } => mcp(McpRule::Session(*session, SqlWrite)),
-        Command::ExportQuery { .. }
-        | Command::ListHistory { .. }
-        | Command::ClearHistory { .. } => base,
+        Command::SetReadOnly { session, .. } => {
+            on(session, mcp(McpRule::Session(*session, SqlWrite)))
+        }
+        Command::ExportQuery { session, .. } => on(session, base),
+        Command::ListHistory { .. } | Command::ClearHistory { .. } => base,
 
         Command::ListAddons
         | Command::ApproveAddon { .. }

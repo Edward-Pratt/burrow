@@ -1,5 +1,5 @@
-//! The phone uses only the terminals it opened or kept, and keeps using
-//! its own after it reconnects.
+//! The phone uses only the sessions it opened and the terminals it kept,
+//! and keeps using its own terminals after it reconnects.
 
 use burrow_core::ipc::{Client, Role};
 use burrow_core::{Command, PromptAnswer, SessionId};
@@ -40,7 +40,7 @@ async fn refused_everything(phone: &Client, session: SessionId) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_phone_may_not_use_another_clients_terminals() {
+async fn the_phone_may_not_use_another_clients_sessions() {
     let Some(server) = Server::start() else {
         return;
     };
@@ -58,6 +58,24 @@ async fn the_phone_may_not_use_another_clients_terminals() {
     }
     assert_eq!(info(&window, open).await.unwrap().kept_by, None);
     assert!(info(&window, windows).await.is_some());
+
+    // Not only terminals: the window's file panel isn't the phone's either.
+    let files = open_and_wait(&window, Command::OpenFiles { node: node.id }).await;
+    for command in [
+        Command::ListDir {
+            session: files,
+            path: ".".into(),
+        },
+        Command::CloseSession { session: files },
+    ] {
+        let error = phone.execute(command).await.unwrap_err().to_string();
+        assert!(error.contains("the phone may only use"), "{error}");
+    }
+    let mine = open_and_wait(&phone, Command::OpenFiles { node: node.id }).await;
+    phone
+        .execute(Command::CloseSession { session: mine })
+        .await
+        .unwrap();
 
     // An id that isn't running is refused too.
     let error = phone

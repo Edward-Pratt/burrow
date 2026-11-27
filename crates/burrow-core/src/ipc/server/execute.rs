@@ -9,7 +9,7 @@ impl Conn {
     pub(super) async fn execute_as(&self, role: Role, command: Command) -> Result<Response> {
         match role {
             Role::Gui | Role::Cli | Role::Mobile => {
-                if let Some(session) = crate::class::of(&command).terminal {
+                if let Some(session) = crate::class::of(&command).session {
                     self.may_use(session)?;
                 }
                 match command {

@@ -1,10 +1,11 @@
 //! Which sessions a client may act on, beyond what its role may run.
 //!
 //! The window and the CLI may use any session. The MCP bridge uses only
-//! the ones it opened (see `mcp.rs`). The phone uses any session except
-//! another client's terminals: it is the one client on another device, so
-//! it must not type into the window's shells or read them, and the daemon
-//! decides that rather than the app.
+//! the ones it opened (see `mcp.rs`). The phone, too, uses only the
+//! sessions it opened, and the terminals it kept so that it gets them back
+//! after reconnecting: it is the one client on another device, so it must
+//! not type into the window's shells, read its desktops or browse its file
+//! panels, and the daemon decides that rather than the app.
 
 use super::Conn;
 use crate::api::rpc::Role;
@@ -17,16 +18,14 @@ impl Conn {
         self.owned.lock().unwrap().contains(&session)
     }
 
-    /// Refuses the phone a terminal it neither opened on this connection
-    /// nor kept; other roles pass. A kept terminal is the phone's again
-    /// after it reconnects, because the daemon recorded the role that kept
-    /// it.
+    /// Refuses the phone a session it didn't open on this connection,
+    /// unless it is a terminal the phone kept; other roles pass.
     pub(super) fn may_use(&self, session: SessionId) -> Result<()> {
         if self.role.get() != Some(&Role::Mobile) || self.owns(session) {
             return Ok(());
         }
         // A session that isn't running is refused here rather than by the
-        // command, so an id can't become someone's terminal in between.
+        // command, so an id can't become someone else's session in between.
         let info = self
             .core
             .sessions()
@@ -34,11 +33,11 @@ impl Conn {
             .into_iter()
             .find(|i| i.session == session)
             .ok_or(Error::SessionNotFound(session))?;
-        if info.kind != SessionKind::Terminal || info.kept_by == Some(Role::Mobile) {
+        if info.kind == SessionKind::Terminal && info.kept_by == Some(Role::Mobile) {
             return Ok(());
         }
         Err(Error::PermissionDenied(
-            "the phone may only use terminals it opened or kept".to_string(),
+            "the phone may only use sessions it opened and terminals it kept".to_string(),
         ))
     }
 }
