@@ -120,7 +120,8 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub background: bool,
     /// A terminal kept with [`Command::KeepTerminal`](crate::Command::KeepTerminal): it outlives the
-    /// client that opened it, and any client may attach to it again.
+    /// client that opened it, and a client may attach to it again: the
+    /// window or the CLI to any, the phone only to one `mobile` kept.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kept: bool,
     /// The role of the client that kept it, such as `mobile` for the

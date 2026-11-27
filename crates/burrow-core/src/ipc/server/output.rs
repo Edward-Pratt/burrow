@@ -27,7 +27,7 @@ impl Conn {
     /// Passes a terminal's output on as `output` notifications, then
     /// `output_ended`.
     fn take_output(&self, session: SessionId) -> Result<()> {
-        self.reads_terminals()?;
+        self.reads_terminal(session)?;
         let stream = self.core.take_output(session)?;
         self.forward(session, None, stream);
         Ok(())
@@ -41,7 +41,7 @@ impl Conn {
     /// an earlier stream's output may still be queued, and the client
     /// drops whatever comes before the replay, so nothing arrives twice.
     fn attach_output(&self, session: SessionId) -> Result<()> {
-        self.reads_terminals()?;
+        self.reads_terminal(session)?;
         // The earlier forwarder goes quietly: its `output_ended` would end
         // the new stream too.
         if let Some(earlier) = self.forwarders.lock().unwrap().remove(&session) {
@@ -58,13 +58,14 @@ impl Conn {
     }
 
     /// The MCP bridge opens no terminals or desktops, so it has no output
-    /// to take, and must not read or take over someone else's.
-    fn reads_terminals(&self) -> Result<()> {
+    /// to take, and must not read or take over someone else's. The phone
+    /// reads only its own.
+    fn reads_terminal(&self, session: SessionId) -> Result<()> {
         match self.role.get() {
             Some(Role::Mcp) => Err(Error::PermissionDenied(
                 "the MCP bridge may not read terminals".to_string(),
             )),
-            _ => Ok(()),
+            _ => self.may_use(session),
         }
     }
 

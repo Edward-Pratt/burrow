@@ -1,5 +1,5 @@
 //! Kept terminals: ones that outlive the client that opened it, such as a
-//! phone whose screen locked, so that any client can attach to them
+//! phone whose screen locked, so that a client can attach to them
 //! again. See [`Keeper`] for where their output goes meanwhile.
 
 use tokio::sync::mpsc;

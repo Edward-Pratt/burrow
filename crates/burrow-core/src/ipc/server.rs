@@ -24,6 +24,7 @@ mod execute;
 mod hello;
 mod mcp;
 mod output;
+mod ownership;
 use super::{INVALID_PARAMS, MAX_LINE, METHOD_NOT_FOUND, Role, SERVER_ERROR, read_line};
 use crate::api::{Command, Response, SessionId};
 use crate::engine::Core;

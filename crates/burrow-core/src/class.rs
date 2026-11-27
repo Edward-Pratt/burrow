@@ -20,6 +20,9 @@ pub(crate) struct Class<'a> {
     /// May change what autostart consents, background monitors and grants
     /// cover, so those are checked again after it runs.
     pub changes_tree: bool,
+    /// The session it acts on, when that may be a terminal. The phone may
+    /// use only the terminals it opened or kept.
+    pub terminal: Option<SessionId>,
     pub mcp: McpRule,
     pub addon: AddonRule<'a>,
 }
@@ -71,6 +74,7 @@ pub(crate) fn of(command: &Command) -> Class<'_> {
     let base = Class {
         opens_session: false,
         changes_tree: false,
+        terminal: None,
         mcp: McpRule::Denied,
         addon: AddonRule::Denied,
     };
@@ -108,11 +112,17 @@ pub(crate) fn of(command: &Command) -> Class<'_> {
         | Command::AddSshHost { .. } => base,
 
         Command::OpenTerminal { .. } => opens(McpRule::Denied),
-        Command::WriteTerminal { .. }
-        | Command::ResizeTerminal { .. }
-        | Command::KeepTerminal { .. }
-        | Command::AnswerPrompt { .. } => base,
-        Command::CloseSession { session } => mcp(McpRule::Close(*session)),
+        Command::WriteTerminal { session, .. }
+        | Command::ResizeTerminal { session, .. }
+        | Command::KeepTerminal { session }
+        | Command::AnswerPrompt { session, .. } => Class {
+            terminal: Some(*session),
+            ..base
+        },
+        Command::CloseSession { session } => Class {
+            terminal: Some(*session),
+            ..mcp(McpRule::Close(*session))
+        },
         Command::ListSessions => mcp(McpRule::Free),
         Command::StartTunnel { node } => mcp(McpRule::Node(*node, Tunnel)),
 
